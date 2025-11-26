@@ -61,3 +61,29 @@ type LogicalGroupAgg struct {
 }
 
 func (g *LogicalGroupAgg) nodeName() string { return "LogicalGroupAgg" }
+
+// WindowFuncSpec describes a window function specification
+type WindowFuncSpec struct {
+	// Function name: LAG, LEAD, ROW_NUMBER, etc.
+	FuncName string
+	// Arguments to the function (e.g., column name for LAG)
+	Args []string
+	// PARTITION BY columns
+	PartitionBy []string
+	// ORDER BY column
+	OrderBy string
+	// For LAG/LEAD: offset (default 1)
+	Offset int
+}
+
+// LogicalWindowFunc represents a window function application
+type LogicalWindowFunc struct {
+	// WindowSpec describes the window function
+	Spec WindowFuncSpec
+	// OutputCol is the name of the output column
+	OutputCol string
+	// Input is the child logical node
+	Input LogicalNode
+}
+
+func (w *LogicalWindowFunc) nodeName() string { return "LogicalWindowFunc" }

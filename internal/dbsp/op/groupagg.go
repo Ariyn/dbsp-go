@@ -134,6 +134,115 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 	return newI, out
 }
 
+// AvgAgg maintains a running average using a monoid structure (sum,count) pair.
+// This follows DBSP's monoid pattern for aggregates that need composite state.
+//
+// Monoid properties:
+// - Identity: AvgMonoid{sum:0, count:0}
+// - Associative: (a ⊕ b) ⊕ c = a ⊕ (b ⊕ c)
+// - Invertible: supports both insertion (Count=+1) and deletion (Count=-1)
+//
+// The aggregate value is computed as sum/count, and the delta reports
+// changes in the "avg_delta" column.
+type AvgAgg struct {
+	ColName string
+}
+
+// AvgMonoid is the monoid structure for AVG aggregation.
+// It maintains sum and count separately to support incremental updates
+// including deletions.
+type AvgMonoid struct {
+	Sum   float64
+	Count float64
+}
+
+// Zero returns the identity element of the AVG monoid.
+func (a AvgMonoid) Zero() AvgMonoid {
+	return AvgMonoid{Sum: 0, Count: 0}
+}
+
+// Combine merges two AVG monoids (associative operation).
+func (a AvgMonoid) Combine(other AvgMonoid) AvgMonoid {
+	return AvgMonoid{
+		Sum:   a.Sum + other.Sum,
+		Count: a.Count + other.Count,
+	}
+}
+
+// Value computes the aggregate result (average).
+func (a AvgMonoid) Value() float64 {
+	if a.Count == 0 {
+		return 0
+	}
+	return a.Sum / a.Count
+}
+
+// Apply updates the monoid state with a delta tuple and returns the new state
+// and output delta.
+func (a *AvgAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
+	// Extract or initialize monoid state
+	var monoid AvgMonoid
+	if prev != nil {
+		var ok bool
+		monoid, ok = prev.(AvgMonoid)
+		if !ok {
+			// Migration path: handle old AvgState format
+			if oldState, ok := prev.(AvgState); ok {
+				monoid = AvgMonoid{Sum: oldState.sum, Count: oldState.count}
+			}
+		}
+	}
+
+	// Compute old average
+	oldAvg := monoid.Value()
+
+	// Extract value from tuple
+	col := a.ColName
+	if col == "" {
+		col = "v"
+	}
+	var v float64
+	if raw, ok := td.Tuple[col]; ok {
+		switch x := raw.(type) {
+		case int:
+			v = float64(x)
+		case int64:
+			v = float64(x)
+		case float64:
+			v = x
+		default:
+			v = 0
+		}
+	}
+
+	// Create delta monoid and combine
+	delta := AvgMonoid{
+		Sum:   v * float64(td.Count),
+		Count: float64(td.Count),
+	}
+	monoid = monoid.Combine(delta)
+
+	// Compute new average
+	newAvg := monoid.Value()
+
+	// Generate output delta
+	diff := newAvg - oldAvg
+	if diff == 0 {
+		return monoid, nil
+	}
+
+	outT := types.Tuple{"avg_delta": diff}
+	out := &types.TupleDelta{Tuple: outT, Count: 1}
+	return monoid, out
+}
+
+// AvgState is deprecated; kept for backward compatibility.
+// Use AvgMonoid instead.
+type AvgState struct {
+	sum   float64
+	count float64
+}
+
 // Small helper for debug printing
 func (g *GroupAggOp) String() string {
 	return fmt.Sprintf("GroupAggOp(state=%v)", g.state)

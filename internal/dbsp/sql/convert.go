@@ -13,6 +13,23 @@ import (
 
 // ParseQueryToLogicalPlan parses a tiny subset of SQL into a LogicalNode.
 func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
+	// Check for window functions FIRST (before sqlparser)
+	// Since xwb1989/sqlparser doesn't support OVER clause parsing,
+	// we do simple string matching
+	queryUpper := strings.ToUpper(query)
+	if strings.Contains(queryUpper, " OVER ") {
+		wf, err := parseWindowFunctionFromQuery(query)
+		if err != nil {
+			return nil, err
+		}
+		if wf != nil {
+			// Build scan node
+			scan := &ir.LogicalScan{Table: "t"}
+			wf.Input = scan
+			return wf, nil
+		}
+	}
+
 	stmt, err := sqlparser.Parse(query)
 	if err != nil {
 		return nil, err
@@ -72,60 +89,59 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 	}
 
 	// Handle GROUP BY with aggregation
-	gbExpr := sel.GroupBy[0]
 	var (
-		groupCol   string
+		groupCols  []string
 		windowSpec *ir.WindowSpec
 	)
 
-	switch e := gbExpr.(type) {
-	case *sqlparser.ColName:
-		// Regular GROUP BY column
-		groupCol = e.Name.String()
-	case *sqlparser.FuncExpr:
-		// Minimal support for: GROUP BY TUMBLE(ts_col, INTERVAL '5' MINUTE)
-		funcName := e.Name.String()
-		if funcName != "tumble" && funcName != "TUMBLE" {
-			return nil, errors.New("unsupported GROUP BY function (only TUMBLE supported)")
-		}
-		if len(e.Exprs) != 2 {
-			return nil, errors.New("TUMBLE expects two arguments: time column, interval literal")
-		}
+	// Parse all GROUP BY expressions
+	for _, gbExpr := range sel.GroupBy {
+		switch e := gbExpr.(type) {
+		case *sqlparser.ColName:
+			// Regular GROUP BY column
+			groupCols = append(groupCols, e.Name.String())
+		case *sqlparser.FuncExpr:
+			// Minimal support for: GROUP BY TUMBLE(ts_col, INTERVAL '5' MINUTE)
+			funcName := e.Name.String()
+			if funcName != "tumble" && funcName != "TUMBLE" {
+				return nil, errors.New("unsupported GROUP BY function (only TUMBLE supported)")
+			}
+			if len(e.Exprs) != 2 {
+				return nil, errors.New("TUMBLE expects two arguments: time column, interval literal")
+			}
 
-		// First argument: time column
-		arg1, ok := e.Exprs[0].(*sqlparser.AliasedExpr)
-		if !ok {
-			return nil, errors.New("unsupported TUMBLE time column expression")
-		}
-		col, ok := arg1.Expr.(*sqlparser.ColName)
-		if !ok {
-			return nil, errors.New("TUMBLE time column must be a simple column name")
-		}
-		timeCol := col.Name.String()
+			// First argument: time column
+			arg1, ok := e.Exprs[0].(*sqlparser.AliasedExpr)
+			if !ok {
+				return nil, errors.New("unsupported TUMBLE time column expression")
+			}
+			col, ok := arg1.Expr.(*sqlparser.ColName)
+			if !ok {
+				return nil, errors.New("TUMBLE time column must be a simple column name")
+			}
+			timeCol := col.Name.String()
 
-		// Second argument: we expect an interval literal, e.g., INTERVAL '5' MINUTE
-		arg2, ok := e.Exprs[1].(*sqlparser.AliasedExpr)
-		if !ok {
-			return nil, errors.New("unsupported TUMBLE interval expression")
-		}
-		// For now, be very strict and require the literal SQL text to be of the form:
-		// INTERVAL 'N' SECOND|MINUTE
-		intervalSQL := sqlparser.String(arg2.Expr)
-		// A tiny parser for the interval; we only support SECOND and MINUTE
-		sizeMillis, err := parseSimpleIntervalToMillis(intervalSQL)
-		if err != nil {
-			return nil, err
-		}
+			// Second argument: we expect an interval literal, e.g., INTERVAL '5' MINUTE
+			arg2, ok := e.Exprs[1].(*sqlparser.AliasedExpr)
+			if !ok {
+				return nil, errors.New("unsupported TUMBLE interval expression")
+			}
+			// For now, be very strict and require the literal SQL text to be of the form:
+			// INTERVAL 'N' SECOND|MINUTE
+			intervalSQL := sqlparser.String(arg2.Expr)
+			// A tiny parser for the interval; we only support SECOND and MINUTE
+			sizeMillis, err := parseSimpleIntervalToMillis(intervalSQL)
+			if err != nil {
+				return nil, err
+			}
 
-		windowSpec = &ir.WindowSpec{
-			TimeCol:    timeCol,
-			SizeMillis: sizeMillis,
+			windowSpec = &ir.WindowSpec{
+				TimeCol:    timeCol,
+				SizeMillis: sizeMillis,
+			}
+		default:
+			return nil, errors.New("unsupported GROUP BY expression")
 		}
-
-		// For now, we treat the window itself as the only grouping key.
-		groupCol = "__window__"
-	default:
-		return nil, errors.New("unsupported GROUP BY expression")
 	}
 
 	// find aggregate: scan SELECT list for SUM/COUNT and ignore window
@@ -142,8 +158,8 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		}
 		name := strings.ToUpper(sqlparser.String(f.Name))
 		// Ignore window functions such as TUMBLE here; we only care about
-		// true aggregates like SUM/COUNT.
-		if name != "SUM" && name != "COUNT" {
+		// true aggregates like SUM/COUNT/AVG/MIN/MAX.
+		if name != "SUM" && name != "COUNT" && name != "AVG" && name != "MIN" && name != "MAX" {
 			continue
 		}
 		if len(f.Exprs) != 1 {
@@ -167,7 +183,7 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 
 	// Build GroupAgg with input from current node (which may include filter)
 	lg := &ir.LogicalGroupAgg{
-		Keys:       []string{groupCol},
+		Keys:       groupCols,
 		AggName:    aggFunc,
 		AggCol:     aggCol,
 		WindowSpec: windowSpec,
@@ -226,6 +242,136 @@ func ParseQueryToDBSP(query string) (*op.Node, error) {
 		return nil, err
 	}
 	return ir.LogicalToDBSP(lp)
+}
+
+// parseWindowFunctionFromQuery parses window function from query string
+// This is a simple parser since xwb1989/sqlparser doesn't support OVER clause
+func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, error) {
+	// Find the OVER clause pattern: LAG(col, offset) OVER (PARTITION BY x ORDER BY y)
+	queryUpper := strings.ToUpper(query)
+
+	// Find LAG function
+	lagIdx := strings.Index(queryUpper, "LAG(")
+	if lagIdx == -1 {
+		return nil, nil // No LAG function
+	}
+
+	// Find OVER clause
+	overIdx := strings.Index(queryUpper[lagIdx:], "OVER")
+	if overIdx == -1 {
+		return nil, errors.New("LAG function requires OVER clause")
+	}
+	overIdx += lagIdx
+
+	// Extract LAG arguments
+	lagStart := lagIdx + 4 // after "LAG("
+	lagEnd := strings.Index(query[lagStart:], ")")
+	if lagEnd == -1 {
+		return nil, errors.New("LAG function not closed properly")
+	}
+	lagEnd += lagStart
+
+	lagArgsStr := strings.TrimSpace(query[lagStart:lagEnd])
+	lagArgsParts := strings.Split(lagArgsStr, ",")
+
+	var lagCol string
+	offset := 1
+
+	if len(lagArgsParts) > 0 {
+		lagCol = strings.TrimSpace(lagArgsParts[0])
+	} else {
+		return nil, errors.New("LAG requires at least one argument")
+	}
+
+	if len(lagArgsParts) > 1 {
+		offsetStr := strings.TrimSpace(lagArgsParts[1])
+		if offsetVal, err := strconv.Atoi(offsetStr); err == nil {
+			offset = offsetVal
+		}
+	}
+
+	// Extract OVER clause content
+	overStart := strings.Index(query[overIdx:], "(")
+	if overStart == -1 {
+		return nil, errors.New("OVER clause must have parentheses")
+	}
+	overStart += overIdx + 1
+
+	overEnd := strings.Index(query[overStart:], ")")
+	if overEnd == -1 {
+		return nil, errors.New("OVER clause not closed properly")
+	}
+	overEnd += overStart
+
+	overContent := query[overStart:overEnd]
+	overContentUpper := strings.ToUpper(overContent)
+
+	// Parse PARTITION BY
+	var partitionBy []string
+	partIdx := strings.Index(overContentUpper, "PARTITION BY")
+	if partIdx != -1 {
+		partStart := partIdx + 12 // after "PARTITION BY"
+
+		// Find end of PARTITION BY clause (either ORDER BY or end)
+		orderIdx := strings.Index(overContentUpper[partStart:], "ORDER BY")
+		var partEnd int
+		if orderIdx != -1 {
+			partEnd = partStart + orderIdx
+		} else {
+			partEnd = len(overContent)
+		}
+
+		partCols := strings.TrimSpace(overContent[partStart:partEnd])
+		for _, col := range strings.Split(partCols, ",") {
+			col = strings.TrimSpace(col)
+			if col != "" {
+				partitionBy = append(partitionBy, col)
+			}
+		}
+	}
+
+	// Parse ORDER BY
+	var orderBy string
+	orderIdx := strings.Index(overContentUpper, "ORDER BY")
+	if orderIdx == -1 {
+		return nil, errors.New("LAG requires ORDER BY in OVER clause")
+	}
+
+	orderStart := orderIdx + 8 // after "ORDER BY"
+	orderContent := strings.TrimSpace(overContent[orderStart:])
+
+	// Take first column (ignore ASC/DESC for now)
+	orderParts := strings.Fields(orderContent)
+	if len(orderParts) > 0 {
+		orderBy = orderParts[0]
+	} else {
+		return nil, errors.New("ORDER BY must specify a column")
+	}
+
+	// Determine output column name from alias
+	outputCol := "lag_" + lagCol
+
+	// Try to extract alias from query
+	asIdx := strings.Index(queryUpper, " AS ")
+	if asIdx != -1 {
+		afterAs := strings.TrimSpace(query[asIdx+4:])
+		// Extract alias (word before FROM)
+		fromIdx := strings.Index(strings.ToUpper(afterAs), " FROM")
+		if fromIdx != -1 {
+			outputCol = strings.TrimSpace(afterAs[:fromIdx])
+		}
+	}
+
+	return &ir.LogicalWindowFunc{
+		Spec: ir.WindowFuncSpec{
+			FuncName:    "LAG",
+			Args:        []string{lagCol},
+			PartitionBy: partitionBy,
+			OrderBy:     orderBy,
+			Offset:      offset,
+		},
+		OutputCol: outputCol,
+	}, nil
 }
 
 // ParseQueryToIncrementalDBSP parses SQL, builds DBSP graph, and applies differentiation.

@@ -14,7 +14,7 @@ Incremental View Maintenance(IVM) 엔진을 구현하기 위한 기술 지침서
   - SUM, COUNT 등 기본 Aggregation
   - Bag semantics (+1 / -1 multiplicity)
   - 입력은 ΔBatch(트랜잭션 변화 묶음)
-  - 재귀, 윈도우 함수, Update 연산, 비단조성 복잡 케이스는 제외
+  - 재귀, 비단조성 복잡 케이스는 제외
 
 ---
 

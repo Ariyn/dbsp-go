@@ -47,6 +47,14 @@ func Differentiate(node *op.Node) (*op.Node, error) {
 			Inputs: node.Inputs,
 		}, nil
 
+	case *op.WindowAggOp:
+		// WindowAggOp already handles incremental updates internally (window-local deltas)
+		// The derivative is the operator itself - it processes input deltas and produces output deltas
+		return &op.Node{
+			Op:     opType,
+			Inputs: node.Inputs,
+		}, nil
+
 	// TODO: Add Binary operator support for JOIN
 	// case *op.BinaryOp:
 	//     return differentiateBinary(node)

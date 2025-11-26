@@ -524,6 +524,12 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				case "COUNT", "count":
 					agg = &op.CountAgg{}
 					aggInit = func() any { return int64(0) }
+				case "MIN", "min":
+					agg = &op.MinAgg{ColName: n.AggCol}
+					aggInit = func() any { return op.NewSortedMultiset() }
+				case "MAX", "max":
+					agg = &op.MaxAgg{ColName: n.AggCol}
+					aggInit = func() any { return op.NewSortedMultiset() }
 				default:
 					return nil, fmt.Errorf("unsupported agg %s", n.AggName)
 				}
@@ -532,14 +538,26 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				return &op.Node{Op: g}, nil
 			}
 
-			// Windowed aggregation: for the first version we only support
-			// a single tumbling window over a time column, without extra
-			// group-by keys. We reuse GroupAggOp with a window key function.
+			// Windowed aggregation: use WindowAggOp so that each input delta
+			// only affects its corresponding window(s) and group key.
 			ws := n.WindowSpec
 			if ws == nil {
 				return nil, fmt.Errorf("windowSpec must not be nil in windowed branch")
 			}
-			keyFn := buildWindowKeyFn(ws.TimeCol, ws.SizeMillis)
+
+			// If there are group keys, we currently support a single key column
+			// in addition to the window. This can be extended to composite keys
+			// later if needed.
+			var groupKeyFn func(t types.Tuple) any
+			if len(n.Keys) == 0 {
+				groupKeyFn = func(t types.Tuple) any { return nil }
+			} else {
+				if len(n.Keys) != 1 {
+					return nil, fmt.Errorf("only single group key supported in windowed aggregation for now")
+				}
+				keyCol := n.Keys[0]
+				groupKeyFn = func(t types.Tuple) any { return t[keyCol] }
+			}
 
 			var agg op.AggFunc
 			var aggInit func() any
@@ -550,11 +568,24 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			case "COUNT", "count":
 				agg = &op.CountAgg{}
 				aggInit = func() any { return int64(0) }
+			case "AVG", "avg":
+				agg = &op.AvgAgg{ColName: n.AggCol}
+				aggInit = func() any { return nil }
+			case "MIN", "min":
+				agg = &op.MinAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
+			case "MAX", "max":
+				agg = &op.MaxAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
 			default:
 				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
 			}
 
-			g := op.NewGroupAggOp(keyFn, aggInit, agg)
+			waSpec := op.WindowSpecLite{
+				TimeCol:    ws.TimeCol,
+				SizeMillis: ws.SizeMillis,
+			}
+			g := op.NewWindowAggOp(waSpec, groupKeyFn, n.Keys, aggInit, agg)
 			return &op.Node{Op: g}, nil
 
 		case *LogicalFilter:
@@ -576,6 +607,15 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				case "COUNT", "count":
 					agg = &op.CountAgg{}
 					aggInit = func() any { return int64(0) }
+				case "AVG", "avg":
+					agg = &op.AvgAgg{ColName: n.AggCol}
+					aggInit = func() any { return nil }
+				case "MIN", "min":
+					agg = &op.MinAgg{ColName: n.AggCol}
+					aggInit = func() any { return op.NewSortedMultiset() }
+				case "MAX", "max":
+					agg = &op.MaxAgg{ColName: n.AggCol}
+					aggInit = func() any { return op.NewSortedMultiset() }
 				default:
 					return nil, fmt.Errorf("unsupported agg %s", n.AggName)
 				}
@@ -622,6 +662,15 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			case "COUNT", "count":
 				agg = &op.CountAgg{}
 				aggInit = func() any { return int64(0) }
+			case "AVG", "avg":
+				agg = &op.AvgAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.AvgMonoid{} }
+			case "MIN", "min":
+				agg = &op.MinAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
+			case "MAX", "max":
+				agg = &op.MaxAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
 			default:
 				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
 			}
@@ -651,7 +700,73 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 		default:
 			return nil, fmt.Errorf("unsupported input node to GroupAgg: %T", in)
 		}
+
+	case *LogicalWindowFunc:
+		// Transform window function to appropriate operator
+		return logicalWindowFuncToDBSP(n)
+
 	default:
 		return nil, fmt.Errorf("unsupported logical node: %T", n)
 	}
+}
+
+// logicalWindowFuncToDBSP transforms LogicalWindowFunc to DBSP operators
+func logicalWindowFuncToDBSP(wf *LogicalWindowFunc) (*op.Node, error) {
+	if wf.Spec.FuncName != "LAG" {
+		return nil, fmt.Errorf("only LAG window function is currently supported, got %s", wf.Spec.FuncName)
+	}
+
+	if len(wf.Spec.Args) == 0 {
+		return nil, fmt.Errorf("LAG requires at least one argument")
+	}
+
+	lagCol := wf.Spec.Args[0]
+
+	// Determine partition key function
+	var keyFn func(types.Tuple) any
+	if len(wf.Spec.PartitionBy) == 0 {
+		// No partition - single global partition
+		keyFn = func(t types.Tuple) any { return nil }
+	} else if len(wf.Spec.PartitionBy) == 1 {
+		// Single partition column
+		keyCol := wf.Spec.PartitionBy[0]
+		keyFn = func(t types.Tuple) any { return t[keyCol] }
+	} else {
+		// Multiple partition columns - composite key
+		partCols := wf.Spec.PartitionBy
+		keyFn = func(t types.Tuple) any {
+			key := make([]any, len(partCols))
+			for i, col := range partCols {
+				key[i] = t[col]
+			}
+			return fmt.Sprintf("%v", key)
+		}
+	}
+
+	// Create LagAgg operator
+	lagAgg := &op.LagAgg{
+		OrderByCol: wf.Spec.OrderBy,
+		LagCol:     lagCol,
+		Offset:     wf.Spec.Offset,
+		OutputCol:  wf.OutputCol,
+	}
+
+	// Initialize function for LagMonoid
+	aggInit := func() any {
+		return op.LagMonoid{
+			Buffer: op.NewOrderedBuffer(wf.Spec.OrderBy),
+		}
+	}
+
+	// Create GroupAggOp to handle partitioning
+	g := op.NewGroupAggOp(keyFn, aggInit, lagAgg)
+
+	// Check if there's an input node
+	if wf.Input != nil {
+		// For now, we return the operator directly
+		// In a full implementation, we'd chain with the input
+		return &op.Node{Op: g}, nil
+	}
+
+	return &op.Node{Op: g}, nil
 }
