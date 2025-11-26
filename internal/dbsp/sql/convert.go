@@ -56,23 +56,9 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		}
 	}
 
-	// Extract SELECT columns (for projection)
-	var selectCols []string
-	for _, expr := range sel.SelectExprs {
-		switch e := expr.(type) {
-		case *sqlparser.StarExpr:
-			// SELECT * - no projection needed
-			selectCols = nil
-		case *sqlparser.AliasedExpr:
-			switch ae := e.Expr.(type) {
-			case *sqlparser.ColName:
-				// Regular column
-				selectCols = append(selectCols, ae.Name.String())
-			case *sqlparser.FuncExpr:
-				// Aggregate function - will be handled in GROUP BY section
-				// Don't add to selectCols
-			}
-		}
+	selectCols, err := extractSelectColumns(sel)
+	if err != nil {
+		return nil, err
 	}
 
 	// Check for GROUP BY
@@ -94,91 +80,14 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		windowSpec *ir.WindowSpec
 	)
 
-	// Parse all GROUP BY expressions
-	for _, gbExpr := range sel.GroupBy {
-		switch e := gbExpr.(type) {
-		case *sqlparser.ColName:
-			// Regular GROUP BY column
-			groupCols = append(groupCols, e.Name.String())
-		case *sqlparser.FuncExpr:
-			// Minimal support for: GROUP BY TUMBLE(ts_col, INTERVAL '5' MINUTE)
-			funcName := e.Name.String()
-			if funcName != "tumble" && funcName != "TUMBLE" {
-				return nil, errors.New("unsupported GROUP BY function (only TUMBLE supported)")
-			}
-			if len(e.Exprs) != 2 {
-				return nil, errors.New("TUMBLE expects two arguments: time column, interval literal")
-			}
-
-			// First argument: time column
-			arg1, ok := e.Exprs[0].(*sqlparser.AliasedExpr)
-			if !ok {
-				return nil, errors.New("unsupported TUMBLE time column expression")
-			}
-			col, ok := arg1.Expr.(*sqlparser.ColName)
-			if !ok {
-				return nil, errors.New("TUMBLE time column must be a simple column name")
-			}
-			timeCol := col.Name.String()
-
-			// Second argument: we expect an interval literal, e.g., INTERVAL '5' MINUTE
-			arg2, ok := e.Exprs[1].(*sqlparser.AliasedExpr)
-			if !ok {
-				return nil, errors.New("unsupported TUMBLE interval expression")
-			}
-			// For now, be very strict and require the literal SQL text to be of the form:
-			// INTERVAL 'N' SECOND|MINUTE
-			intervalSQL := sqlparser.String(arg2.Expr)
-			// A tiny parser for the interval; we only support SECOND and MINUTE
-			sizeMillis, err := parseSimpleIntervalToMillis(intervalSQL)
-			if err != nil {
-				return nil, err
-			}
-
-			windowSpec = &ir.WindowSpec{
-				TimeCol:    timeCol,
-				SizeMillis: sizeMillis,
-			}
-		default:
-			return nil, errors.New("unsupported GROUP BY expression")
-		}
+	groupCols, windowSpec, err = parseGroupBy(sel.GroupBy)
+	if err != nil {
+		return nil, err
 	}
 
-	// find aggregate: scan SELECT list for SUM/COUNT and ignore window
-	var aggFunc string
-	var aggCol string
-	for _, expr := range sel.SelectExprs {
-		se, ok := expr.(*sqlparser.AliasedExpr)
-		if !ok {
-			continue
-		}
-		f, ok := se.Expr.(*sqlparser.FuncExpr)
-		if !ok {
-			continue
-		}
-		name := strings.ToUpper(sqlparser.String(f.Name))
-		// Ignore window functions such as TUMBLE here; we only care about
-		// true aggregates like SUM/COUNT/AVG/MIN/MAX.
-		if name != "SUM" && name != "COUNT" && name != "AVG" && name != "MIN" && name != "MAX" {
-			continue
-		}
-		if len(f.Exprs) != 1 {
-			return nil, errors.New("only single-arg aggregates supported")
-		}
-		ae, ok := f.Exprs[0].(*sqlparser.AliasedExpr)
-		if !ok {
-			return nil, errors.New("unsupported func arg")
-		}
-		switch a := ae.Expr.(type) {
-		case *sqlparser.ColName:
-			aggFunc = name
-			aggCol = a.Name.String()
-		default:
-			return nil, errors.New("unsupported aggregate arg type")
-		}
-	}
-	if aggFunc == "" {
-		return nil, errors.New("no aggregate function found")
+	aggFunc, aggCol, err := findSingleAggregate(sel.SelectExprs)
+	if err != nil {
+		return nil, err
 	}
 
 	// Build GroupAgg with input from current node (which may include filter)
