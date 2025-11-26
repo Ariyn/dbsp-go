@@ -55,9 +55,12 @@ func Differentiate(node *op.Node) (*op.Node, error) {
 			Inputs: node.Inputs,
 		}, nil
 
-	// TODO: Add Binary operator support for JOIN
-	// case *op.BinaryOp:
-	//     return differentiateBinary(node)
+	case *op.BinaryOp:
+		// Binary operators (Join, Union, Difference) follow the product rule:
+		// d(S ⊙ T) = (dS ⊙ T) + (S ⊙ dT) + (dS ⊙ dT)
+		// The BinaryOp already implements this rule in its ApplyBinary method
+		// by maintaining state and computing all three terms.
+		return differentiateBinary(node)
 
 	default:
 		return nil, fmt.Errorf("differentiation not implemented for operator type %T", opType)
@@ -68,4 +71,25 @@ func Differentiate(node *op.Node) (*op.Node, error) {
 // For now, this is a simple wrapper since we have single-operator nodes.
 func DifferentiateGraph(root *op.Node) (*op.Node, error) {
 	return Differentiate(root)
+}
+
+// differentiateBinary applies the product rule for binary operators.
+// For binary operators: d(S ⊙ T) = (dS ⊙ T) + (S ⊙ dT) + (dS ⊙ dT)
+//
+// The BinaryOp implementation already handles this through its ApplyBinary method
+// which maintains left and right state and computes all three terms.
+// The differentiated operator is the operator itself, as it processes deltas.
+func differentiateBinary(node *op.Node) (*op.Node, error) {
+	binOp, ok := node.Op.(*op.BinaryOp)
+	if !ok {
+		return nil, fmt.Errorf("expected BinaryOp, got %T", node.Op)
+	}
+
+	// For binary operators in DBSP, the derivative processes input deltas
+	// and the operator itself implements the product rule internally.
+	// We return a new node with the same operator (which maintains state).
+	return &op.Node{
+		Op:     binOp,
+		Inputs: node.Inputs,
+	}, nil
 }
