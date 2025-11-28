@@ -73,9 +73,9 @@ func TestJoinOp_IncrementalJoin(t *testing.T) {
 		func(tuple types.Tuple) any { return tuple["key"] },
 		func(l, r types.Tuple) types.Tuple {
 			return types.Tuple{
-				"key":    l["key"],
-				"l_val":  l["val"],
-				"r_val":  r["val"],
+				"key":   l["key"],
+				"l_val": l["val"],
+				"r_val": r["val"],
 			}
 		},
 	)

@@ -16,15 +16,15 @@ const (
 // BinaryOp represents a binary operation on two input streams.
 // For DBSP differentiation: d(S ⊙ T) = (dS ⊙ T) + (S ⊙ dT) + (dS ⊙ dT)
 type BinaryOp struct {
-	Type BinaryOpType
+	Type  BinaryOpType
 	Left  Operator
 	Right Operator
-	
+
 	// For Join: key extraction and combine functions
 	LeftKeyFn  func(types.Tuple) any
 	RightKeyFn func(types.Tuple) any
 	CombineFn  func(l, r types.Tuple) types.Tuple
-	
+
 	// State for incremental processing
 	leftState  map[any][]types.TupleDelta
 	rightState map[any][]types.TupleDelta
@@ -82,7 +82,7 @@ func (b *BinaryOp) ApplyBinary(leftDelta, rightDelta types.Batch) (types.Batch, 
 	if b.rightState == nil {
 		b.rightState = make(map[any][]types.TupleDelta)
 	}
-	
+
 	switch b.Type {
 	case BinaryJoin:
 		return b.applyJoin(leftDelta, rightDelta)
@@ -98,7 +98,7 @@ func (b *BinaryOp) ApplyBinary(leftDelta, rightDelta types.Batch) (types.Batch, 
 // applyJoin implements incremental join: ΔJoin = (ΔR⋈S) + (R⋈ΔS) + (ΔR⋈ΔS)
 func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, error) {
 	var out types.Batch
-	
+
 	// Part 1: ΔR ⋈ S (new left tuples join with existing right state)
 	for _, ld := range leftDelta {
 		leftKey := b.LeftKeyFn(ld.Tuple)
@@ -116,7 +116,7 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 			}
 		}
 	}
-	
+
 	// Part 2: R ⋈ ΔS (existing left state join with new right tuples)
 	for _, rd := range rightDelta {
 		rightKey := b.RightKeyFn(rd.Tuple)
@@ -133,7 +133,7 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 			}
 		}
 	}
-	
+
 	// Part 3: ΔR ⋈ ΔS (new left tuples join with new right tuples)
 	for _, ld := range leftDelta {
 		leftKey := b.LeftKeyFn(ld.Tuple)
@@ -151,7 +151,7 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 			}
 		}
 	}
-	
+
 	// Update state: add new deltas to the state
 	for _, ld := range leftDelta {
 		key := b.LeftKeyFn(ld.Tuple)
@@ -161,7 +161,7 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 		key := b.RightKeyFn(rd.Tuple)
 		b.rightState[key] = append(b.rightState[key], rd)
 	}
-	
+
 	return out, nil
 }
 
@@ -177,7 +177,7 @@ func (b *BinaryOp) applyUnion(leftDelta, rightDelta types.Batch) (types.Batch, e
 func (b *BinaryOp) applyDifference(leftDelta, rightDelta types.Batch) (types.Batch, error) {
 	out := make(types.Batch, 0, len(leftDelta)+len(rightDelta))
 	out = append(out, leftDelta...)
-	
+
 	// Negate right deltas (subtract from left)
 	for _, rd := range rightDelta {
 		out = append(out, types.TupleDelta{
@@ -185,7 +185,7 @@ func (b *BinaryOp) applyDifference(leftDelta, rightDelta types.Batch) (types.Bat
 			Count: -rd.Count,
 		})
 	}
-	
+
 	return out, nil
 }
 
