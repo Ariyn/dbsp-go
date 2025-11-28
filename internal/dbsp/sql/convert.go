@@ -13,18 +13,15 @@ import (
 
 // ParseQueryToLogicalPlan parses a tiny subset of SQL into a LogicalNode.
 func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
-	// Check for window functions FIRST (before sqlparser)
-	// Since xwb1989/sqlparser doesn't support OVER clause parsing,
-	// we do simple string matching
+	// 먼저 window function(LAG ... OVER ...)을 문자열로 감지한 뒤,
+	// SELECT/FROM 정보를 최소한으로 보존해 LogicalWindowFunc를 구성한다.
 	queryUpper := strings.ToUpper(query)
 	if strings.Contains(queryUpper, " OVER ") {
-		wf, err := parseWindowFunctionFromQuery(query)
+		wf, scan, err := parseWindowFunctionFromQuery(query)
 		if err != nil {
 			return nil, err
 		}
 		if wf != nil {
-			// Build scan node
-			scan := &ir.LogicalScan{Table: "t"}
 			wf.Input = scan
 			return wf, nil
 		}
@@ -155,20 +152,20 @@ func ParseQueryToDBSP(query string) (*op.Node, error) {
 
 // parseWindowFunctionFromQuery parses window function from query string
 // This is a simple parser since xwb1989/sqlparser doesn't support OVER clause
-func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, error) {
+func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, *ir.LogicalScan, error) {
 	// Find the OVER clause pattern: LAG(col, offset) OVER (PARTITION BY x ORDER BY y)
 	queryUpper := strings.ToUpper(query)
 
 	// Find LAG function
 	lagIdx := strings.Index(queryUpper, "LAG(")
 	if lagIdx == -1 {
-		return nil, nil // No LAG function
+		return nil, nil, nil // No LAG function
 	}
 
 	// Find OVER clause
 	overIdx := strings.Index(queryUpper[lagIdx:], "OVER")
 	if overIdx == -1 {
-		return nil, errors.New("LAG function requires OVER clause")
+		return nil, nil, errors.New("LAG function requires OVER clause")
 	}
 	overIdx += lagIdx
 
@@ -176,7 +173,7 @@ func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, error) {
 	lagStart := lagIdx + 4 // after "LAG("
 	lagEnd := strings.Index(query[lagStart:], ")")
 	if lagEnd == -1 {
-		return nil, errors.New("LAG function not closed properly")
+		return nil, nil, errors.New("LAG function not closed properly")
 	}
 	lagEnd += lagStart
 
@@ -189,7 +186,7 @@ func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, error) {
 	if len(lagArgsParts) > 0 {
 		lagCol = strings.TrimSpace(lagArgsParts[0])
 	} else {
-		return nil, errors.New("LAG requires at least one argument")
+		return nil, nil, errors.New("LAG requires at least one argument")
 	}
 
 	if len(lagArgsParts) > 1 {
@@ -202,13 +199,13 @@ func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, error) {
 	// Extract OVER clause content
 	overStart := strings.Index(query[overIdx:], "(")
 	if overStart == -1 {
-		return nil, errors.New("OVER clause must have parentheses")
+		return nil, nil, errors.New("OVER clause must have parentheses")
 	}
 	overStart += overIdx + 1
 
 	overEnd := strings.Index(query[overStart:], ")")
 	if overEnd == -1 {
-		return nil, errors.New("OVER clause not closed properly")
+		return nil, nil, errors.New("OVER clause not closed properly")
 	}
 	overEnd += overStart
 
@@ -243,7 +240,7 @@ func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, error) {
 	var orderBy string
 	orderIdx := strings.Index(overContentUpper, "ORDER BY")
 	if orderIdx == -1 {
-		return nil, errors.New("LAG requires ORDER BY in OVER clause")
+		return nil, nil, errors.New("LAG requires ORDER BY in OVER clause")
 	}
 
 	orderStart := orderIdx + 8 // after "ORDER BY"
@@ -254,24 +251,35 @@ func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, error) {
 	if len(orderParts) > 0 {
 		orderBy = orderParts[0]
 	} else {
-		return nil, errors.New("ORDER BY must specify a column")
+		return nil, nil, errors.New("ORDER BY must specify a column")
 	}
 
-	// Determine output column name from alias
+	// Determine output column name from alias (기본값: lag_<col>)
 	outputCol := "lag_" + lagCol
 
-	// Try to extract alias from query
-	asIdx := strings.Index(queryUpper, " AS ")
-	if asIdx != -1 {
-		afterAs := strings.TrimSpace(query[asIdx+4:])
-		// Extract alias (word before FROM)
-		fromIdx := strings.Index(strings.ToUpper(afterAs), " FROM")
-		if fromIdx != -1 {
-			outputCol = strings.TrimSpace(afterAs[:fromIdx])
+	// 최소한으로 SELECT ... FROM ... 구조에서 alias와 테이블명을 뽑는다.
+	// 형식 가정: SELECT <expr> AS alias FROM <table>
+	fromIdx := strings.Index(queryUpper, " FROM ")
+	var tableName string = "t"
+	if fromIdx != -1 {
+		fromPart := strings.TrimSpace(queryUpper[fromIdx+6:])
+		// 테이블명은 FROM 뒤 첫 토큰으로 가정
+		parts := strings.Fields(fromPart)
+		if len(parts) > 0 {
+			tableName = strings.TrimSpace(parts[0])
 		}
 	}
 
-	return &ir.LogicalWindowFunc{
+	// alias 추출: OVER ... AS alias FROM
+	asIdx := strings.Index(queryUpper, " AS ")
+	if asIdx != -1 && fromIdx != -1 && asIdx < fromIdx {
+		afterAs := strings.TrimSpace(query[asIdx+4 : fromIdx])
+		if afterAs != "" {
+			outputCol = afterAs
+		}
+	}
+
+	wf := &ir.LogicalWindowFunc{
 		Spec: ir.WindowFuncSpec{
 			FuncName:    "LAG",
 			Args:        []string{lagCol},
@@ -280,7 +288,10 @@ func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, error) {
 			Offset:      offset,
 		},
 		OutputCol: outputCol,
-	}, nil
+	}
+
+	scan := &ir.LogicalScan{Table: tableName}
+	return wf, scan, nil
 }
 
 // ParseQueryToIncrementalDBSP parses SQL, builds DBSP graph, and applies differentiation.

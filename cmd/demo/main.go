@@ -270,9 +270,75 @@ func main() {
 
 	runDeleteUpdateDemo()
 
+	// LAG(PARTITION BY ...) 윈도우 함수 데모
+	fmt.Println("\n╔═══════════════════════════════════════════════════════════╗")
+	fmt.Println("║  LAG(Window) 예제: PARTITION BY + ORDER BY               ║")
+	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
+	fmt.Println()
+
+	runLagPartitionByDemo()
+
 	fmt.Println("\n╔═══════════════════════════════════════════════════════════╗")
 	fmt.Println("║  Demo 완료                                                ║")
 	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
+}
+
+// LAG(window) + PARTITION BY 데모
+//
+//	SELECT id, ts, value,
+//	       LAG(value) OVER (PARTITION BY id ORDER BY ts) AS prev_value
+//	FROM metrics
+func runLagPartitionByDemo() {
+	query := `
+		SELECT LAG(value) OVER (PARTITION BY id ORDER BY ts) AS prev_value
+		FROM metrics
+	`
+
+	fmt.Println("📝 Query:")
+	fmt.Println("   ", query)
+	fmt.Println()
+
+	node, err := sqlconv.ParseQueryToIncrementalDBSP(query)
+	if err != nil {
+		fmt.Printf("❌ 파싱 에러: %v\n", err)
+		return
+	}
+
+	fmt.Println("✅ LAG(Window) 쿼리를 증분 DBSP 그래프로 변환 완료")
+
+	batch := types.Batch{
+		// id=A 파티션
+		{Tuple: types.Tuple{"id": "A", "ts": int64(1), "value": 10}, Count: 1},
+		{Tuple: types.Tuple{"id": "A", "ts": int64(2), "value": 20}, Count: 1},
+		{Tuple: types.Tuple{"id": "A", "ts": int64(3), "value": 30}, Count: 1},
+		// id=B 파티션
+		{Tuple: types.Tuple{"id": "B", "ts": int64(1), "value": 100}, Count: 1},
+		{Tuple: types.Tuple{"id": "B", "ts": int64(2), "value": 200}, Count: 1},
+	}
+
+	fmt.Println("\n입력 Batch:")
+	for _, td := range batch {
+		fmt.Printf("   • %v\n", formatTuple(td.Tuple))
+	}
+
+	out, err := op.Execute(node, batch)
+	if err != nil {
+		fmt.Printf("❌ 실행 에러: %v\n", err)
+		return
+	}
+
+	if len(out) == 0 {
+		fmt.Println("   (결과 없음)")
+		return
+	}
+
+	fmt.Println("\n📈 LAG 결과 (prev_value):")
+	for _, td := range out {
+		if td.Count <= 0 {
+			continue
+		}
+		fmt.Printf("   • %v\n", formatTuple(td.Tuple))
+	}
 }
 
 func runTumbleWindowDemo() {
