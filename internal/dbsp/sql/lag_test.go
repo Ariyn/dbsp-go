@@ -969,7 +969,7 @@ func TestLagSQL_E2E_NoPartition(t *testing.T) {
 // ============================================================================
 
 func TestWindowedAvgLikeIntegration(t *testing.T) {
-	query := `SELECT k, AVG(v) FROM t GROUP BY TUMBLE(ts, INTERVAL '5' MINUTE), k`
+	query := `SELECT k, AVG(v) FROM t GROUP BY TUMBLE(ts, INTERVAL 5 MINUTE), k`
 
 	root, err := ParseQueryToIncrementalDBSP(query)
 	if err != nil {

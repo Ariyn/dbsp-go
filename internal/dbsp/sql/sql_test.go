@@ -429,7 +429,7 @@ func TestParseQuerySelectStar(t *testing.T) {
 // ============================================================================
 
 func TestParseQueryWithTumbleWindow(t *testing.T) {
-	q := "SELECT TUMBLE(ts, INTERVAL '5' MINUTE), SUM(amount) FROM t GROUP BY TUMBLE(ts, INTERVAL '5' MINUTE)"
+	q := "SELECT TUMBLE(ts, INTERVAL 5 MINUTE), SUM(amount) FROM t GROUP BY TUMBLE(ts, INTERVAL 5 MINUTE)"
 	lp, err := ParseQueryToLogicalPlan(q)
 	if err != nil {
 		t.Fatalf("ParseQueryToLogicalPlan with TUMBLE failed: %v", err)

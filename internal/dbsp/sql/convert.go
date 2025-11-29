@@ -5,48 +5,52 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Ariyn/tree-sitter-duckdb/bindings/go/ast"
+	"github.com/Ariyn/tree-sitter-duckdb/bindings/go/parser"
 	"github.com/ariyn/dbsp/internal/dbsp/diff"
 	"github.com/ariyn/dbsp/internal/dbsp/ir"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
-	"github.com/xwb1989/sqlparser"
 )
 
 // ParseQueryToLogicalPlan parses a tiny subset of SQL into a LogicalNode.
 func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
-	// 먼저 window function(LAG ... OVER ...)을 문자열로 감지한 뒤,
-	// SELECT/FROM 정보를 최소한으로 보존해 LogicalWindowFunc를 구성한다.
-	queryUpper := strings.ToUpper(query)
-	if strings.Contains(queryUpper, " OVER ") {
-		wf, scan, err := parseWindowFunctionFromQuery(query)
-		if err != nil {
-			return nil, err
-		}
-		if wf != nil {
-			wf.Input = scan
-			return wf, nil
-		}
-	}
-
-	stmt, err := sqlparser.Parse(query)
+	p := parser.NewParser()
+	stmt, err := p.Parse(query)
 	if err != nil {
 		return nil, err
 	}
-	sel, ok := stmt.(*sqlparser.Select)
+
+	sel, ok := stmt.(*ast.Select)
 	if !ok {
 		return nil, errors.New("only SELECT supported")
+	}
+
+	// Check for window functions (LAG ... OVER ...)
+	if wf, scan, err := parseWindowFunctionFromSelect(sel); wf != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		wf.Input = scan
+		return wf, nil
 	}
 
 	if len(sel.From) != 1 {
 		return nil, errors.New("only single FROM table supported")
 	}
 
-	// Start with scan
-	scan := &ir.LogicalScan{Table: "t"}
+	// Start with scan - extract table name from FROM
+	tableName := "t"
+	if tableExpr, ok := sel.From[0].(*ast.TableName); ok {
+		tableName = tableExpr.Name
+	}
+	scan := &ir.LogicalScan{Table: tableName}
 	var currentNode ir.LogicalNode = scan
 
 	// Add filter if WHERE clause exists
 	if sel.Where != nil {
-		whereSQL := sqlparser.String(sel.Where.Expr)
+		whereSQL := sel.Where.String()
+		// Remove surrounding quotes that tree-sitter adds
+		whereSQL = strings.Trim(whereSQL, "'\"")
 		currentNode = &ir.LogicalFilter{
 			PredicateSQL: whereSQL,
 			Input:        currentNode,
@@ -82,7 +86,8 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		return nil, err
 	}
 
-	aggFunc, aggCol, err := findSingleAggregate(sel.SelectExprs)
+	// Use original query string to find aggregate because parser has bugs
+	aggFunc, aggCol, err := findSingleAggregateFromQuery(query)
 	if err != nil {
 		return nil, err
 	}
@@ -104,24 +109,42 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 func parseSimpleIntervalToMillis(intervalSQL string) (int64, error) {
 	// We keep this implementation intentionally simple and strict to avoid
 	// pulling in a full interval parser. We expect something like:
-	// INTERVAL '5' SECOND
-	// INTERVAL '10' MINUTE
+	// INTERVAL '5' SECOND  (old sqlparser format)
+	// INTERVAL 5 MINUTE    (tree-sitter format, may be quoted)
 	upper := strings.ToUpper(strings.TrimSpace(intervalSQL))
+	
+	// Remove outer quotes if present (from tree-sitter String() method)
+	upper = strings.Trim(upper, "'\"")
+	
 	if !strings.HasPrefix(upper, "INTERVAL") {
 		return 0, errors.New("interval must start with INTERVAL")
 	}
 	// Remove leading INTERVAL
 	rest := strings.TrimSpace(upper[len("INTERVAL"):])
-	// Expect a quoted integer literal followed by a unit
-	if !strings.HasPrefix(rest, "'") {
-		return 0, errors.New("INTERVAL literal must contain quoted number")
+	
+	// Parse two formats:
+	// 1. INTERVAL '5' MINUTE (quoted number)
+	// 2. INTERVAL 5 MINUTE (unquoted number)
+	var numStr, restUnit string
+	
+	if strings.HasPrefix(rest, "'") {
+		// Format 1: quoted number
+		endQuote := strings.Index(rest[1:], "'")
+		if endQuote <= 0 {
+			return 0, errors.New("invalid INTERVAL literal")
+		}
+		numStr = rest[1 : 1+endQuote]
+		restUnit = strings.TrimSpace(rest[1+endQuote+1:])
+	} else {
+		// Format 2: unquoted number
+		parts := strings.Fields(rest)
+		if len(parts) < 2 {
+			return 0, errors.New("INTERVAL must have number and unit")
+		}
+		numStr = parts[0]
+		restUnit = parts[1]
 	}
-	endQuote := strings.Index(rest[1:], "'")
-	if endQuote <= 0 {
-		return 0, errors.New("invalid INTERVAL literal")
-	}
-	numStr := rest[1 : 1+endQuote]
-	restUnit := strings.TrimSpace(rest[1+endQuote+1:])
+	
 	if restUnit == "" {
 		return 0, errors.New("INTERVAL must specify a unit")
 	}
@@ -150,132 +173,67 @@ func ParseQueryToDBSP(query string) (*op.Node, error) {
 	return ir.LogicalToDBSP(lp)
 }
 
-// parseWindowFunctionFromQuery parses window function from query string
-// This is a simple parser since xwb1989/sqlparser doesn't support OVER clause
-func parseWindowFunctionFromQuery(query string) (*ir.LogicalWindowFunc, *ir.LogicalScan, error) {
-	// Find the OVER clause pattern: LAG(col, offset) OVER (PARTITION BY x ORDER BY y)
-	queryUpper := strings.ToUpper(query)
+// parseWindowFunctionFromSelect parses window function from AST Select
+func parseWindowFunctionFromSelect(sel *ast.Select) (*ir.LogicalWindowFunc, *ir.LogicalScan, error) {
+	// Find LAG function with OVER clause in SELECT list
+	var lagFunc *ast.FuncExpr
+	var outputCol string
 
-	// Find LAG function
-	lagIdx := strings.Index(queryUpper, "LAG(")
-	if lagIdx == -1 {
-		return nil, nil, nil // No LAG function
-	}
-
-	// Find OVER clause
-	overIdx := strings.Index(queryUpper[lagIdx:], "OVER")
-	if overIdx == -1 {
-		return nil, nil, errors.New("LAG function requires OVER clause")
-	}
-	overIdx += lagIdx
-
-	// Extract LAG arguments
-	lagStart := lagIdx + 4 // after "LAG("
-	lagEnd := strings.Index(query[lagStart:], ")")
-	if lagEnd == -1 {
-		return nil, nil, errors.New("LAG function not closed properly")
-	}
-	lagEnd += lagStart
-
-	lagArgsStr := strings.TrimSpace(query[lagStart:lagEnd])
-	lagArgsParts := strings.Split(lagArgsStr, ",")
-
-	var lagCol string
-	offset := 1
-
-	if len(lagArgsParts) > 0 {
-		lagCol = strings.TrimSpace(lagArgsParts[0])
-	} else {
-		return nil, nil, errors.New("LAG requires at least one argument")
-	}
-
-	if len(lagArgsParts) > 1 {
-		offsetStr := strings.TrimSpace(lagArgsParts[1])
-		if offsetVal, err := strconv.Atoi(offsetStr); err == nil {
-			offset = offsetVal
-		}
-	}
-
-	// Extract OVER clause content
-	overStart := strings.Index(query[overIdx:], "(")
-	if overStart == -1 {
-		return nil, nil, errors.New("OVER clause must have parentheses")
-	}
-	overStart += overIdx + 1
-
-	overEnd := strings.Index(query[overStart:], ")")
-	if overEnd == -1 {
-		return nil, nil, errors.New("OVER clause not closed properly")
-	}
-	overEnd += overStart
-
-	overContent := query[overStart:overEnd]
-	overContentUpper := strings.ToUpper(overContent)
-
-	// Parse PARTITION BY
-	var partitionBy []string
-	partIdx := strings.Index(overContentUpper, "PARTITION BY")
-	if partIdx != -1 {
-		partStart := partIdx + 12 // after "PARTITION BY"
-
-		// Find end of PARTITION BY clause (either ORDER BY or end)
-		orderIdx := strings.Index(overContentUpper[partStart:], "ORDER BY")
-		var partEnd int
-		if orderIdx != -1 {
-			partEnd = partStart + orderIdx
-		} else {
-			partEnd = len(overContent)
-		}
-
-		partCols := strings.TrimSpace(overContent[partStart:partEnd])
-		for _, col := range strings.Split(partCols, ",") {
-			col = strings.TrimSpace(col)
-			if col != "" {
-				partitionBy = append(partitionBy, col)
+	for _, item := range sel.SelectList {
+		if funcExpr, ok := item.Expr.(*ast.FuncExpr); ok {
+			if strings.ToUpper(funcExpr.Name) == "LAG" && funcExpr.Over != nil {
+				lagFunc = funcExpr
+				if item.As != "" {
+					outputCol = item.As
+				}
+				break
 			}
 		}
 	}
 
-	// Parse ORDER BY
-	var orderBy string
-	orderIdx := strings.Index(overContentUpper, "ORDER BY")
-	if orderIdx == -1 {
-		return nil, nil, errors.New("LAG requires ORDER BY in OVER clause")
+	if lagFunc == nil {
+		return nil, nil, nil // No LAG function
 	}
 
-	orderStart := orderIdx + 8 // after "ORDER BY"
-	orderContent := strings.TrimSpace(overContent[orderStart:])
-
-	// Take first column (ignore ASC/DESC for now)
-	orderParts := strings.Fields(orderContent)
-	if len(orderParts) > 0 {
-		orderBy = orderParts[0]
-	} else {
-		return nil, nil, errors.New("ORDER BY must specify a column")
+	// Extract LAG arguments
+	if len(lagFunc.Args) < 1 {
+		return nil, nil, errors.New("LAG requires at least one argument")
 	}
 
-	// Determine output column name from alias (기본값: lag_<col>)
-	outputCol := "lag_" + lagCol
+	lagCol := lagFunc.Args[0].String()
+	offset := 1
 
-	// 최소한으로 SELECT ... FROM ... 구조에서 alias와 테이블명을 뽑는다.
-	// 형식 가정: SELECT <expr> AS alias FROM <table>
-	fromIdx := strings.Index(queryUpper, " FROM ")
-	var tableName string = "t"
-	if fromIdx != -1 {
-		fromPart := strings.TrimSpace(queryUpper[fromIdx+6:])
-		// 테이블명은 FROM 뒤 첫 토큰으로 가정
-		parts := strings.Fields(fromPart)
-		if len(parts) > 0 {
-			tableName = strings.TrimSpace(parts[0])
+	if len(lagFunc.Args) > 1 {
+		if lit, ok := lagFunc.Args[1].(*ast.Literal); ok && lit.Type == "INTEGER" {
+			if val, err := strconv.Atoi(lit.Value); err == nil {
+				offset = val
+			}
 		}
 	}
 
-	// alias 추출: OVER ... AS alias FROM
-	asIdx := strings.Index(queryUpper, " AS ")
-	if asIdx != -1 && fromIdx != -1 && asIdx < fromIdx {
-		afterAs := strings.TrimSpace(query[asIdx+4 : fromIdx])
-		if afterAs != "" {
-			outputCol = afterAs
+	// Parse PARTITION BY from OVER clause
+	var partitionBy []string
+	for _, expr := range lagFunc.Over.PartitionBy {
+		partitionBy = append(partitionBy, expr.String())
+	}
+
+	// Parse ORDER BY from OVER clause
+	var orderBy string
+	if len(lagFunc.Over.OrderBy) == 0 {
+		return nil, nil, errors.New("LAG requires ORDER BY in OVER clause")
+	}
+	orderBy = lagFunc.Over.OrderBy[0].Expr.String()
+
+	// Determine output column name
+	if outputCol == "" {
+		outputCol = "lag_" + lagCol
+	}
+
+	// Extract table name from FROM clause
+	tableName := "t"
+	if len(sel.From) > 0 {
+		if tableExpr, ok := sel.From[0].(*ast.TableName); ok {
+			tableName = tableExpr.Name
 		}
 	}
 

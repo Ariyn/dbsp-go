@@ -5,10 +5,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Ariyn/tree-sitter-duckdb/bindings/go/ast"
+	"github.com/Ariyn/tree-sitter-duckdb/bindings/go/parser"
 	"github.com/ariyn/dbsp/internal/dbsp/ir"
 	"github.com/ariyn/dbsp/internal/dbsp/state"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
-	"github.com/xwb1989/sqlparser"
 )
 
 // ParseDMLToBatch converts INSERT/UPDATE/DELETE SQL statements to types.Batch
@@ -19,17 +20,18 @@ func ParseDMLToBatch(sql string) (types.Batch, error) {
 
 // ParseDMLToBatchWithStore converts DML with optional state store for DELETE/UPDATE
 func ParseDMLToBatchWithStore(sql string, store *state.Store) (types.Batch, error) {
-	stmt, err := sqlparser.Parse(sql)
+	p := parser.NewParser()
+	stmt, err := p.Parse(sql)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse SQL: %w", err)
 	}
 
 	switch stmt := stmt.(type) {
-	case *sqlparser.Insert:
+	case *ast.Insert:
 		return parseInsert(stmt)
-	case *sqlparser.Delete:
+	case *ast.Delete:
 		return parseDelete(stmt, store)
-	case *sqlparser.Update:
+	case *ast.Update:
 		return parseUpdate(stmt, store)
 	default:
 		return nil, fmt.Errorf("unsupported SQL statement type: %T", stmt)
@@ -37,63 +39,56 @@ func ParseDMLToBatchWithStore(sql string, store *state.Store) (types.Batch, erro
 }
 
 // parseInsert converts INSERT INTO statement to Batch
-func parseInsert(stmt *sqlparser.Insert) (types.Batch, error) {
+func parseInsert(stmt *ast.Insert) (types.Batch, error) {
 	var batch types.Batch
 
 	// Get column names
-	var columns []string
-	if len(stmt.Columns) > 0 {
-		for _, col := range stmt.Columns {
-			columns = append(columns, col.String())
-		}
-	}
+	columns := stmt.Columns
 
 	// Handle VALUES clause
-	switch rows := stmt.Rows.(type) {
-	case sqlparser.Values:
-		for _, valTuple := range rows {
-			tuple := make(types.Tuple)
+	if len(stmt.Values) == 0 {
+		return nil, fmt.Errorf("unsupported INSERT type: only VALUES is supported")
+	}
 
-			for i, expr := range valTuple {
-				var colName string
-				if i < len(columns) {
-					colName = columns[i]
-				} else {
-					colName = fmt.Sprintf("col%d", i)
-				}
-
-				value, err := extractValue(expr)
-				if err != nil {
-					return nil, fmt.Errorf("failed to extract value: %w", err)
-				}
-				tuple[colName] = value
+	for _, row := range stmt.Values {
+		tuple := make(types.Tuple)
+		for i, expr := range row {
+			var colName string
+			if i < len(columns) {
+				colName = columns[i]
+			} else {
+				colName = fmt.Sprintf("col%d", i)
 			}
 
-			batch = append(batch, types.TupleDelta{
-				Tuple: tuple,
-				Count: 1,
-			})
+			value, err := extractValue(expr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to extract value: %w", err)
+			}
+			tuple[colName] = value
 		}
-	default:
-		return nil, fmt.Errorf("unsupported INSERT type: %T", rows)
+
+		batch = append(batch, types.TupleDelta{
+			Tuple: tuple,
+			Count: 1,
+		})
 	}
 
 	return batch, nil
 }
 
 // parseDelete converts DELETE FROM statement to Batch with Count: -1
-func parseDelete(stmt *sqlparser.Delete, store *state.Store) (types.Batch, error) {
+func parseDelete(stmt *ast.Delete, store *state.Store) (types.Batch, error) {
 	if store == nil {
 		return nil, fmt.Errorf("DELETE requires a state store")
 	}
 
 	// Get table name
-	tableName := sqlparser.String(stmt.TableExprs)
+	tableName := stmt.Table
 
 	// Build predicate from WHERE clause
 	var predicate func(types.Tuple) bool
 	if stmt.Where != nil {
-		whereSQL := sqlparser.String(stmt.Where.Expr)
+		whereSQL := stmt.Where.String()
 		predicate = ir.BuildPredicateFunc(whereSQL)
 	} else {
 		// No WHERE clause: delete all
@@ -106,19 +101,19 @@ func parseDelete(stmt *sqlparser.Delete, store *state.Store) (types.Batch, error
 }
 
 // parseUpdate converts UPDATE statement to Batch (DELETE old + INSERT new)
-func parseUpdate(stmt *sqlparser.Update, store *state.Store) (types.Batch, error) {
+func parseUpdate(stmt *ast.Update, store *state.Store) (types.Batch, error) {
 	if store == nil {
 		return nil, fmt.Errorf("UPDATE requires a state store")
 	}
 
 	// Get table name
-	tableName := sqlparser.String(stmt.TableExprs)
+	tableName := stmt.Table
 
 	// Parse SET clause
 	updates := make(map[string]any)
-	for _, expr := range stmt.Exprs {
-		colName := expr.Name.Name.String()
-		value, err := extractValue(expr.Expr)
+	for _, a := range stmt.Set {
+		colName := a.Column
+		value, err := extractValue(a.Value)
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract update value: %w", err)
 		}
@@ -128,7 +123,7 @@ func parseUpdate(stmt *sqlparser.Update, store *state.Store) (types.Batch, error
 	// Build predicate from WHERE clause
 	var predicate func(types.Tuple) bool
 	if stmt.Where != nil {
-		whereSQL := sqlparser.String(stmt.Where.Expr)
+		whereSQL := stmt.Where.String()
 		predicate = ir.BuildPredicateFunc(whereSQL)
 	} else {
 		// No WHERE clause: update all
@@ -141,27 +136,35 @@ func parseUpdate(stmt *sqlparser.Update, store *state.Store) (types.Batch, error
 }
 
 // extractValue extracts Go value from sqlparser.Expr
-func extractValue(expr sqlparser.Expr) (any, error) {
+func extractValue(expr ast.Expr) (any, error) {
 	switch v := expr.(type) {
-	case *sqlparser.SQLVal:
+	case *ast.Literal:
 		switch v.Type {
-		case sqlparser.IntVal:
-			return strconv.ParseInt(string(v.Val), 10, 64)
-		case sqlparser.FloatVal:
-			return strconv.ParseFloat(string(v.Val), 64)
-		case sqlparser.StrVal:
-			return string(v.Val), nil
+		case "INTEGER":
+			// Try int first, but fall back to float if it contains decimal point
+			if strings.Contains(v.Value, ".") {
+				return strconv.ParseFloat(v.Value, 64)
+			}
+			return strconv.ParseInt(v.Value, 10, 64)
+		case "FLOAT":
+			return strconv.ParseFloat(v.Value, 64)
+		case "STRING":
+			return v.Value, nil
+		case "BOOL":
+			return strconv.ParseBool(v.Value)
+		case "NULL":
+			return nil, nil
 		default:
-			return string(v.Val), nil
+			return v.Value, nil
 		}
-	case *sqlparser.NullVal:
-		return nil, nil
 	default:
 		// Try to convert to string as fallback
-		str := strings.Trim(sqlparser.String(v), "'\"")
+		str := strings.Trim(expr.String(), "'\"")
 		// Try to parse as number
-		if num, err := strconv.ParseInt(str, 10, 64); err == nil {
-			return num, nil
+		if !strings.Contains(str, ".") {
+			if num, err := strconv.ParseInt(str, 10, 64); err == nil {
+				return num, nil
+			}
 		}
 		if num, err := strconv.ParseFloat(str, 64); err == nil {
 			return num, nil

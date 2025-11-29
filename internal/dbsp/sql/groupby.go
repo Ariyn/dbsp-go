@@ -2,14 +2,15 @@ package sqlconv
 
 import (
 	"errors"
+	"strings"
 
+	"github.com/Ariyn/tree-sitter-duckdb/bindings/go/ast"
 	"github.com/ariyn/dbsp/internal/dbsp/ir"
-	"github.com/xwb1989/sqlparser"
 )
 
 // parseGroupBy parses GROUP BY expressions, extracting grouping columns and
 // at most one tumbling window specification.
-func parseGroupBy(groupBy sqlparser.GroupBy) ([]string, *ir.WindowSpec, error) {
+func parseGroupBy(groupBy ast.GroupBy) ([]string, *ir.WindowSpec, error) {
 	var (
 		groupCols  []string
 		windowSpec *ir.WindowSpec
@@ -17,35 +18,27 @@ func parseGroupBy(groupBy sqlparser.GroupBy) ([]string, *ir.WindowSpec, error) {
 
 	for _, gbExpr := range groupBy {
 		switch e := gbExpr.(type) {
-		case *sqlparser.ColName:
-			groupCols = append(groupCols, e.Name.String())
-		case *sqlparser.FuncExpr:
+		case *ast.ColName:
+			groupCols = append(groupCols, e.Name)
+		case *ast.FuncExpr:
 			// Minimal support for: GROUP BY TUMBLE(ts_col, INTERVAL '5' MINUTE)
-			funcName := e.Name.String()
-			if funcName != "tumble" && funcName != "TUMBLE" {
+			funcName := strings.ToUpper(e.Name)
+			if funcName != "TUMBLE" {
 				return nil, nil, errors.New("unsupported GROUP BY function (only TUMBLE supported)")
 			}
-			if len(e.Exprs) != 2 {
+			if len(e.Args) != 2 {
 				return nil, nil, errors.New("TUMBLE expects two arguments: time column, interval literal")
 			}
 
 			// First argument: time column
-			arg1, ok := e.Exprs[0].(*sqlparser.AliasedExpr)
-			if !ok {
-				return nil, nil, errors.New("unsupported TUMBLE time column expression")
-			}
-			col, ok := arg1.Expr.(*sqlparser.ColName)
+			col, ok := e.Args[0].(*ast.ColName)
 			if !ok {
 				return nil, nil, errors.New("TUMBLE time column must be a simple column name")
 			}
-			timeCol := col.Name.String()
+			timeCol := col.Name
 
 			// Second argument: we expect an interval literal, e.g., INTERVAL '5' MINUTE
-			arg2, ok := e.Exprs[1].(*sqlparser.AliasedExpr)
-			if !ok {
-				return nil, nil, errors.New("unsupported TUMBLE interval expression")
-			}
-			intervalSQL := sqlparser.String(arg2.Expr)
+			intervalSQL := e.Args[1].String()
 			sizeMillis, err := parseSimpleIntervalToMillis(intervalSQL)
 			if err != nil {
 				return nil, nil, err
