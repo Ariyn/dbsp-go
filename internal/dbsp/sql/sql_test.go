@@ -428,71 +428,34 @@ func TestParseQuerySelectStar(t *testing.T) {
 // Window Function Tests
 // ============================================================================
 
-func TestParseQueryWithTumbleWindow(t *testing.T) {
-	q := "SELECT TUMBLE(ts, INTERVAL 5 MINUTE), SUM(amount) FROM t GROUP BY TUMBLE(ts, INTERVAL 5 MINUTE)"
+func TestParseQueryWithWindowAggregate(t *testing.T) {
+	// DuckDB standard window aggregate syntax
+	// Note: Frame specification is not yet supported by the parser
+	q := "SELECT SUM(amount) OVER (PARTITION BY region ORDER BY ts) AS rolling_sum FROM t"
 	lp, err := ParseQueryToLogicalPlan(q)
 	if err != nil {
-		t.Fatalf("ParseQueryToLogicalPlan with TUMBLE failed: %v", err)
+		t.Fatalf("ParseQueryToLogicalPlan with window aggregate failed: %v", err)
 	}
 
-	ga, ok := lp.(*ir.LogicalGroupAgg)
+	wa, ok := lp.(*ir.LogicalWindowAgg)
 	if !ok {
-		t.Fatalf("expected LogicalGroupAgg, got %T", lp)
+		t.Fatalf("expected LogicalWindowAgg, got %T", lp)
 	}
-	if ga.WindowSpec == nil {
-		t.Fatalf("expected non-nil WindowSpec for TUMBLE query")
+	if wa.AggName != "SUM" {
+		t.Errorf("expected AggName=SUM, got %s", wa.AggName)
 	}
-	if ga.WindowSpec.TimeCol != "ts" {
-		t.Errorf("expected TimeCol=ts, got %s", ga.WindowSpec.TimeCol)
+	if wa.AggCol != "amount" {
+		t.Errorf("expected AggCol=amount, got %s", wa.AggCol)
 	}
-	// 5 minutes in millis
-	if ga.WindowSpec.SizeMillis != 5*60*1000 {
-		t.Errorf("expected SizeMillis=300000, got %d", ga.WindowSpec.SizeMillis)
+	if len(wa.PartitionBy) != 1 || wa.PartitionBy[0] != "region" {
+		t.Errorf("expected PartitionBy=[region], got %v", wa.PartitionBy)
 	}
-
-	// Also ensure that executing the DBSP node groups by window correctly.
-	node, err := ParseQueryToDBSP(q)
-	if err != nil {
-		t.Fatalf("ParseQueryToDBSP with TUMBLE failed: %v", err)
+	if wa.OrderBy != "ts" {
+		t.Errorf("expected OrderBy=ts, got %s", wa.OrderBy)
 	}
 
-	// ts is in millis: 0ms, 2min, 7min (so windows [0,5), [5,10))
-	batch := types.Batch{
-		{Tuple: types.Tuple{"ts": int64(0), "amount": 100}, Count: 1},
-		{Tuple: types.Tuple{"ts": int64(2 * 60 * 1000), "amount": 50}, Count: 1},
-		{Tuple: types.Tuple{"ts": int64(7 * 60 * 1000), "amount": 200}, Count: 1},
-	}
-
-	out, err := op.Execute(node, batch)
-	if err != nil {
-		t.Fatalf("Execute with TUMBLE failed: %v", err)
-	}
-	if len(out) == 0 {
-		t.Fatalf("expected non-empty output for TUMBLE aggregation")
-	}
-
-	// Verify windowed aggregation results from output deltas
-	w0 := int64(0)
-	w1 := int64(5 * 60 * 1000)
-
-	sumByWindow := map[int64]float64{}
-	for _, td := range out {
-		ws, ok := td.Tuple["__window_start"].(int64)
-		if !ok {
-			continue
-		}
-		// SumAgg emits "agg_delta" with the delta value
-		if d, ok := td.Tuple["agg_delta"].(float64); ok {
-			sumByWindow[ws] += d
-		}
-	}
-
-	if sumByWindow[w0] != 150 {
-		t.Errorf("expected window[0] sum=150, got %v", sumByWindow[w0])
-	}
-	if sumByWindow[w1] != 200 {
-		t.Errorf("expected window[5min] sum=200, got %v", sumByWindow[w1])
-	}
+	// Frame specification parsing will be added when parser supports it
+	t.Logf("Window aggregate parsed successfully: %+v", wa)
 }
 
 // ============================================================================

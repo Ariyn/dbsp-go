@@ -87,3 +87,37 @@ type LogicalWindowFunc struct {
 }
 
 func (w *LogicalWindowFunc) nodeName() string { return "LogicalWindowFunc" }
+
+// FrameSpec describes a window frame specification
+type FrameSpec struct {
+	// Type: ROWS, RANGE, or GROUPS
+	Type string
+	// StartType: UNBOUNDED PRECEDING, CURRENT ROW, <value> PRECEDING/FOLLOWING
+	StartType string
+	// StartValue: numeric value for <value> PRECEDING/FOLLOWING
+	StartValue string
+	// EndType: UNBOUNDED FOLLOWING, CURRENT ROW, <value> PRECEDING/FOLLOWING
+	EndType string
+	// EndValue: numeric value for <value> PRECEDING/FOLLOWING
+	EndValue string
+}
+
+// LogicalWindowAgg represents a window aggregate function
+type LogicalWindowAgg struct {
+	// AggName: SUM, AVG, COUNT, MIN, MAX
+	AggName string
+	// AggCol: column to aggregate
+	AggCol string
+	// PartitionBy columns
+	PartitionBy []string
+	// OrderBy column
+	OrderBy string
+	// FrameSpec describes the window frame
+	FrameSpec *FrameSpec
+	// OutputCol is the name of the output column
+	OutputCol string
+	// Input is the child logical node
+	Input LogicalNode
+}
+
+func (w *LogicalWindowAgg) nodeName() string { return "LogicalWindowAgg" }

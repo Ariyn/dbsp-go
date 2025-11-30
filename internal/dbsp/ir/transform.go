@@ -705,6 +705,10 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 		// Transform window function to appropriate operator
 		return logicalWindowFuncToDBSP(n)
 
+	case *LogicalWindowAgg:
+		// Transform window aggregate function to appropriate operator
+		return logicalWindowAggToDBSP(n)
+
 	default:
 		return nil, fmt.Errorf("unsupported logical node: %T", n)
 	}
@@ -767,6 +771,63 @@ func logicalWindowFuncToDBSP(wf *LogicalWindowFunc) (*op.Node, error) {
 		// In a full implementation, we'd chain with the input
 		return &op.Node{Op: g}, nil
 	}
+
+	return &op.Node{Op: g}, nil
+}
+
+// logicalWindowAggToDBSP transforms LogicalWindowAgg (DuckDB standard window aggregate) to DBSP operators
+func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
+	// Determine partition key function
+	var keyFn func(types.Tuple) any
+	if len(wa.PartitionBy) == 0 {
+		// No partition - single global partition
+		keyFn = func(t types.Tuple) any { return nil }
+	} else if len(wa.PartitionBy) == 1 {
+		// Single partition column
+		keyCol := wa.PartitionBy[0]
+		keyFn = func(t types.Tuple) any { return t[keyCol] }
+	} else {
+		// Multiple partition columns - composite key
+		partCols := wa.PartitionBy
+		keyFn = func(t types.Tuple) any {
+			key := make([]any, len(partCols))
+			for i, col := range partCols {
+				key[i] = t[col]
+			}
+			return fmt.Sprintf("%v", key)
+		}
+	}
+
+	// Create appropriate aggregate function
+	var agg op.AggFunc
+	var aggInit func() any
+
+	switch wa.AggName {
+	case "SUM":
+		agg = &op.SumAgg{ColName: wa.AggCol}
+		aggInit = func() any { return float64(0) }
+	case "AVG":
+		agg = &op.AvgAgg{ColName: wa.AggCol}
+		aggInit = func() any { return op.AvgMonoid{} }
+	case "COUNT":
+		agg = &op.CountAgg{}
+		aggInit = func() any { return int64(0) }
+	case "MIN":
+		agg = &op.MinAgg{ColName: wa.AggCol}
+		aggInit = func() any { return op.NewSortedMultiset() }
+	case "MAX":
+		agg = &op.MaxAgg{ColName: wa.AggCol}
+		aggInit = func() any { return op.NewSortedMultiset() }
+	default:
+		return nil, fmt.Errorf("unsupported window aggregate function: %s", wa.AggName)
+	}
+
+	// For DuckDB window aggregates with ORDER BY and frame specification,
+	// we need a specialized operator that maintains ordered state per partition
+	// For Phase 1, we'll use a simplified approach with GroupAggOp
+	// TODO: Implement proper frame-based window aggregation
+
+	g := op.NewGroupAggOp(keyFn, aggInit, agg)
 
 	return &op.Node{Op: g}, nil
 }

@@ -34,6 +34,15 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		return wf, nil
 	}
 
+	// Check for window aggregate functions (SUM(...) OVER ...)
+	if waf, scan, err := parseWindowAggregateFromSelect(sel); waf != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		waf.Input = scan
+		return waf, nil
+	}
+
 	if len(sel.From) != 1 {
 		return nil, errors.New("only single FROM table supported")
 	}
@@ -112,21 +121,21 @@ func parseSimpleIntervalToMillis(intervalSQL string) (int64, error) {
 	// INTERVAL '5' SECOND  (old sqlparser format)
 	// INTERVAL 5 MINUTE    (tree-sitter format, may be quoted)
 	upper := strings.ToUpper(strings.TrimSpace(intervalSQL))
-	
+
 	// Remove outer quotes if present (from tree-sitter String() method)
 	upper = strings.Trim(upper, "'\"")
-	
+
 	if !strings.HasPrefix(upper, "INTERVAL") {
 		return 0, errors.New("interval must start with INTERVAL")
 	}
 	// Remove leading INTERVAL
 	rest := strings.TrimSpace(upper[len("INTERVAL"):])
-	
+
 	// Parse two formats:
 	// 1. INTERVAL '5' MINUTE (quoted number)
 	// 2. INTERVAL 5 MINUTE (unquoted number)
 	var numStr, restUnit string
-	
+
 	if strings.HasPrefix(rest, "'") {
 		// Format 1: quoted number
 		endQuote := strings.Index(rest[1:], "'")
@@ -144,7 +153,7 @@ func parseSimpleIntervalToMillis(intervalSQL string) (int64, error) {
 		numStr = parts[0]
 		restUnit = parts[1]
 	}
-	
+
 	if restUnit == "" {
 		return 0, errors.New("INTERVAL must specify a unit")
 	}
@@ -250,6 +259,109 @@ func parseWindowFunctionFromSelect(sel *ast.Select) (*ir.LogicalWindowFunc, *ir.
 
 	scan := &ir.LogicalScan{Table: tableName}
 	return wf, scan, nil
+}
+
+// parseWindowAggregateFromSelect parses window aggregate function from SELECT clause.
+// Supports: SUM(col) OVER (PARTITION BY ... ORDER BY ... RANGE BETWEEN ...)
+func parseWindowAggregateFromSelect(sel *ast.Select) (*ir.LogicalWindowAgg, *ir.LogicalScan, error) {
+	var aggFunc *ast.FuncExpr
+	var outputCol string
+
+	for _, item := range sel.SelectList {
+		if funcExpr, ok := item.Expr.(*ast.FuncExpr); ok {
+			if funcExpr.Over != nil {
+				// This is a window aggregate function
+				funcName := strings.ToUpper(funcExpr.Name)
+				if funcName == "SUM" || funcName == "AVG" || funcName == "COUNT" || funcName == "MIN" || funcName == "MAX" {
+					aggFunc = funcExpr
+					if item.As != "" {
+						outputCol = item.As
+					}
+					break
+				}
+			}
+		}
+	}
+
+	if aggFunc == nil {
+		return nil, nil, nil // No window aggregate function
+	}
+
+	// Extract aggregate column
+	aggCol := ""
+	if len(aggFunc.Args) > 0 {
+		aggCol = aggFunc.Args[0].String()
+	}
+
+	// Parse PARTITION BY from OVER clause
+	var partitionBy []string
+	for _, expr := range aggFunc.Over.PartitionBy {
+		partitionBy = append(partitionBy, expr.String())
+	}
+
+	// Parse ORDER BY from OVER clause
+	var orderBy string
+	if len(aggFunc.Over.OrderBy) > 0 {
+		orderBy = aggFunc.Over.OrderBy[0].Expr.String()
+	}
+
+	// Parse frame specification (ROWS/RANGE/GROUPS BETWEEN ...)
+	var frameSpec *ir.FrameSpec
+	if aggFunc.Over.Frame != nil {
+		frameSpec = parseFrameSpec(aggFunc.Over.Frame)
+	}
+
+	if outputCol == "" {
+		outputCol = strings.ToLower(aggFunc.Name) + "_" + aggCol
+	}
+
+	// Extract table name from FROM clause
+	tableName := "t"
+	if len(sel.From) > 0 {
+		if tableExpr, ok := sel.From[0].(*ast.TableName); ok {
+			tableName = tableExpr.Name
+		}
+	}
+
+	waf := &ir.LogicalWindowAgg{
+		AggName:     strings.ToUpper(aggFunc.Name),
+		AggCol:      aggCol,
+		PartitionBy: partitionBy,
+		OrderBy:     orderBy,
+		FrameSpec:   frameSpec,
+		OutputCol:   outputCol,
+	}
+
+	scan := &ir.LogicalScan{Table: tableName}
+	return waf, scan, nil
+}
+
+// parseFrameSpec parses frame specification from AST WindowFrame
+func parseFrameSpec(frame *ast.WindowFrame) *ir.FrameSpec {
+	if frame == nil {
+		return nil
+	}
+
+	spec := &ir.FrameSpec{
+		Type: strings.ToUpper(frame.Type), // ROWS, RANGE, or GROUPS
+	}
+
+	// Parse frame bounds
+	if frame.Start != nil {
+		spec.StartType = strings.ToUpper(frame.Start.Type)
+		if frame.Start.Value != nil {
+			spec.StartValue = frame.Start.Value.String()
+		}
+	}
+
+	if frame.End != nil {
+		spec.EndType = strings.ToUpper(frame.End.Type)
+		if frame.End.Value != nil {
+			spec.EndValue = frame.End.Value.String()
+		}
+	}
+
+	return spec
 }
 
 // ParseQueryToIncrementalDBSP parses SQL, builds DBSP graph, and applies differentiation.

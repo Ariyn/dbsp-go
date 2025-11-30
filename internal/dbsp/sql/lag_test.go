@@ -969,7 +969,8 @@ func TestLagSQL_E2E_NoPartition(t *testing.T) {
 // ============================================================================
 
 func TestWindowedAvgLikeIntegration(t *testing.T) {
-	query := `SELECT k, AVG(v) FROM t GROUP BY TUMBLE(ts, INTERVAL 5 MINUTE), k`
+	// DuckDB standard window aggregate: AVG(v) OVER (PARTITION BY k ORDER BY ts RANGE BETWEEN ...)
+	query := `SELECT k, AVG(v) OVER (PARTITION BY k ORDER BY ts RANGE BETWEEN INTERVAL 2 MINUTES PRECEDING AND CURRENT ROW) AS avg_v FROM t`
 
 	root, err := ParseQueryToIncrementalDBSP(query)
 	if err != nil {
@@ -995,5 +996,89 @@ func TestWindowedAvgLikeIntegration(t *testing.T) {
 	t.Logf("Output batch has %d deltas:", len(out))
 	for i, td := range out {
 		t.Logf("  [%d] count=%d, tuple=%#v", i, td.Count, td.Tuple)
+	}
+}
+
+// ============================================================================
+// DuckDB Window Aggregate Tests
+// ============================================================================
+
+func TestWindowAggregate_SimpleSum(t *testing.T) {
+	// Simple window aggregate: SUM(amount) OVER (PARTITION BY region ORDER BY ts)
+	query := `SELECT region, SUM(amount) OVER (PARTITION BY region ORDER BY ts) AS cumulative_sum FROM sales`
+
+	node, err := ParseQueryToIncrementalDBSP(query)
+	if err != nil {
+		t.Fatalf("failed to parse query: %v", err)
+	}
+
+	batch := types.Batch{
+		{Tuple: types.Tuple{"region": "East", "ts": int64(1), "amount": 100}, Count: 1},
+		{Tuple: types.Tuple{"region": "East", "ts": int64(2), "amount": 200}, Count: 1},
+		{Tuple: types.Tuple{"region": "West", "ts": int64(1), "amount": 150}, Count: 1},
+		{Tuple: types.Tuple{"region": "West", "ts": int64(2), "amount": 250}, Count: 1},
+	}
+
+	out, err := node.Op.Apply(batch)
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	t.Logf("Output: %+v", out)
+	if len(out) == 0 {
+		t.Fatal("expected non-empty output")
+	}
+}
+
+func TestWindowAggregate_Count(t *testing.T) {
+	// COUNT window function
+	query := `SELECT user_id, COUNT(*) OVER (PARTITION BY user_id ORDER BY event_time) AS event_count FROM events`
+
+	node, err := ParseQueryToIncrementalDBSP(query)
+	if err != nil {
+		t.Fatalf("failed to parse query: %v", err)
+	}
+
+	batch := types.Batch{
+		{Tuple: types.Tuple{"user_id": "U1", "event_time": int64(1)}, Count: 1},
+		{Tuple: types.Tuple{"user_id": "U1", "event_time": int64(2)}, Count: 1},
+		{Tuple: types.Tuple{"user_id": "U1", "event_time": int64(3)}, Count: 1},
+		{Tuple: types.Tuple{"user_id": "U2", "event_time": int64(1)}, Count: 1},
+	}
+
+	out, err := node.Op.Apply(batch)
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	t.Logf("Output: %+v", out)
+	if len(out) == 0 {
+		t.Fatal("expected non-empty output")
+	}
+}
+
+func TestWindowAggregate_NoPartition(t *testing.T) {
+	// Window aggregate without PARTITION BY (global window)
+	query := `SELECT ts, SUM(value) OVER (ORDER BY ts) AS running_total FROM data`
+
+	node, err := ParseQueryToIncrementalDBSP(query)
+	if err != nil {
+		t.Fatalf("failed to parse query: %v", err)
+	}
+
+	batch := types.Batch{
+		{Tuple: types.Tuple{"ts": int64(1), "value": 10}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(2), "value": 20}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(3), "value": 30}, Count: 1},
+	}
+
+	out, err := node.Op.Apply(batch)
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	t.Logf("Output: %+v", out)
+	if len(out) == 0 {
+		t.Fatal("expected non-empty output")
 	}
 }
