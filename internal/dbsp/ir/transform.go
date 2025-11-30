@@ -219,6 +219,15 @@ func splitByKeywordOutsideParens(s, keyword string) []string {
 func buildComparisonFunc(predicateSQL string) func(types.Tuple) bool {
 	predicateSQL = strings.TrimSpace(predicateSQL)
 
+	// Check for IS NULL / IS NOT NULL first
+	if strings.Contains(strings.ToUpper(predicateSQL), " IS NULL") {
+		return buildIsNullFunc(predicateSQL)
+	}
+
+	if strings.Contains(strings.ToUpper(predicateSQL), " IS NOT NULL") {
+		return buildIsNotNullFunc(predicateSQL)
+	}
+
 	// Try operators in order: !=, <=, >=, =, <, >
 	// Check two-char operators first to avoid false matches
 
@@ -250,6 +259,38 @@ func buildComparisonFunc(predicateSQL string) func(types.Tuple) bool {
 	return func(t types.Tuple) bool { return true }
 }
 
+// buildIsNullFunc handles "column IS NULL"
+func buildIsNullFunc(predicateSQL string) func(types.Tuple) bool {
+	parts := strings.Split(strings.ToUpper(predicateSQL), " IS NULL")
+	if len(parts) < 1 {
+		return func(t types.Tuple) bool { return false }
+	}
+	// Extract original column name (preserve case)
+	idx := strings.Index(strings.ToUpper(predicateSQL), " IS NULL")
+	col := strings.TrimSpace(predicateSQL[:idx])
+
+	return func(t types.Tuple) bool {
+		val, exists := t[col]
+		return !exists || val == nil
+	}
+}
+
+// buildIsNotNullFunc handles "column IS NOT NULL"
+func buildIsNotNullFunc(predicateSQL string) func(types.Tuple) bool {
+	parts := strings.Split(strings.ToUpper(predicateSQL), " IS NOT NULL")
+	if len(parts) < 1 {
+		return func(t types.Tuple) bool { return false }
+	}
+	// Extract original column name (preserve case)
+	idx := strings.Index(strings.ToUpper(predicateSQL), " IS NOT NULL")
+	col := strings.TrimSpace(predicateSQL[:idx])
+
+	return func(t types.Tuple) bool {
+		val, exists := t[col]
+		return exists && val != nil
+	}
+}
+
 // buildEqualFunc handles "column = value"
 func buildEqualFunc(predicateSQL string) func(types.Tuple) bool {
 	parts := strings.Split(predicateSQL, "=")
@@ -263,7 +304,8 @@ func buildEqualFunc(predicateSQL string) func(types.Tuple) bool {
 
 	return func(t types.Tuple) bool {
 		tupleVal, ok := t[col]
-		if !ok {
+		// NULL values should not match in equality comparisons
+		if !ok || tupleVal == nil {
 			return false
 		}
 		return compareEqual(tupleVal, val)
@@ -283,7 +325,8 @@ func buildNotEqualFunc(predicateSQL string) func(types.Tuple) bool {
 
 	return func(t types.Tuple) bool {
 		tupleVal, ok := t[col]
-		if !ok {
+		// NULL values should not match in inequality comparisons
+		if !ok || tupleVal == nil {
 			return false
 		}
 		return !compareEqual(tupleVal, val)
@@ -306,7 +349,8 @@ func buildGreaterFunc(predicateSQL string) func(types.Tuple) bool {
 
 	return func(t types.Tuple) bool {
 		tupleVal, ok := t[col]
-		if !ok {
+		// NULL values should not match in comparisons
+		if !ok || tupleVal == nil {
 			return false
 		}
 		return compareGreater(tupleVal, threshold)
@@ -329,7 +373,8 @@ func buildGreaterEqualFunc(predicateSQL string) func(types.Tuple) bool {
 
 	return func(t types.Tuple) bool {
 		tupleVal, ok := t[col]
-		if !ok {
+		// NULL values should not match in comparisons
+		if !ok || tupleVal == nil {
 			return false
 		}
 		return compareGreaterOrEqual(tupleVal, threshold)
@@ -352,7 +397,8 @@ func buildLessFunc(predicateSQL string) func(types.Tuple) bool {
 
 	return func(t types.Tuple) bool {
 		tupleVal, ok := t[col]
-		if !ok {
+		// NULL values should not match in comparisons
+		if !ok || tupleVal == nil {
 			return false
 		}
 		return compareLess(tupleVal, threshold)
@@ -375,7 +421,8 @@ func buildLessEqualFunc(predicateSQL string) func(types.Tuple) bool {
 
 	return func(t types.Tuple) bool {
 		tupleVal, ok := t[col]
-		if !ok {
+		// NULL values should not match in comparisons
+		if !ok || tupleVal == nil {
 			return false
 		}
 		return compareLessOrEqual(tupleVal, threshold)
@@ -515,30 +562,28 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				key := n.Keys[0]
 				keyFn := func(t types.Tuple) any { return t[key] }
 
-				var agg op.AggFunc
-				var aggInit func() any
-				switch n.AggName {
-				case "SUM", "sum":
-					agg = &op.SumAgg{ColName: n.AggCol}
-					aggInit = func() any { return float64(0) }
-				case "COUNT", "count":
-					agg = &op.CountAgg{}
-					aggInit = func() any { return int64(0) }
-				case "MIN", "min":
-					agg = &op.MinAgg{ColName: n.AggCol}
-					aggInit = func() any { return op.NewSortedMultiset() }
-				case "MAX", "max":
-					agg = &op.MaxAgg{ColName: n.AggCol}
-					aggInit = func() any { return op.NewSortedMultiset() }
-				default:
-					return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-				}
+			var agg op.AggFunc
+			var aggInit func() any
+			switch n.AggName {
+			case "SUM", "sum":
+				agg = &op.SumAgg{ColName: n.AggCol}
+				aggInit = func() any { return float64(0) }
+			case "COUNT", "count":
+				agg = &op.CountAgg{ColName: n.AggCol}
+				aggInit = func() any { return int64(0) }
+			case "MIN", "min":
+			agg = &op.MinAgg{ColName: n.AggCol}
+			aggInit = func() any { return op.NewSortedMultiset() }
+		case "MAX", "max":
+			agg = &op.MaxAgg{ColName: n.AggCol}
+			aggInit = func() any { return op.NewSortedMultiset() }
+		default:
+			return nil, fmt.Errorf("unsupported agg %s", n.AggName)
+		}
 
-				g := op.NewGroupAggOp(keyFn, aggInit, agg)
-				return &op.Node{Op: g}, nil
-			}
-
-			// Windowed aggregation: use WindowAggOp so that each input delta
+		g := op.NewGroupAggOp(keyFn, aggInit, agg)
+		return &op.Node{Op: g}, nil
+	}			// Windowed aggregation: use WindowAggOp so that each input delta
 			// only affects its corresponding window(s) and group key.
 			ws := n.WindowSpec
 			if ws == nil {
@@ -562,11 +607,50 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			var agg op.AggFunc
 			var aggInit func() any
 			switch n.AggName {
-			case "SUM", "sum":
+		case "SUM", "sum":
+			agg = &op.SumAgg{ColName: n.AggCol}
+			aggInit = func() any { return float64(0) }
+		case "COUNT", "count":
+			agg = &op.CountAgg{ColName: n.AggCol}
+			aggInit = func() any { return int64(0) }
+		case "AVG", "avg":
+			agg = &op.AvgAgg{ColName: n.AggCol}
+			aggInit = func() any { return nil }
+		case "MIN", "min":
+			agg = &op.MinAgg{ColName: n.AggCol}
+			aggInit = func() any { return op.NewSortedMultiset() }
+		case "MAX", "max":
+			agg = &op.MaxAgg{ColName: n.AggCol}
+			aggInit = func() any { return op.NewSortedMultiset() }
+		default:
+			return nil, fmt.Errorf("unsupported agg %s", n.AggName)
+		}
+
+		waSpec := op.WindowSpecLite{
+			TimeCol:    ws.TimeCol,
+			SizeMillis: ws.SizeMillis,
+		}
+		g := op.NewWindowAggOp(waSpec, groupKeyFn, n.Keys, aggInit, agg)
+	return &op.Node{Op: g}, nil
+
+	case *LogicalFilter:
+			// Filter before GroupAgg - create chained MapOp
+			if n.WindowSpec == nil {
+				// Non-windowed grouping with a single group key
+				if len(n.Keys) != 1 {
+					return nil, fmt.Errorf("only single-group-key supported")
+				}
+				key := n.Keys[0]
+				keyFn := func(t types.Tuple) any { return t[key] }
+
+				var agg op.AggFunc
+				var aggInit func() any
+				switch n.AggName {
+				case "SUM", "sum":
 				agg = &op.SumAgg{ColName: n.AggCol}
 				aggInit = func() any { return float64(0) }
 			case "COUNT", "count":
-				agg = &op.CountAgg{}
+				agg = &op.CountAgg{ColName: n.AggCol}
 				aggInit = func() any { return int64(0) }
 			case "AVG", "avg":
 				agg = &op.AvgAgg{ColName: n.AggCol}
@@ -581,49 +665,8 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
 			}
 
-			waSpec := op.WindowSpecLite{
-				TimeCol:    ws.TimeCol,
-				SizeMillis: ws.SizeMillis,
-			}
-			g := op.NewWindowAggOp(waSpec, groupKeyFn, n.Keys, aggInit, agg)
-			return &op.Node{Op: g}, nil
-
-		case *LogicalFilter:
-			// Filter before GroupAgg - create chained MapOp
-			if n.WindowSpec == nil {
-				// Non-windowed grouping with a single group key
-				if len(n.Keys) != 1 {
-					return nil, fmt.Errorf("only single-group-key supported")
-				}
-				key := n.Keys[0]
-				keyFn := func(t types.Tuple) any { return t[key] }
-
-				var agg op.AggFunc
-				var aggInit func() any
-				switch n.AggName {
-				case "SUM", "sum":
-					agg = &op.SumAgg{ColName: n.AggCol}
-					aggInit = func() any { return float64(0) }
-				case "COUNT", "count":
-					agg = &op.CountAgg{}
-					aggInit = func() any { return int64(0) }
-				case "AVG", "avg":
-					agg = &op.AvgAgg{ColName: n.AggCol}
-					aggInit = func() any { return nil }
-				case "MIN", "min":
-					agg = &op.MinAgg{ColName: n.AggCol}
-					aggInit = func() any { return op.NewSortedMultiset() }
-				case "MAX", "max":
-					agg = &op.MaxAgg{ColName: n.AggCol}
-					aggInit = func() any { return op.NewSortedMultiset() }
-				default:
-					return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-				}
-
-				// Create filter function
-				predicateFn := BuildPredicateFunc(in.PredicateSQL)
-
-				// Create a combined operator: filter then aggregate
+			// Create filter function
+			predicateFn := BuildPredicateFunc(in.PredicateSQL)				// Create a combined operator: filter then aggregate
 				// For Phase1, we embed filtering in the GroupAgg by wrapping the input
 				g := op.NewGroupAggOp(keyFn, aggInit, agg)
 
@@ -659,28 +702,26 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			case "SUM", "sum":
 				agg = &op.SumAgg{ColName: n.AggCol}
 				aggInit = func() any { return float64(0) }
-			case "COUNT", "count":
-				agg = &op.CountAgg{}
-				aggInit = func() any { return int64(0) }
-			case "AVG", "avg":
-				agg = &op.AvgAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.AvgMonoid{} }
-			case "MIN", "min":
-				agg = &op.MinAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			case "MAX", "max":
-				agg = &op.MaxAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			default:
-				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-			}
+		case "COUNT", "count":
+			agg = &op.CountAgg{ColName: n.AggCol}
+			aggInit = func() any { return int64(0) }
+		case "AVG", "avg":
+			agg = &op.AvgAgg{ColName: n.AggCol}
+			aggInit = func() any { return op.AvgMonoid{} }
+		case "MIN", "min":
+			agg = &op.MinAgg{ColName: n.AggCol}
+			aggInit = func() any { return op.NewSortedMultiset() }
+		case "MAX", "max":
+			agg = &op.MaxAgg{ColName: n.AggCol}
+			aggInit = func() any { return op.NewSortedMultiset() }
+		default:
+			return nil, fmt.Errorf("unsupported agg %s", n.AggName)
+		}
 
-			// Create filter function
-			predicateFn := BuildPredicateFunc(in.PredicateSQL)
+		// Create filter function
+		predicateFn := BuildPredicateFunc(in.PredicateSQL)
 
-			g := op.NewGroupAggOp(keyFn, aggInit, agg)
-
-			// Wrap with MapOp for filtering
+		g := op.NewGroupAggOp(keyFn, aggInit, agg)			// Wrap with MapOp for filtering
 			filterOp := &op.MapOp{
 				F: func(td types.TupleDelta) []types.TupleDelta {
 					if predicateFn(td.Tuple) {

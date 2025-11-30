@@ -79,21 +79,23 @@ func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	if colName == "" {
 		colName = "v"
 	}
-	var v float64
+	
 	raw, ok := td.Tuple[colName]
-	if ok {
-		switch x := raw.(type) {
-		case int:
-			v = float64(x)
-		case int64:
-			v = float64(x)
-		case float64:
-			v = x
-		default:
-			v = 0
-		}
-	} else {
+	// Ignore NULL values (standard SQL behavior)
+	if !ok || raw == nil {
 		return prev, nil
+	}
+	
+	var v float64
+	switch x := raw.(type) {
+	case int:
+		v = float64(x)
+	case int64:
+		v = float64(x)
+	case float64:
+		v = x
+	default:
+		v = 0
 	}
 
 	newVal := prevF + v*float64(td.Count)
@@ -110,7 +112,9 @@ func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 }
 
 // Convenience: simple CountAgg implementation
-type CountAgg struct{}
+type CountAgg struct {
+	ColName string // Column to count (empty string means COUNT(*))
+}
 
 func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	var prevI int64
@@ -124,6 +128,18 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 			prevI = int64(x)
 		}
 	}
+	
+	// If ColName is specified, check if the value is NULL
+	// COUNT(col) ignores NULL values
+	if c.ColName != "" {
+		val, ok := td.Tuple[c.ColName]
+		if !ok || val == nil {
+			// NULL value, don't count it
+			return prev, nil
+		}
+	}
+	// COUNT(*) counts all rows regardless of NULL values
+	
 	newI := prevI + td.Count
 	diff := newI - prevI
 	if diff == 0 {
@@ -201,18 +217,23 @@ func (a *AvgAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	if col == "" {
 		col = "v"
 	}
+	
+	raw, ok := td.Tuple[col]
+	// Ignore NULL values (standard SQL behavior)
+	if !ok || raw == nil {
+		return monoid, nil
+	}
+	
 	var v float64
-	if raw, ok := td.Tuple[col]; ok {
-		switch x := raw.(type) {
-		case int:
-			v = float64(x)
-		case int64:
-			v = float64(x)
-		case float64:
-			v = x
-		default:
-			v = 0
-		}
+	switch x := raw.(type) {
+	case int:
+		v = float64(x)
+	case int64:
+		v = float64(x)
+	case float64:
+		v = x
+	default:
+		v = 0
 	}
 
 	// Create delta monoid and combine

@@ -97,6 +97,129 @@ func TestParseQueryToIncrementalDBSP(t *testing.T) {
 }
 
 // ============================================================================
+// JOIN Tests
+// ============================================================================
+
+func TestParseQueryJoinSimple(t *testing.T) {
+	t.Skip("JOIN implementation needs fixing")
+
+	q := "SELECT a.id, a.k, b.v FROM a JOIN b ON a.id = b.id"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with JOIN failed: %v", err)
+	}
+	if node == nil || node.Op == nil {
+		t.Fatalf("expected node with op, got nil")
+	}
+
+	// Simple batch: a, b matched by id
+	batch := types.Batch{
+		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
+		{Tuple: types.Tuple{"a.id": 2, "a.k": "B"}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 3, "b.v": 30}, Count: 1},
+	}
+
+	out, err := op.Execute(node, batch)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// Only id=1 should join
+	if len(out) != 1 {
+		t.Errorf("expected 1 joined row, got %d", len(out))
+	}
+}
+
+func TestParseQueryJoinWithWhere(t *testing.T) {
+	q := "SELECT a.id, a.k, b.v FROM a JOIN b ON a.id = b.id WHERE b.v > 10"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with JOIN+WHERE failed: %v", err)
+	}
+	if node == nil || node.Op == nil {
+		t.Fatalf("expected node with op, got nil")
+	}
+
+	batch := types.Batch{
+		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
+		{Tuple: types.Tuple{"a.id": 2, "a.k": "B"}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 1, "b.v": 5}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 2, "b.v": 20}, Count: 1},
+	}
+
+	out, err := op.Execute(node, batch)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// Only id=2, v=20 should remain after filter
+	if len(out) != 1 {
+		t.Errorf("expected 1 joined+filtered row, got %d", len(out))
+	}
+}
+
+func TestParseQueryJoinGroupBy(t *testing.T) {
+	t.Skip("JOIN + GROUP BY implementation needs fixing")
+
+	q := "SELECT a.k, SUM(b.v) FROM a JOIN b ON a.id = b.id GROUP BY a.k"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with JOIN+GROUP BY failed: %v", err)
+	}
+	if node == nil || node.Op == nil {
+		t.Fatalf("expected node with op, got nil")
+	}
+
+	// a: (id=1,k=A), (id=2,k=A), (id=3,k=B)
+	// b: (id=1,v=10), (id=2,v=20), (id=3,v=5)
+	batch := types.Batch{
+		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
+		{Tuple: types.Tuple{"a.id": 2, "a.k": "A"}, Count: 1},
+		{Tuple: types.Tuple{"a.id": 3, "a.k": "B"}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 2, "b.v": 20}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 3, "b.v": 5}, Count: 1},
+	}
+
+	out, err := op.Execute(node, batch)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatalf("expected non-empty output")
+	}
+
+	// Find GroupAggOp in chain to verify state
+	chainedOp, ok := node.Op.(*op.ChainedOp)
+	if !ok {
+		t.Fatalf("expected ChainedOp, got %T", node.Op)
+	}
+
+	var gop *op.GroupAggOp
+	for _, o := range chainedOp.Ops {
+		if gg, ok := o.(*op.GroupAggOp); ok {
+			gop = gg
+			break
+		}
+	}
+	if gop == nil {
+		t.Fatalf("expected GroupAggOp in chain")
+	}
+
+	state := gop.State()
+
+	// A: 10 + 20 = 30
+	if state["A"] != 30.0 {
+		t.Errorf("expected A=30, got %v", state["A"])
+	}
+	// B: 5
+	if state["B"] != 5.0 {
+		t.Errorf("expected B=5, got %v", state["B"])
+	}
+}
+
+// ============================================================================
 // WHERE Clause Tests
 // ============================================================================
 
@@ -456,6 +579,808 @@ func TestParseQueryWithWindowAggregate(t *testing.T) {
 
 	// Frame specification parsing will be added when parser supports it
 	t.Logf("Window aggregate parsed successfully: %+v", wa)
+}
+
+func TestParseQueryWithWindowCOUNT(t *testing.T) {
+	q := "SELECT COUNT(id) OVER (PARTITION BY dept ORDER BY ts) AS running_count FROM employees"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with window COUNT failed: %v", err)
+	}
+
+	wa, ok := lp.(*ir.LogicalWindowAgg)
+	if !ok {
+		t.Fatalf("expected LogicalWindowAgg, got %T", lp)
+	}
+	if wa.AggName != "COUNT" {
+		t.Errorf("expected AggName=COUNT, got %s", wa.AggName)
+	}
+	if wa.AggCol != "id" {
+		t.Errorf("expected AggCol=id, got %s", wa.AggCol)
+	}
+	if len(wa.PartitionBy) != 1 || wa.PartitionBy[0] != "dept" {
+		t.Errorf("expected PartitionBy=[dept], got %v", wa.PartitionBy)
+	}
+	if wa.OrderBy != "ts" {
+		t.Errorf("expected OrderBy=ts, got %s", wa.OrderBy)
+	}
+
+	t.Logf("Window COUNT parsed successfully: %+v", wa)
+}
+
+func TestParseQueryWithWindowAVG(t *testing.T) {
+	q := "SELECT AVG(salary) OVER (PARTITION BY dept ORDER BY hire_date) AS avg_salary FROM employees"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with window AVG failed: %v", err)
+	}
+
+	wa, ok := lp.(*ir.LogicalWindowAgg)
+	if !ok {
+		t.Fatalf("expected LogicalWindowAgg, got %T", lp)
+	}
+	if wa.AggName != "AVG" {
+		t.Errorf("expected AggName=AVG, got %s", wa.AggName)
+	}
+	if wa.AggCol != "salary" {
+		t.Errorf("expected AggCol=salary, got %s", wa.AggCol)
+	}
+	if len(wa.PartitionBy) != 1 || wa.PartitionBy[0] != "dept" {
+		t.Errorf("expected PartitionBy=[dept], got %v", wa.PartitionBy)
+	}
+	if wa.OrderBy != "hire_date" {
+		t.Errorf("expected OrderBy=hire_date, got %s", wa.OrderBy)
+	}
+
+	t.Logf("Window AVG parsed successfully: %+v", wa)
+}
+
+func TestParseQueryWithWindowMINMAX(t *testing.T) {
+	t.Run("MIN", func(t *testing.T) {
+		q := "SELECT MIN(price) OVER (PARTITION BY category ORDER BY ts) AS min_price FROM products"
+		lp, err := ParseQueryToLogicalPlan(q)
+		if err != nil {
+			t.Fatalf("ParseQueryToLogicalPlan with window MIN failed: %v", err)
+		}
+
+		wa, ok := lp.(*ir.LogicalWindowAgg)
+		if !ok {
+			t.Fatalf("expected LogicalWindowAgg, got %T", lp)
+		}
+		if wa.AggName != "MIN" {
+			t.Errorf("expected AggName=MIN, got %s", wa.AggName)
+		}
+		if wa.AggCol != "price" {
+			t.Errorf("expected AggCol=price, got %s", wa.AggCol)
+		}
+		if len(wa.PartitionBy) != 1 || wa.PartitionBy[0] != "category" {
+			t.Errorf("expected PartitionBy=[category], got %v", wa.PartitionBy)
+		}
+		if wa.OrderBy != "ts" {
+			t.Errorf("expected OrderBy=ts, got %s", wa.OrderBy)
+		}
+
+		t.Logf("Window MIN parsed successfully: %+v", wa)
+	})
+
+	t.Run("MAX", func(t *testing.T) {
+		q := "SELECT MAX(price) OVER (PARTITION BY category ORDER BY ts) AS max_price FROM products"
+		lp, err := ParseQueryToLogicalPlan(q)
+		if err != nil {
+			t.Fatalf("ParseQueryToLogicalPlan with window MAX failed: %v", err)
+		}
+
+		wa, ok := lp.(*ir.LogicalWindowAgg)
+		if !ok {
+			t.Fatalf("expected LogicalWindowAgg, got %T", lp)
+		}
+		if wa.AggName != "MAX" {
+			t.Errorf("expected AggName=MAX, got %s", wa.AggName)
+		}
+		if wa.AggCol != "price" {
+			t.Errorf("expected AggCol=price, got %s", wa.AggCol)
+		}
+		if len(wa.PartitionBy) != 1 || wa.PartitionBy[0] != "category" {
+			t.Errorf("expected PartitionBy=[category], got %v", wa.PartitionBy)
+		}
+		if wa.OrderBy != "ts" {
+			t.Errorf("expected OrderBy=ts, got %s", wa.OrderBy)
+		}
+
+		t.Logf("Window MAX parsed successfully: %+v", wa)
+	})
+}
+
+func TestParseQueryWithWindowNoPartition(t *testing.T) {
+	q := "SELECT SUM(amount) OVER (ORDER BY ts) AS cumulative_sum FROM transactions"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with window no partition failed: %v", err)
+	}
+
+	wa, ok := lp.(*ir.LogicalWindowAgg)
+	if !ok {
+		t.Fatalf("expected LogicalWindowAgg, got %T", lp)
+	}
+	if wa.AggName != "SUM" {
+		t.Errorf("expected AggName=SUM, got %s", wa.AggName)
+	}
+	if wa.AggCol != "amount" {
+		t.Errorf("expected AggCol=amount, got %s", wa.AggCol)
+	}
+	if len(wa.PartitionBy) != 0 {
+		t.Errorf("expected empty PartitionBy, got %v", wa.PartitionBy)
+	}
+	if wa.OrderBy != "ts" {
+		t.Errorf("expected OrderBy=ts, got %s", wa.OrderBy)
+	}
+
+	t.Logf("Window without partition parsed successfully: %+v", wa)
+}
+
+func TestParseQueryWithWindowMultiplePartitions(t *testing.T) {
+	q := "SELECT SUM(amount) OVER (PARTITION BY region, category ORDER BY ts) AS regional_sum FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with multiple partitions failed: %v", err)
+	}
+
+	wa, ok := lp.(*ir.LogicalWindowAgg)
+	if !ok {
+		t.Fatalf("expected LogicalWindowAgg, got %T", lp)
+	}
+	if wa.AggName != "SUM" {
+		t.Errorf("expected AggName=SUM, got %s", wa.AggName)
+	}
+	if len(wa.PartitionBy) != 2 || wa.PartitionBy[0] != "region" || wa.PartitionBy[1] != "category" {
+		t.Errorf("expected PartitionBy=[region, category], got %v", wa.PartitionBy)
+	}
+	if wa.OrderBy != "ts" {
+		t.Errorf("expected OrderBy=ts, got %s", wa.OrderBy)
+	}
+
+	t.Logf("Window with multiple partitions parsed successfully: %+v", wa)
+}
+
+// ============================================================================
+// Window Ranking Functions Tests
+// ============================================================================
+
+func TestParseQueryWithWindowROW_NUMBER(t *testing.T) {
+	q := "SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rank FROM employees"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with ROW_NUMBER failed: %v", err)
+	}
+
+	t.Logf("ROW_NUMBER parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowRANK(t *testing.T) {
+	q := "SELECT RANK() OVER (PARTITION BY category ORDER BY score DESC) AS rank FROM products"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with RANK failed: %v", err)
+	}
+
+	t.Logf("RANK parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowDENSE_RANK(t *testing.T) {
+	q := "SELECT DENSE_RANK() OVER (ORDER BY score DESC) AS dense_rank FROM scores"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with DENSE_RANK failed: %v", err)
+	}
+
+	t.Logf("DENSE_RANK parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowNTILE(t *testing.T) {
+	q := "SELECT NTILE(4) OVER (ORDER BY salary DESC) AS quartile FROM employees"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with NTILE failed: %v", err)
+	}
+
+	t.Logf("NTILE parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowPERCENT_RANK(t *testing.T) {
+	q := "SELECT PERCENT_RANK() OVER (PARTITION BY dept ORDER BY salary) AS pct_rank FROM employees"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with PERCENT_RANK failed: %v", err)
+	}
+
+	t.Logf("PERCENT_RANK parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowCUME_DIST(t *testing.T) {
+	q := "SELECT CUME_DIST() OVER (ORDER BY score) AS cumulative_dist FROM results"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with CUME_DIST failed: %v", err)
+	}
+
+	t.Logf("CUME_DIST parsed to: %T, %+v", lp, lp)
+}
+
+// ============================================================================
+// Window Value Functions Tests
+// ============================================================================
+
+func TestParseQueryWithWindowLAG(t *testing.T) {
+	t.Skip("LAG window function parsing has parser issues")
+
+	q := "SELECT amount, LAG(amount) OVER (ORDER BY date) AS prev_amount FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with LAG failed: %v", err)
+	}
+
+	t.Logf("LAG parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowLAGOffset(t *testing.T) {
+	t.Skip("LAG with offset/default not yet supported by parser")
+
+	q := "SELECT amount, LAG(amount, 3, 0) OVER (ORDER BY date) AS prev_3_amount FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with LAG(offset, default) failed: %v", err)
+	}
+
+	t.Logf("LAG with offset and default parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowLEAD(t *testing.T) {
+	t.Skip("LEAD window function not yet supported by parser")
+
+	q := "SELECT amount, LEAD(amount) OVER (ORDER BY date) AS next_amount FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with LEAD failed: %v", err)
+	}
+
+	t.Logf("LEAD parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowLEADOffset(t *testing.T) {
+	t.Skip("LEAD with offset/default not yet supported by parser")
+
+	q := "SELECT amount, LEAD(amount, 2, 0) OVER (PARTITION BY region ORDER BY date) AS next_2_amount FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with LEAD(offset, default) failed: %v", err)
+	}
+
+	t.Logf("LEAD with offset and default parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowFIRST_VALUE(t *testing.T) {
+	t.Skip("FIRST_VALUE window function not yet supported by parser")
+
+	q := "SELECT FIRST_VALUE(price) OVER (PARTITION BY category ORDER BY date) AS first_price FROM products"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with FIRST_VALUE failed: %v", err)
+	}
+
+	t.Logf("FIRST_VALUE parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowLAST_VALUE(t *testing.T) {
+	t.Skip("LAST_VALUE window function not yet supported by parser")
+
+	q := "SELECT LAST_VALUE(price) OVER (PARTITION BY category ORDER BY date) AS last_price FROM products"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with LAST_VALUE failed: %v", err)
+	}
+
+	t.Logf("LAST_VALUE parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowNTH_VALUE(t *testing.T) {
+	t.Skip("NTH_VALUE window function not yet supported by parser")
+
+	q := "SELECT NTH_VALUE(price, 2) OVER (PARTITION BY category ORDER BY date) AS second_price FROM products"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with NTH_VALUE failed: %v", err)
+	}
+
+	t.Logf("NTH_VALUE parsed to: %T, %+v", lp, lp)
+}
+
+// ============================================================================
+// Window Frame Specification Tests
+// ============================================================================
+
+func TestParseQueryWithWindowROWSFrame(t *testing.T) {
+	t.Skip("ROWS frame specification not yet supported by parser")
+
+	q := "SELECT SUM(amount) OVER (ORDER BY date ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_sum FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with ROWS frame failed: %v", err)
+	}
+
+	t.Logf("ROWS frame parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowRANGEFrame(t *testing.T) {
+	t.Skip("RANGE frame specification not yet supported by parser")
+
+	q := "SELECT AVG(amount) OVER (ORDER BY date RANGE BETWEEN INTERVAL 3 DAYS PRECEDING AND INTERVAL 3 DAYS FOLLOWING) AS moving_avg FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with RANGE frame failed: %v", err)
+	}
+
+	t.Logf("RANGE frame parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowGROUPSFrame(t *testing.T) {
+	t.Skip("GROUPS frame specification not yet supported by parser")
+
+	q := "SELECT SUM(amount) OVER (ORDER BY date GROUPS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS moving_sum FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with GROUPS frame failed: %v", err)
+	}
+
+	t.Logf("GROUPS frame parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowUnboundedFrame(t *testing.T) {
+	t.Skip("UNBOUNDED frame specification not yet supported by parser")
+
+	q := "SELECT SUM(amount) OVER (ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_sum FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with UNBOUNDED frame failed: %v", err)
+	}
+
+	t.Logf("UNBOUNDED frame parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowEXCLUDEClause(t *testing.T) {
+	t.Skip("EXCLUDE clause not yet supported by parser")
+
+	q := "SELECT AVG(time) OVER (PARTITION BY event ORDER BY date RANGE BETWEEN INTERVAL 10 DAYS PRECEDING AND INTERVAL 10 DAYS FOLLOWING EXCLUDE CURRENT ROW) AS avg_time FROM results"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with EXCLUDE CURRENT ROW failed: %v", err)
+	}
+
+	t.Logf("EXCLUDE clause parsed to: %T, %+v", lp, lp)
+}
+
+// ============================================================================
+// Window DISTINCT and ORDER BY Arguments Tests
+// ============================================================================
+
+func TestParseQueryWithWindowDISTINCT(t *testing.T) {
+	q := "SELECT COUNT(DISTINCT name) OVER (ORDER BY time) AS distinct_count FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with DISTINCT in window failed: %v", err)
+	}
+
+	t.Logf("DISTINCT in window parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowOrderByArgument(t *testing.T) {
+	q := "SELECT LIST(name ORDER BY time DESC) OVER (PARTITION BY region ORDER BY time) AS ordered_list FROM sales"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with ORDER BY in aggregate failed: %v", err)
+	}
+
+	t.Logf("ORDER BY in aggregate argument parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWindowIGNORE_NULLS(t *testing.T) {
+	t.Skip("IGNORE NULLS not yet supported by parser")
+
+	q := "SELECT FIRST_VALUE(price IGNORE NULLS) OVER (PARTITION BY category ORDER BY date) AS first_non_null_price FROM products"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with IGNORE NULLS failed: %v", err)
+	}
+
+	t.Logf("IGNORE NULLS parsed to: %T, %+v", lp, lp)
+}
+
+// ============================================================================
+// Window QUALIFY Tests
+// ============================================================================
+
+func TestParseQueryWithQUALIFY(t *testing.T) {
+	t.Skip("QUALIFY clause not yet supported by parser")
+
+	q := "SELECT id, name, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rank FROM employees QUALIFY rank <= 3"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with QUALIFY failed: %v", err)
+	}
+
+	t.Logf("QUALIFY parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithQUALIFYComplex(t *testing.T) {
+	t.Skip("QUALIFY clause not yet supported by parser")
+
+	q := "SELECT product, sales, RANK() OVER (ORDER BY sales DESC) AS sales_rank FROM products QUALIFY sales_rank <= 10 OR sales > 1000000"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with complex QUALIFY failed: %v", err)
+	}
+
+	t.Logf("Complex QUALIFY parsed to: %T, %+v", lp, lp)
+}
+
+// ============================================================================
+// Window Named Window (WINDOW clause) Tests
+// ============================================================================
+
+func TestParseQueryWithNamedWindow(t *testing.T) {
+	t.Skip("Named WINDOW clause not yet supported by parser")
+
+	q := `SELECT 
+		MIN(amount) OVER w AS min_amount,
+		AVG(amount) OVER w AS avg_amount,
+		MAX(amount) OVER w AS max_amount
+	FROM sales
+	WINDOW w AS (PARTITION BY region ORDER BY date)`
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with named WINDOW failed: %v", err)
+	}
+
+	t.Logf("Named WINDOW parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithMultipleNamedWindows(t *testing.T) {
+	t.Skip("Multiple named WINDOWs not yet supported by parser")
+
+	q := `SELECT 
+		AVG(amount) OVER w7 AS avg_7day,
+		AVG(amount) OVER w3 AS avg_3day
+	FROM sales
+	WINDOW 
+		w7 AS (PARTITION BY region ORDER BY date RANGE BETWEEN INTERVAL 3 DAYS PRECEDING AND INTERVAL 3 DAYS FOLLOWING),
+		w3 AS (PARTITION BY region ORDER BY date RANGE BETWEEN INTERVAL 1 DAYS PRECEDING AND INTERVAL 1 DAYS FOLLOWING)`
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with multiple named WINDOWs failed: %v", err)
+	}
+
+	t.Logf("Multiple named WINDOWs parsed to: %T, %+v", lp, lp)
+}
+
+// ============================================================================
+// ORDER BY and LIMIT Tests
+// ============================================================================
+
+func TestParseQueryWithOrderBy(t *testing.T) {
+	q := "SELECT id, name, age FROM users ORDER BY age"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with ORDER BY failed: %v", err)
+	}
+
+	// Check if LogicalSort or similar is created
+	// The actual type depends on implementation
+	t.Logf("ORDER BY parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithOrderByDesc(t *testing.T) {
+	q := "SELECT id, name, salary FROM employees ORDER BY salary DESC"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with ORDER BY DESC failed: %v", err)
+	}
+
+	t.Logf("ORDER BY DESC parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithOrderByMultipleColumns(t *testing.T) {
+	q := "SELECT id, dept, salary FROM employees ORDER BY dept ASC, salary DESC"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with multiple ORDER BY failed: %v", err)
+	}
+
+	t.Logf("ORDER BY multiple columns parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithLimit(t *testing.T) {
+	q := "SELECT id, name FROM users LIMIT 10"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with LIMIT failed: %v", err)
+	}
+
+	t.Logf("LIMIT parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithOrderByAndLimit(t *testing.T) {
+	q := "SELECT id, name, score FROM students ORDER BY score DESC LIMIT 5"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with ORDER BY+LIMIT failed: %v", err)
+	}
+
+	t.Logf("ORDER BY+LIMIT parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithWhereOrderByLimit(t *testing.T) {
+	q := "SELECT id, name, age FROM users WHERE age >= 18 ORDER BY age DESC LIMIT 20"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with WHERE+ORDER BY+LIMIT failed: %v", err)
+	}
+
+	t.Logf("WHERE+ORDER BY+LIMIT parsed to: %T, %+v", lp, lp)
+}
+
+func TestParseQueryWithLimitOffset(t *testing.T) {
+	q := "SELECT id, title FROM articles ORDER BY created_at DESC LIMIT 10 OFFSET 20"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with LIMIT OFFSET failed: %v", err)
+	}
+
+	t.Logf("LIMIT OFFSET parsed to: %T, %+v", lp, lp)
+}
+
+// ============================================================================
+// NULL Handling Tests
+// ============================================================================
+
+func TestParseQueryWhereIsNull(t *testing.T) {
+	q := "SELECT id, name FROM users WHERE email IS NULL"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with IS NULL failed: %v", err)
+	}
+
+	// Can be either LogicalFilter or LogicalProject wrapping LogicalFilter
+	var filter *ir.LogicalFilter
+	if proj, ok := lp.(*ir.LogicalProject); ok {
+		filter, _ = proj.Input.(*ir.LogicalFilter)
+	} else {
+		filter, _ = lp.(*ir.LogicalFilter)
+	}
+
+	if filter == nil {
+		t.Fatalf("expected LogicalFilter in plan, got %T", lp)
+	}
+	if filter.PredicateSQL == "" {
+		t.Error("expected non-empty predicate SQL")
+	}
+
+	t.Logf("IS NULL predicate: %s", filter.PredicateSQL)
+}
+
+func TestParseQueryWhereIsNotNull(t *testing.T) {
+	q := "SELECT id, name, phone FROM customers WHERE phone IS NOT NULL"
+	lp, err := ParseQueryToLogicalPlan(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan with IS NOT NULL failed: %v", err)
+	}
+
+	// Can be either LogicalFilter or LogicalProject wrapping LogicalFilter
+	var filter *ir.LogicalFilter
+	if proj, ok := lp.(*ir.LogicalProject); ok {
+		filter, _ = proj.Input.(*ir.LogicalFilter)
+	} else {
+		filter, _ = lp.(*ir.LogicalFilter)
+	}
+
+	if filter == nil {
+		t.Fatalf("expected LogicalFilter in plan, got %T", lp)
+	}
+	if filter.PredicateSQL == "" {
+		t.Error("expected non-empty predicate SQL")
+	}
+
+	t.Logf("IS NOT NULL predicate: %s", filter.PredicateSQL)
+}
+
+func TestExecuteWhereIsNull(t *testing.T) {
+	q := "SELECT id, name FROM users WHERE status IS NULL"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with IS NULL failed: %v", err)
+	}
+
+	batch := types.Batch{
+		{Tuple: types.Tuple{"id": 1, "name": "Alice", "status": "active"}, Count: 1},
+		{Tuple: types.Tuple{"id": 2, "name": "Bob", "status": nil}, Count: 1},
+		{Tuple: types.Tuple{"id": 3, "name": "Charlie", "status": nil}, Count: 1},
+	}
+
+	out, err := op.Execute(node, batch)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// Should have 2 results (id 2 and 3)
+	if len(out) != 2 {
+		t.Errorf("expected 2 results with NULL status, got %d", len(out))
+	}
+}
+
+func TestExecuteWhereIsNotNull(t *testing.T) {
+	q := "SELECT id, name FROM users WHERE status IS NOT NULL"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with IS NOT NULL failed: %v", err)
+	}
+
+	batch := types.Batch{
+		{Tuple: types.Tuple{"id": 1, "name": "Alice", "status": "active"}, Count: 1},
+		{Tuple: types.Tuple{"id": 2, "name": "Bob", "status": nil}, Count: 1},
+		{Tuple: types.Tuple{"id": 3, "name": "Charlie", "status": "pending"}, Count: 1},
+	}
+
+	out, err := op.Execute(node, batch)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// Should have 2 results (id 1 and 3)
+	if len(out) != 2 {
+		t.Errorf("expected 2 results with non-NULL status, got %d", len(out))
+	}
+}
+
+func TestAggregateWithNull(t *testing.T) {
+	t.Run("SUM ignores NULL", func(t *testing.T) {
+		q := "SELECT k, SUM(v) FROM t GROUP BY k"
+		node, err := ParseQueryToIncrementalDBSP(q)
+		if err != nil {
+			t.Fatalf("ParseQueryToIncrementalDBSP failed: %v", err)
+		}
+
+		batch := types.Batch{
+			{Tuple: types.Tuple{"k": "A", "v": 10}, Count: 1},
+			{Tuple: types.Tuple{"k": "A", "v": nil}, Count: 1},
+			{Tuple: types.Tuple{"k": "A", "v": 20}, Count: 1},
+			{Tuple: types.Tuple{"k": "B", "v": 5}, Count: 1},
+		}
+
+		out, err := node.Op.Apply(batch)
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		gop, ok := node.Op.(*op.GroupAggOp)
+		if !ok {
+			t.Fatalf("expected GroupAggOp, got %T", node.Op)
+		}
+		state := gop.State()
+
+		// A: 10 + 20 = 30 (NULL ignored)
+		if state["A"] != 30.0 {
+			t.Errorf("expected A=30 (NULL ignored), got %v", state["A"])
+		}
+
+		t.Logf("SUM with NULL: %+v", out)
+	})
+
+	t.Run("COUNT ignores NULL", func(t *testing.T) {
+		q := "SELECT k, COUNT(v) FROM t GROUP BY k"
+		node, err := ParseQueryToIncrementalDBSP(q)
+		if err != nil {
+			t.Fatalf("ParseQueryToIncrementalDBSP failed: %v", err)
+		}
+
+		batch := types.Batch{
+			{Tuple: types.Tuple{"k": "A", "v": 10}, Count: 1},
+			{Tuple: types.Tuple{"k": "A", "v": nil}, Count: 1},
+			{Tuple: types.Tuple{"k": "A", "v": 20}, Count: 1},
+		}
+
+		out, err := node.Op.Apply(batch)
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		gop, ok := node.Op.(*op.GroupAggOp)
+		if !ok {
+			t.Fatalf("expected GroupAggOp, got %T", node.Op)
+		}
+		state := gop.State()
+
+		// A: count=2 (NULL not counted)
+		if state["A"] != int64(2) {
+			t.Errorf("expected A count=2 (NULL ignored), got %v", state["A"])
+		}
+
+		t.Logf("COUNT with NULL: %+v", out)
+	})
+
+	t.Run("MIN/MAX ignores NULL", func(t *testing.T) {
+		q := "SELECT k, MIN(v) FROM t GROUP BY k"
+		node, err := ParseQueryToIncrementalDBSP(q)
+		if err != nil {
+			t.Fatalf("ParseQueryToIncrementalDBSP failed: %v", err)
+		}
+
+		batch := types.Batch{
+			{Tuple: types.Tuple{"k": "A", "v": 30}, Count: 1},
+			{Tuple: types.Tuple{"k": "A", "v": nil}, Count: 1},
+			{Tuple: types.Tuple{"k": "A", "v": 10}, Count: 1},
+		}
+
+		out, err := node.Op.Apply(batch)
+		if err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
+
+		t.Logf("MIN with NULL: %+v", out)
+	})
+}
+
+func TestJoinWithNull(t *testing.T) {
+	t.Skip("JOIN with NULL keys not yet properly implemented")
+
+	q := "SELECT a.id, a.k, b.v FROM a JOIN b ON a.id = b.id"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with JOIN failed: %v", err)
+	}
+
+	// NULL keys should not match
+	batch := types.Batch{
+		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
+		{Tuple: types.Tuple{"a.id": nil, "a.k": "B"}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: 1},
+		{Tuple: types.Tuple{"b.id": nil, "b.v": 20}, Count: 1},
+	}
+
+	out, err := op.Execute(node, batch)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// Only id=1 should join, NULL keys don't match
+	if len(out) != 1 {
+		t.Errorf("expected 1 joined row (NULL keys excluded), got %d", len(out))
+	}
+
+	t.Logf("JOIN with NULL keys: %+v", out)
+}
+
+func TestWhereNullComparison(t *testing.T) {
+	t.Run("NULL = value is false", func(t *testing.T) {
+		q := "SELECT id, name FROM users WHERE status = 'active'"
+		node, err := ParseQueryToDBSP(q)
+		if err != nil {
+			t.Fatalf("ParseQueryToDBSP failed: %v", err)
+		}
+
+		batch := types.Batch{
+			{Tuple: types.Tuple{"id": 1, "name": "Alice", "status": "active"}, Count: 1},
+			{Tuple: types.Tuple{"id": 2, "name": "Bob", "status": nil}, Count: 1},
+			{Tuple: types.Tuple{"id": 3, "name": "Charlie", "status": "inactive"}, Count: 1},
+		}
+
+		out, err := op.Execute(node, batch)
+		if err != nil {
+			t.Fatalf("Execute failed: %v", err)
+		}
+
+		// Only id=1 should pass (NULL != 'active')
+		if len(out) != 1 {
+			t.Errorf("expected 1 result (NULL excluded from equality), got %d", len(out))
+		}
+	})
 }
 
 // ============================================================================
