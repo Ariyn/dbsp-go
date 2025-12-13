@@ -18,11 +18,16 @@ type GroupAggOp struct {
 	AggInit func() any
 	AggFn   AggFunc
 
-	state map[any]any
+	state      map[any]any
+	KeyColName string // Optional: name of the key column to include in output
 }
 
 func NewGroupAggOp(keyFn func(types.Tuple) any, aggInit func() any, aggFn AggFunc) *GroupAggOp {
 	return &GroupAggOp{KeyFn: keyFn, AggInit: aggInit, AggFn: aggFn, state: make(map[any]any)}
+}
+
+func (g *GroupAggOp) SetKeyColName(name string) {
+	g.KeyColName = name
 }
 
 func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
@@ -39,6 +44,10 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 		newVal, outDelta := g.AggFn.Apply(prev, td)
 		g.state[key] = newVal
 		if outDelta != nil {
+			// If KeyColName is set, inject the key into the output tuple
+			if g.KeyColName != "" {
+				outDelta.Tuple[g.KeyColName] = key
+			}
 			out = append(out, *outDelta)
 		}
 	}

@@ -1,0 +1,17 @@
+pipeline:
+  source:
+    type: http
+    config:
+      port: 8080
+      path: /ingest
+      schema:
+        time_bucket: string
+        amount: float
+        product: string
+  transform:
+    type: sql
+    query: "SELECT time_bucket, SUM(amount) as total_sales FROM sales GROUP BY time_bucket"
+  sink:
+    type: console
+    config:
+      format: json

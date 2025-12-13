@@ -612,6 +612,7 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				}
 
 				g := op.NewGroupAggOp(keyFn, aggInit, agg)
+				g.SetKeyColName(key)
 				return &op.Node{Op: g}, nil
 			} // Windowed aggregation: use WindowAggOp so that each input delta
 			// only affects its corresponding window(s) and group key.
@@ -699,6 +700,7 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				predicateFn := BuildPredicateFunc(in.PredicateSQL) // Create a combined operator: filter then aggregate
 				// For Phase1, we embed filtering in the GroupAgg by wrapping the input
 				g := op.NewGroupAggOp(keyFn, aggInit, agg)
+				g.SetKeyColName(key)
 
 				// Wrap with MapOp for filtering
 				filterOp := &op.MapOp{
@@ -799,6 +801,7 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			}
 
 			g := op.NewGroupAggOp(keyFn, aggInit, agg)
+			g.SetKeyColName(key)
 
 			// Transform JOIN
 			joinNode, err := logicalJoinToDBSP(in)
@@ -1001,6 +1004,9 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 
 	// Fallback to GroupAggOp for simple aggregations without frame
 	g := op.NewGroupAggOp(keyFn, aggInit, agg)
+	if len(wa.PartitionBy) == 1 {
+		g.SetKeyColName(wa.PartitionBy[0])
+	}
 
 	return &op.Node{Op: g}, nil
 }

@@ -1,0 +1,4 @@
+time_bucket,amount,product
+10:00,1000,A
+10:00,1500,B
+10:05,3000,A
