@@ -65,11 +65,42 @@ func NewJoinOp(
 }
 
 // Apply processes batches from both inputs and returns the output batch.
-// This is a stateful operator that maintains left and right state.
+// For JOIN, we separate the batch into left and right based on which columns exist.
 func (b *BinaryOp) Apply(batch types.Batch) (types.Batch, error) {
-	// Note: This simple Apply only works for single-input operators.
-	// Binary operators need special handling in the execution engine.
-	// For now, we'll implement ApplyBinary which takes two batches.
+	if b.Type == BinaryJoin {
+		// Separate batch into left and right based on key columns
+		var leftBatch, rightBatch types.Batch
+
+		for _, td := range batch {
+			// Check which side this tuple belongs to by looking for key columns
+			hasLeft := false
+			hasRight := false
+
+			// Try to extract keys to determine which side
+			leftKey := b.LeftKeyFn(td.Tuple)
+			rightKey := b.RightKeyFn(td.Tuple)
+
+			// If left key exists and is not nil, it's from left table
+			if leftKey != nil {
+				hasLeft = true
+			}
+			// If right key exists and is not nil, it's from right table
+			if rightKey != nil {
+				hasRight = true
+			}
+
+			// A tuple with only left columns goes to left batch
+			// A tuple with only right columns goes to right batch
+			if hasLeft && !hasRight {
+				leftBatch = append(leftBatch, td)
+			} else if hasRight && !hasLeft {
+				rightBatch = append(rightBatch, td)
+			}
+		}
+
+		return b.ApplyBinary(leftBatch, rightBatch)
+	}
+
 	return nil, nil
 }
 
@@ -102,6 +133,10 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 	// Part 1: ΔR ⋈ S (new left tuples join with existing right state)
 	for _, ld := range leftDelta {
 		leftKey := b.LeftKeyFn(ld.Tuple)
+		// Skip NULL keys
+		if leftKey == nil {
+			continue
+		}
 		if rightTuples, ok := b.rightState[leftKey]; ok {
 			for _, rd := range rightTuples {
 				combined := b.CombineFn(ld.Tuple, rd.Tuple)
@@ -120,6 +155,10 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 	// Part 2: R ⋈ ΔS (existing left state join with new right tuples)
 	for _, rd := range rightDelta {
 		rightKey := b.RightKeyFn(rd.Tuple)
+		// Skip NULL keys
+		if rightKey == nil {
+			continue
+		}
 		if leftTuples, ok := b.leftState[rightKey]; ok {
 			for _, ld := range leftTuples {
 				combined := b.CombineFn(ld.Tuple, rd.Tuple)
@@ -137,8 +176,16 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 	// Part 3: ΔR ⋈ ΔS (new left tuples join with new right tuples)
 	for _, ld := range leftDelta {
 		leftKey := b.LeftKeyFn(ld.Tuple)
+		// Skip NULL keys
+		if leftKey == nil {
+			continue
+		}
 		for _, rd := range rightDelta {
 			rightKey := b.RightKeyFn(rd.Tuple)
+			// Skip NULL keys
+			if rightKey == nil {
+				continue
+			}
 			if leftKey == rightKey {
 				combined := b.CombineFn(ld.Tuple, rd.Tuple)
 				count := ld.Count * rd.Count
@@ -152,14 +199,24 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 		}
 	}
 
-	// Update state: add new deltas to the state
+	// Debug: log join output
+	// fmt.Printf("[DEBUG] JOIN: leftDelta=%d, rightDelta=%d, output=%d\n", len(leftDelta), len(rightDelta), len(out))
+	// for i, o := range out {
+	// 	fmt.Printf("[DEBUG] JOIN output[%d]: %+v\n", i, o.Tuple)
+	// }
+
+	// Update state: add new deltas to the state (skip NULL keys)
 	for _, ld := range leftDelta {
 		key := b.LeftKeyFn(ld.Tuple)
-		b.leftState[key] = append(b.leftState[key], ld)
+		if key != nil {
+			b.leftState[key] = append(b.leftState[key], ld)
+		}
 	}
 	for _, rd := range rightDelta {
 		key := b.RightKeyFn(rd.Tuple)
-		b.rightState[key] = append(b.rightState[key], rd)
+		if key != nil {
+			b.rightState[key] = append(b.rightState[key], rd)
+		}
 	}
 
 	return out, nil

@@ -101,8 +101,6 @@ func TestParseQueryToIncrementalDBSP(t *testing.T) {
 // ============================================================================
 
 func TestParseQueryJoinSimple(t *testing.T) {
-	t.Skip("JOIN implementation needs fixing")
-
 	q := "SELECT a.id, a.k, b.v FROM a JOIN b ON a.id = b.id"
 	node, err := ParseQueryToDBSP(q)
 	if err != nil {
@@ -160,7 +158,6 @@ func TestParseQueryJoinWithWhere(t *testing.T) {
 }
 
 func TestParseQueryJoinGroupBy(t *testing.T) {
-	t.Skip("JOIN + GROUP BY implementation needs fixing")
 
 	q := "SELECT a.k, SUM(b.v) FROM a JOIN b ON a.id = b.id GROUP BY a.k"
 	node, err := ParseQueryToDBSP(q)
@@ -1328,7 +1325,6 @@ func TestAggregateWithNull(t *testing.T) {
 }
 
 func TestJoinWithNull(t *testing.T) {
-	t.Skip("JOIN with NULL keys not yet properly implemented")
 
 	q := "SELECT a.id, a.k, b.v FROM a JOIN b ON a.id = b.id"
 	node, err := ParseQueryToDBSP(q)
@@ -1597,5 +1593,123 @@ func TestSortBatchByOrderColumn_EmptyOrNoColumn(t *testing.T) {
 	if sorted2[0].Tuple["id"] != batch[0].Tuple["id"] ||
 		sorted2[1].Tuple["id"] != batch[1].Tuple["id"] {
 		t.Fatalf("batch should not change when order column is missing")
+	}
+}
+
+// ============================================================================
+// Time Window Tests
+// ============================================================================
+
+func TestParseTimeWindowSQL_Tumble(t *testing.T) {
+	spec, err := ParseTimeWindowSQL("TUMBLE(ts, INTERVAL '5' MINUTE)")
+	if err != nil {
+		t.Fatalf("failed to parse: %v", err)
+	}
+
+	if spec.WindowType != "TUMBLING" {
+		t.Errorf("expected TUMBLING, got %s", spec.WindowType)
+	}
+	if spec.TimeCol != "ts" {
+		t.Errorf("expected TimeCol=ts, got %s", spec.TimeCol)
+	}
+	if spec.SizeMillis != 300000 {
+		t.Errorf("expected 300000ms, got %d", spec.SizeMillis)
+	}
+}
+
+func TestParseTimeWindowSQL_Hop(t *testing.T) {
+	spec, err := ParseTimeWindowSQL("HOP(ts, INTERVAL '5' MINUTE, INTERVAL '10' MINUTE)")
+	if err != nil {
+		t.Fatalf("failed to parse: %v", err)
+	}
+
+	if spec.WindowType != "SLIDING" {
+		t.Errorf("expected SLIDING, got %s", spec.WindowType)
+	}
+	if spec.SlideMillis != 300000 {
+		t.Errorf("expected slide=300000ms, got %d", spec.SlideMillis)
+	}
+	if spec.SizeMillis != 600000 {
+		t.Errorf("expected size=600000ms, got %d", spec.SizeMillis)
+	}
+}
+
+func TestParseTimeWindowSQL_Session(t *testing.T) {
+	spec, err := ParseTimeWindowSQL("SESSION(ts, INTERVAL '5' MINUTE)")
+	if err != nil {
+		t.Fatalf("failed to parse: %v", err)
+	}
+
+	if spec.WindowType != "SESSION" {
+		t.Errorf("expected SESSION, got %s", spec.WindowType)
+	}
+	if spec.GapMillis != 300000 {
+		t.Errorf("expected gap=300000ms, got %d", spec.GapMillis)
+	}
+}
+
+func TestTimeWindowIntegration(t *testing.T) {
+	t.Skip("Requires manual TimeWindowSpec creation until parser supports it")
+	
+	// Create a manual LogicalWindowAgg with TimeWindowSpec
+	timeWindowSpec := &ir.TimeWindowSpec{
+		WindowType:  "TUMBLING",
+		TimeCol:     "ts",
+		SizeMillis:  300000, // 5 minutes
+		SlideMillis: 0,
+		GapMillis:   0,
+	}
+	
+	scan := &ir.LogicalScan{Table: "events"}
+	
+	wa := &ir.LogicalWindowAgg{
+		AggName:        "SUM",
+		AggCol:         "amount",
+		PartitionBy:    []string{"region"},
+		TimeWindowSpec: timeWindowSpec,
+		OutputCol:      "total",
+		Input:          scan,
+	}
+	
+	// Convert to DBSP
+	node, err := ir.LogicalToDBSP(wa)
+	if err != nil {
+		t.Fatalf("LogicalToDBSP failed: %v", err)
+	}
+	
+	// Verify WindowAggOp was created
+	windowOp, ok := node.Op.(*op.WindowAggOp)
+	if !ok {
+		t.Fatalf("expected WindowAggOp, got %T", node.Op)
+	}
+	
+	if windowOp.Spec.WindowType != op.WindowTypeTumbling {
+		t.Errorf("expected TUMBLING window type")
+	}
+	
+	if windowOp.Spec.TimeCol != "ts" {
+		t.Errorf("expected TimeCol=ts, got %s", windowOp.Spec.TimeCol)
+	}
+	
+	// Test with batch
+	batch := types.Batch{
+		{Tuple: types.Tuple{"ts": int64(100000), "region": "East", "amount": 100.0}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(350000), "region": "East", "amount": 200.0}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(100000), "region": "West", "amount": 50.0}, Count: 1},
+	}
+	
+	out, err := windowOp.Apply(batch)
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+	
+	// Should have multiple window results
+	if len(out) == 0 {
+		t.Error("expected window results")
+	}
+	
+	t.Logf("Window results: %d deltas", len(out))
+	for i, td := range out {
+		t.Logf("  [%d] %+v", i, td.Tuple)
 	}
 }

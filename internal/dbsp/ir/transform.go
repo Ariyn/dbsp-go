@@ -517,20 +517,50 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			},
 		}
 
-		// Check if we need to chain with filter
-		if filter, ok := n.Input.(*LogicalFilter); ok {
-			// Build filter predicate
-			predicateFn := BuildPredicateFunc(filter.PredicateSQL)
-			filterOp := &op.MapOp{
-				F: func(td types.TupleDelta) []types.TupleDelta {
-					if predicateFn(td.Tuple) {
-						return []types.TupleDelta{td}
+		// Check if input needs processing
+		if n.Input != nil {
+			// Recursively transform input first
+			switch in := n.Input.(type) {
+			case *LogicalFilter:
+				// Build filter predicate
+				predicateFn := BuildPredicateFunc(in.PredicateSQL)
+				filterOp := &op.MapOp{
+					F: func(td types.TupleDelta) []types.TupleDelta {
+						if predicateFn(td.Tuple) {
+							return []types.TupleDelta{td}
+						}
+						return nil
+					},
+				}
+
+				// Check if filter has JOIN as input
+				if join, ok := in.Input.(*LogicalJoin); ok {
+					// Transform JOIN
+					joinNode, err := logicalJoinToDBSP(join)
+					if err != nil {
+						return nil, err
 					}
-					return nil
-				},
+					// Chain: JOIN -> filter -> project
+					chainedOp := &op.ChainedOp{
+						Ops: []op.Operator{joinNode.Op, filterOp, projectOp},
+					}
+					return &op.Node{Op: chainedOp}, nil
+				}
+
+				// Chain: filter first, then project
+				return &op.Node{Op: &op.ChainedOp{Ops: []op.Operator{filterOp, projectOp}}}, nil
+
+			case *LogicalJoin:
+				// Transform JOIN and chain with project
+				joinNode, err := logicalJoinToDBSP(in)
+				if err != nil {
+					return nil, err
+				}
+				chainedOp := &op.ChainedOp{
+					Ops: []op.Operator{joinNode.Op, projectOp},
+				}
+				return &op.Node{Op: chainedOp}, nil
 			}
-			// Chain: filter first, then project
-			return &op.Node{Op: &op.ChainedOp{Ops: []op.Operator{filterOp, projectOp}}}, nil
 		}
 
 		return &op.Node{Op: projectOp}, nil
@@ -562,28 +592,28 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				key := n.Keys[0]
 				keyFn := func(t types.Tuple) any { return t[key] }
 
-			var agg op.AggFunc
-			var aggInit func() any
-			switch n.AggName {
-			case "SUM", "sum":
-				agg = &op.SumAgg{ColName: n.AggCol}
-				aggInit = func() any { return float64(0) }
-			case "COUNT", "count":
-				agg = &op.CountAgg{ColName: n.AggCol}
-				aggInit = func() any { return int64(0) }
-			case "MIN", "min":
-			agg = &op.MinAgg{ColName: n.AggCol}
-			aggInit = func() any { return op.NewSortedMultiset() }
-		case "MAX", "max":
-			agg = &op.MaxAgg{ColName: n.AggCol}
-			aggInit = func() any { return op.NewSortedMultiset() }
-		default:
-			return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-		}
+				var agg op.AggFunc
+				var aggInit func() any
+				switch n.AggName {
+				case "SUM", "sum":
+					agg = &op.SumAgg{ColName: n.AggCol}
+					aggInit = func() any { return float64(0) }
+				case "COUNT", "count":
+					agg = &op.CountAgg{ColName: n.AggCol}
+					aggInit = func() any { return int64(0) }
+				case "MIN", "min":
+					agg = &op.MinAgg{ColName: n.AggCol}
+					aggInit = func() any { return op.NewSortedMultiset() }
+				case "MAX", "max":
+					agg = &op.MaxAgg{ColName: n.AggCol}
+					aggInit = func() any { return op.NewSortedMultiset() }
+				default:
+					return nil, fmt.Errorf("unsupported agg %s", n.AggName)
+				}
 
-		g := op.NewGroupAggOp(keyFn, aggInit, agg)
-		return &op.Node{Op: g}, nil
-	}			// Windowed aggregation: use WindowAggOp so that each input delta
+				g := op.NewGroupAggOp(keyFn, aggInit, agg)
+				return &op.Node{Op: g}, nil
+			} // Windowed aggregation: use WindowAggOp so that each input delta
 			// only affects its corresponding window(s) and group key.
 			ws := n.WindowSpec
 			if ws == nil {
@@ -607,46 +637,7 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			var agg op.AggFunc
 			var aggInit func() any
 			switch n.AggName {
-		case "SUM", "sum":
-			agg = &op.SumAgg{ColName: n.AggCol}
-			aggInit = func() any { return float64(0) }
-		case "COUNT", "count":
-			agg = &op.CountAgg{ColName: n.AggCol}
-			aggInit = func() any { return int64(0) }
-		case "AVG", "avg":
-			agg = &op.AvgAgg{ColName: n.AggCol}
-			aggInit = func() any { return nil }
-		case "MIN", "min":
-			agg = &op.MinAgg{ColName: n.AggCol}
-			aggInit = func() any { return op.NewSortedMultiset() }
-		case "MAX", "max":
-			agg = &op.MaxAgg{ColName: n.AggCol}
-			aggInit = func() any { return op.NewSortedMultiset() }
-		default:
-			return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-		}
-
-		waSpec := op.WindowSpecLite{
-			TimeCol:    ws.TimeCol,
-			SizeMillis: ws.SizeMillis,
-		}
-		g := op.NewWindowAggOp(waSpec, groupKeyFn, n.Keys, aggInit, agg)
-	return &op.Node{Op: g}, nil
-
-	case *LogicalFilter:
-			// Filter before GroupAgg - create chained MapOp
-			if n.WindowSpec == nil {
-				// Non-windowed grouping with a single group key
-				if len(n.Keys) != 1 {
-					return nil, fmt.Errorf("only single-group-key supported")
-				}
-				key := n.Keys[0]
-				keyFn := func(t types.Tuple) any { return t[key] }
-
-				var agg op.AggFunc
-				var aggInit func() any
-				switch n.AggName {
-				case "SUM", "sum":
+			case "SUM", "sum":
 				agg = &op.SumAgg{ColName: n.AggCol}
 				aggInit = func() any { return float64(0) }
 			case "COUNT", "count":
@@ -665,8 +656,47 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
 			}
 
-			// Create filter function
-			predicateFn := BuildPredicateFunc(in.PredicateSQL)				// Create a combined operator: filter then aggregate
+			waSpec := op.WindowSpecLite{
+				TimeCol:    ws.TimeCol,
+				SizeMillis: ws.SizeMillis,
+			}
+			g := op.NewWindowAggOp(waSpec, groupKeyFn, n.Keys, aggInit, agg)
+			return &op.Node{Op: g}, nil
+
+		case *LogicalFilter:
+			// Filter before GroupAgg - create chained MapOp
+			if n.WindowSpec == nil {
+				// Non-windowed grouping with a single group key
+				if len(n.Keys) != 1 {
+					return nil, fmt.Errorf("only single-group-key supported")
+				}
+				key := n.Keys[0]
+				keyFn := func(t types.Tuple) any { return t[key] }
+
+				var agg op.AggFunc
+				var aggInit func() any
+				switch n.AggName {
+				case "SUM", "sum":
+					agg = &op.SumAgg{ColName: n.AggCol}
+					aggInit = func() any { return float64(0) }
+				case "COUNT", "count":
+					agg = &op.CountAgg{ColName: n.AggCol}
+					aggInit = func() any { return int64(0) }
+				case "AVG", "avg":
+					agg = &op.AvgAgg{ColName: n.AggCol}
+					aggInit = func() any { return nil }
+				case "MIN", "min":
+					agg = &op.MinAgg{ColName: n.AggCol}
+					aggInit = func() any { return op.NewSortedMultiset() }
+				case "MAX", "max":
+					agg = &op.MaxAgg{ColName: n.AggCol}
+					aggInit = func() any { return op.NewSortedMultiset() }
+				default:
+					return nil, fmt.Errorf("unsupported agg %s", n.AggName)
+				}
+
+				// Create filter function
+				predicateFn := BuildPredicateFunc(in.PredicateSQL) // Create a combined operator: filter then aggregate
 				// For Phase1, we embed filtering in the GroupAgg by wrapping the input
 				g := op.NewGroupAggOp(keyFn, aggInit, agg)
 
@@ -702,26 +732,26 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			case "SUM", "sum":
 				agg = &op.SumAgg{ColName: n.AggCol}
 				aggInit = func() any { return float64(0) }
-		case "COUNT", "count":
-			agg = &op.CountAgg{ColName: n.AggCol}
-			aggInit = func() any { return int64(0) }
-		case "AVG", "avg":
-			agg = &op.AvgAgg{ColName: n.AggCol}
-			aggInit = func() any { return op.AvgMonoid{} }
-		case "MIN", "min":
-			agg = &op.MinAgg{ColName: n.AggCol}
-			aggInit = func() any { return op.NewSortedMultiset() }
-		case "MAX", "max":
-			agg = &op.MaxAgg{ColName: n.AggCol}
-			aggInit = func() any { return op.NewSortedMultiset() }
-		default:
-			return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-		}
+			case "COUNT", "count":
+				agg = &op.CountAgg{ColName: n.AggCol}
+				aggInit = func() any { return int64(0) }
+			case "AVG", "avg":
+				agg = &op.AvgAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.AvgMonoid{} }
+			case "MIN", "min":
+				agg = &op.MinAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
+			case "MAX", "max":
+				agg = &op.MaxAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
+			default:
+				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
+			}
 
-		// Create filter function
-		predicateFn := BuildPredicateFunc(in.PredicateSQL)
+			// Create filter function
+			predicateFn := BuildPredicateFunc(in.PredicateSQL)
 
-		g := op.NewGroupAggOp(keyFn, aggInit, agg)			// Wrap with MapOp for filtering
+			g := op.NewGroupAggOp(keyFn, aggInit, agg) // Wrap with MapOp for filtering
 			filterOp := &op.MapOp{
 				F: func(td types.TupleDelta) []types.TupleDelta {
 					if predicateFn(td.Tuple) {
@@ -738,6 +768,51 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 
 			return &op.Node{Op: chainedOp}, nil
 
+		case *LogicalJoin:
+			// JOIN followed by GroupAgg
+			if len(n.Keys) != 1 {
+				return nil, fmt.Errorf("only single-group-key supported")
+			}
+			key := n.Keys[0]
+			keyFn := func(t types.Tuple) any { return t[key] }
+
+			var agg op.AggFunc
+			var aggInit func() any
+			switch n.AggName {
+			case "SUM", "sum":
+				agg = &op.SumAgg{ColName: n.AggCol}
+				aggInit = func() any { return float64(0) }
+			case "COUNT", "count":
+				agg = &op.CountAgg{ColName: n.AggCol}
+				aggInit = func() any { return int64(0) }
+			case "AVG", "avg":
+				agg = &op.AvgAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.AvgMonoid{} }
+			case "MIN", "min":
+				agg = &op.MinAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
+			case "MAX", "max":
+				agg = &op.MaxAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
+			default:
+				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
+			}
+
+			g := op.NewGroupAggOp(keyFn, aggInit, agg)
+
+			// Transform JOIN
+			joinNode, err := logicalJoinToDBSP(in)
+			if err != nil {
+				return nil, err
+			}
+
+			// Chain: JOIN -> GroupAgg
+			chainedOp := &op.ChainedOp{
+				Ops: []op.Operator{joinNode.Op, g},
+			}
+
+			return &op.Node{Op: chainedOp}, nil
+
 		default:
 			return nil, fmt.Errorf("unsupported input node to GroupAgg: %T", in)
 		}
@@ -749,6 +824,18 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 	case *LogicalWindowAgg:
 		// Transform window aggregate function to appropriate operator
 		return logicalWindowAggToDBSP(n)
+
+	case *LogicalJoin:
+		// Transform JOIN to BinaryOp
+		return logicalJoinToDBSP(n)
+
+	case *LogicalSort:
+		// Transform ORDER BY to SortOp
+		return logicalSortToDBSP(n)
+
+	case *LogicalLimit:
+		// Transform LIMIT to LimitOp
+		return logicalLimitToDBSP(n)
 
 	default:
 		return nil, fmt.Errorf("unsupported logical node: %T", n)
@@ -863,12 +950,117 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 		return nil, fmt.Errorf("unsupported window aggregate function: %s", wa.AggName)
 	}
 
-	// For DuckDB window aggregates with ORDER BY and frame specification,
-	// we need a specialized operator that maintains ordered state per partition
-	// For Phase 1, we'll use a simplified approach with GroupAggOp
-	// TODO: Implement proper frame-based window aggregation
+	// Check for time-based windowing
+	if wa.TimeWindowSpec != nil {
+		spec := wa.TimeWindowSpec
+		
+		// Convert to op.WindowType
+		var windowType op.WindowType
+		switch strings.ToUpper(spec.WindowType) {
+		case "TUMBLING":
+			windowType = op.WindowTypeTumbling
+		case "SLIDING":
+			windowType = op.WindowTypeSliding
+		case "SESSION":
+			windowType = op.WindowTypeSession
+		default:
+			windowType = op.WindowTypeTumbling
+		}
 
+		// Create WindowSpecLite for time-based windows
+		windowSpec := op.WindowSpecLite{
+			TimeCol:     spec.TimeCol,
+			SizeMillis:  spec.SizeMillis,
+			WindowType:  windowType,
+			SlideMillis: spec.SlideMillis,
+			GapMillis:   spec.GapMillis,
+		}
+
+		windowOp := op.NewWindowAggOp(windowSpec, keyFn, wa.PartitionBy, aggInit, agg)
+		return &op.Node{Op: windowOp}, nil
+	}
+
+	// For DuckDB window aggregates with ORDER BY and frame specification,
+	// use WindowAggOp for proper frame-based aggregation
+	if wa.OrderBy != "" && wa.FrameSpec != nil {
+		// Convert FrameSpec to op.FrameSpecLite
+		frameSpec := &op.FrameSpecLite{
+			Type:       wa.FrameSpec.Type,
+			StartType:  wa.FrameSpec.StartType,
+			StartValue: wa.FrameSpec.StartValue,
+			EndType:    wa.FrameSpec.EndType,
+			EndValue:   wa.FrameSpec.EndValue,
+		}
+
+		windowOp := op.NewWindowAggOp(op.WindowSpecLite{}, keyFn, wa.PartitionBy, aggInit, agg)
+		windowOp.OrderByCol = wa.OrderBy
+		windowOp.FrameSpec = frameSpec
+
+		return &op.Node{Op: windowOp}, nil
+	}
+
+	// Fallback to GroupAggOp for simple aggregations without frame
 	g := op.NewGroupAggOp(keyFn, aggInit, agg)
 
 	return &op.Node{Op: g}, nil
+}
+
+// logicalJoinToDBSP transforms LogicalJoin to BinaryOp (JoinOp)
+func logicalJoinToDBSP(join *LogicalJoin) (*op.Node, error) {
+	// For now, only support single equi-join condition
+	if len(join.Conditions) != 1 {
+		return nil, fmt.Errorf("only single join condition supported")
+	}
+
+	cond := join.Conditions[0]
+
+	// Create key extraction functions for left and right
+	leftKeyFn := func(t types.Tuple) any {
+		key := t[cond.LeftCol]
+		// NULL keys should not match
+		if key == nil {
+			return nil
+		}
+		return key
+	}
+
+	rightKeyFn := func(t types.Tuple) any {
+		key := t[cond.RightCol]
+		// NULL keys should not match
+		if key == nil {
+			return nil
+		}
+		return key
+	}
+
+	// Combine function merges left and right tuples
+	combineFn := func(l, r types.Tuple) types.Tuple {
+		result := make(types.Tuple)
+		// Copy all columns from left
+		for k, v := range l {
+			result[k] = v
+		}
+		// Copy all columns from right
+		for k, v := range r {
+			result[k] = v
+		}
+		return result
+	}
+
+	// Create JoinOp
+	joinOp := op.NewJoinOp(leftKeyFn, rightKeyFn, combineFn)
+
+	return &op.Node{Op: joinOp}, nil
+}
+
+// logicalSortToDBSP transforms LogicalSort to SortOp
+func logicalSortToDBSP(sort *LogicalSort) (*op.Node, error) {
+	sortOp := op.NewSortOp(sort.OrderColumns, sort.Descending)
+	return &op.Node{Op: sortOp}, nil
+}
+
+// logicalLimitToDBSP transforms LogicalLimit to LimitOp
+func logicalLimitToDBSP(limit *LogicalLimit) (*op.Node, error) {
+	limitOp := op.NewLimitOp(limit.Limit, limit.Offset)
+	return &op.Node{Op: limitOp}, nil
 }

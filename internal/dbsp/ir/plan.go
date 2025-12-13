@@ -102,6 +102,20 @@ type FrameSpec struct {
 	EndValue string
 }
 
+// TimeWindowSpec describes time-based windowing (Tumbling/Sliding/Session)
+type TimeWindowSpec struct {
+	// WindowType: TUMBLING, SLIDING, or SESSION
+	WindowType string
+	// TimeCol is the timestamp column
+	TimeCol string
+	// SizeMillis is the window size in milliseconds
+	SizeMillis int64
+	// SlideMillis is the slide size for sliding windows (0 for tumbling)
+	SlideMillis int64
+	// GapMillis is the inactivity gap for session windows
+	GapMillis int64
+}
+
 // LogicalWindowAgg represents a window aggregate function
 type LogicalWindowAgg struct {
 	// AggName: SUM, AVG, COUNT, MIN, MAX
@@ -112,8 +126,10 @@ type LogicalWindowAgg struct {
 	PartitionBy []string
 	// OrderBy column
 	OrderBy string
-	// FrameSpec describes the window frame
+	// FrameSpec describes the window frame (for row-based windows)
 	FrameSpec *FrameSpec
+	// TimeWindowSpec describes time-based windowing (for event-time windows)
+	TimeWindowSpec *TimeWindowSpec
 	// OutputCol is the name of the output column
 	OutputCol string
 	// Input is the child logical node
@@ -121,3 +137,51 @@ type LogicalWindowAgg struct {
 }
 
 func (w *LogicalWindowAgg) nodeName() string { return "LogicalWindowAgg" }
+
+// JoinCondition describes a single join condition (equi-join on columns)
+type JoinCondition struct {
+	// LeftCol is the column name from the left table (with table prefix, e.g., "a.id")
+	LeftCol string
+	// RightCol is the column name from the right table (with table prefix, e.g., "b.id")
+	RightCol string
+}
+
+// LogicalJoin represents an inner equi-join between two tables
+type LogicalJoin struct {
+	// LeftTable is the left table name
+	LeftTable string
+	// RightTable is the right table name
+	RightTable string
+	// Conditions are the join conditions (ON clause)
+	Conditions []JoinCondition
+	// Left is the left input (typically LogicalScan)
+	Left LogicalNode
+	// Right is the right input (typically LogicalScan)
+	Right LogicalNode
+}
+
+func (j *LogicalJoin) nodeName() string { return "LogicalJoin" }
+
+// LogicalSort represents ORDER BY clause
+type LogicalSort struct {
+	// OrderColumns are the columns to sort by
+	OrderColumns []string
+	// Descending indicates whether each column is sorted descending
+	Descending []bool
+	// Input is the child logical node
+	Input LogicalNode
+}
+
+func (s *LogicalSort) nodeName() string { return "LogicalSort" }
+
+// LogicalLimit represents LIMIT and OFFSET clauses
+type LogicalLimit struct {
+	// Limit is the maximum number of rows to return
+	Limit int64
+	// Offset is the number of rows to skip
+	Offset int64
+	// Input is the child logical node
+	Input LogicalNode
+}
+
+func (l *LogicalLimit) nodeName() string { return "LogicalLimit" }

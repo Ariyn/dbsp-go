@@ -51,7 +51,7 @@ func TestLogicalToDBSP_CountGroupAgg(t *testing.T) {
 	agg := &LogicalGroupAgg{
 		Keys:    []string{"event_type"},
 		AggName: "COUNT",
-		AggCol:  "id",
+		AggCol:  "", // COUNT(*) - count all rows
 		Input:   scan,
 	}
 

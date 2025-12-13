@@ -28,6 +28,44 @@
     - 중첩 괄호 지원
     - 예: `(age > 50 OR status = 'vip') AND amount > 100`
 - **Projection** (SELECT 특정 컬럼 선택)
+- **시간 기반 윈도우 집계**
+  - **Tumbling Windows**: 겹치지 않는 고정 크기 윈도우
+  - **Sliding Windows**: 겹치는 윈도우 (size, slide 파라미터)
+  - **Session Windows**: 비활동 시간 기반 동적 윈도우
+
+### 시간 윈도우 기능
+
+#### Interval 타입
+- 시간 간격 표현: `"5 minutes"`, `"1 hour"`, `"30 seconds"`, `"2 days"`
+- 자동 밀리초 변환 및 파싱
+
+#### Tumbling Window
+```go
+spec := op.WindowSpecLite{
+    TimeCol:     "ts",
+    SizeMillis:  300000, // 5 minutes
+    WindowType:  op.WindowTypeTumbling,
+}
+```
+
+#### Sliding Window
+```go
+spec := op.WindowSpecLite{
+    TimeCol:     "ts",
+    SizeMillis:  600000,  // 10 minutes window
+    SlideMillis: 300000,  // 5 minutes slide
+    WindowType:  op.WindowTypeSliding,
+}
+```
+
+#### Session Window
+```go
+spec := op.WindowSpecLite{
+    TimeCol:    "ts",
+    GapMillis:  300000,  // 5 minutes inactivity gap
+    WindowType: op.WindowTypeSession,
+}
+```
 
 ## 빌드 및 실행
 

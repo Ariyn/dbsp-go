@@ -15,6 +15,14 @@ func main() {
 	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
 	fmt.Println()
 
+	// Run window demos first
+	runWindowDemos()
+	
+	fmt.Println("\n\n╔═══════════════════════════════════════════════════════════╗")
+	fmt.Println("║  Original Demo: 5분 단위 매출 집계                       ║")
+	fmt.Println("╚═══════════════════════════════════════════════════════════╝")
+	fmt.Println()
+
 	// SQL 쿼리: 5분 단위로 그룹화하여 매출 합계 계산
 	query := `
 		SELECT time_bucket, SUM(amount) as total_sales

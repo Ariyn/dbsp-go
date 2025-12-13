@@ -47,6 +47,13 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		return nil, errors.New("only single FROM table supported")
 	}
 
+	// Check if we have a JOIN in the FROM clause
+	fromExpr := sel.From[0]
+	if joinExpr, ok := fromExpr.(*ast.JoinTableExpr); ok {
+		// Handle JOIN
+		return parseJoin(sel, joinExpr)
+	}
+
 	// Start with scan - extract table name from FROM
 	tableName := "t"
 	if tableExpr, ok := sel.From[0].(*ast.TableName); ok {
@@ -307,8 +314,32 @@ func parseWindowAggregateFromSelect(sel *ast.Select) (*ir.LogicalWindowAgg, *ir.
 
 	// Parse frame specification (ROWS/RANGE/GROUPS BETWEEN ...)
 	var frameSpec *ir.FrameSpec
+	var timeWindowSpec *ir.TimeWindowSpec
+	
 	if aggFunc.Over.Frame != nil {
 		frameSpec = parseFrameSpec(aggFunc.Over.Frame)
+		
+		// Check if frame uses time-based RANGE with INTERVAL
+		// This indicates a time window (e.g., RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING AND CURRENT ROW)
+		if frameSpec != nil && strings.ToUpper(frameSpec.Type) == "RANGE" {
+			if strings.Contains(strings.ToUpper(frameSpec.StartValue), "INTERVAL") ||
+				strings.Contains(strings.ToUpper(frameSpec.EndValue), "INTERVAL") {
+				// This is a time-based window
+				// For now, we'll treat RANGE with INTERVAL as a sliding window
+				// Extract the interval from StartValue
+				if frameSpec.StartValue != "" {
+					interval, err := parseIntervalArg(frameSpec.StartValue)
+					if err == nil && orderBy != "" {
+						timeWindowSpec = &ir.TimeWindowSpec{
+							WindowType: "SLIDING",
+							TimeCol:    orderBy,
+							SizeMillis: interval,
+							SlideMillis: interval / 2, // Default: half of size
+						}
+					}
+				}
+			}
+		}
 	}
 
 	if outputCol == "" {
@@ -324,12 +355,13 @@ func parseWindowAggregateFromSelect(sel *ast.Select) (*ir.LogicalWindowAgg, *ir.
 	}
 
 	waf := &ir.LogicalWindowAgg{
-		AggName:     strings.ToUpper(aggFunc.Name),
-		AggCol:      aggCol,
-		PartitionBy: partitionBy,
-		OrderBy:     orderBy,
-		FrameSpec:   frameSpec,
-		OutputCol:   outputCol,
+		AggName:        strings.ToUpper(aggFunc.Name),
+		AggCol:         aggCol,
+		PartitionBy:    partitionBy,
+		OrderBy:        orderBy,
+		FrameSpec:      frameSpec,
+		TimeWindowSpec: timeWindowSpec,
+		OutputCol:      outputCol,
 	}
 
 	scan := &ir.LogicalScan{Table: tableName}
@@ -377,4 +409,121 @@ func ParseQueryToIncrementalDBSP(query string) (*op.Node, error) {
 	// Note: For Phase1 with GroupAgg, this returns the same node since
 	// GroupAgg already handles incremental updates internally
 	return diff.Differentiate(baseNode)
+}
+
+// parseJoin handles JOIN in the FROM clause
+func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr) (ir.LogicalNode, error) {
+	// Extract left and right table names
+	leftTable, ok := joinExpr.LeftExpr.(*ast.TableName)
+	if !ok {
+		return nil, errors.New("JOIN left side must be a table")
+	}
+
+	rightTable, ok := joinExpr.RightExpr.(*ast.TableName)
+	if !ok {
+		return nil, errors.New("JOIN right side must be a table")
+	}
+
+	// Parse ON conditions (only equi-join supported)
+	conditions, err := parseJoinConditions(joinExpr.On)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create LogicalJoin
+	leftScan := &ir.LogicalScan{Table: leftTable.Name}
+	rightScan := &ir.LogicalScan{Table: rightTable.Name}
+
+	join := &ir.LogicalJoin{
+		LeftTable:  leftTable.Name,
+		RightTable: rightTable.Name,
+		Conditions: conditions,
+		Left:       leftScan,
+		Right:      rightScan,
+	}
+
+	var currentNode ir.LogicalNode = join
+
+	// Add WHERE filter if present
+	if sel.Where != nil {
+		whereSQL := sel.Where.String()
+		whereSQL = strings.Trim(whereSQL, "'\"")
+		currentNode = &ir.LogicalFilter{
+			PredicateSQL: whereSQL,
+			Input:        currentNode,
+		}
+	}
+
+	// Extract select columns
+	selectCols, err := extractSelectColumns(sel)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for GROUP BY
+	if len(sel.GroupBy) == 0 {
+		// No GROUP BY - add projection if needed
+		if len(selectCols) > 0 {
+			currentNode = &ir.LogicalProject{
+				Columns: selectCols,
+				Input:   currentNode,
+			}
+		}
+		return currentNode, nil
+	}
+
+	// Handle GROUP BY with aggregation
+	var (
+		groupCols  []string
+		windowSpec *ir.WindowSpec
+	)
+
+	groupCols, windowSpec, err = parseGroupBy(sel.GroupBy)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find aggregate function from query string
+	aggFunc, aggCol, err := findSingleAggregateFromQuery(sel.String())
+	if err != nil {
+		return nil, err
+	}
+
+	// Build GroupAgg with input from current node
+	lg := &ir.LogicalGroupAgg{
+		Keys:       groupCols,
+		AggName:    aggFunc,
+		AggCol:     aggCol,
+		WindowSpec: windowSpec,
+		Input:      currentNode,
+	}
+
+	return lg, nil
+}
+
+// parseJoinConditions parses ON clause into JoinConditions
+func parseJoinConditions(onExpr ast.Expr) ([]ir.JoinCondition, error) {
+	if onExpr == nil {
+		return nil, errors.New("JOIN requires ON clause")
+	}
+
+	// For now, only support simple equality: a.col = b.col
+	binExpr, ok := onExpr.(*ast.BinaryExpr)
+	if !ok || binExpr.Operator != "=" {
+		return nil, errors.New("JOIN only supports equi-join (=)")
+	}
+
+	leftCol := binExpr.Left.String()
+	rightCol := binExpr.Right.String()
+
+	// Remove quotes added by tree-sitter
+	leftCol = strings.Trim(leftCol, "'\"")
+	rightCol = strings.Trim(rightCol, "'\"")
+
+	condition := ir.JoinCondition{
+		LeftCol:  leftCol,
+		RightCol: rightCol,
+	}
+
+	return []ir.JoinCondition{condition}, nil
 }

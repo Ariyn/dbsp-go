@@ -79,13 +79,13 @@ func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	if colName == "" {
 		colName = "v"
 	}
-	
+
 	raw, ok := td.Tuple[colName]
 	// Ignore NULL values (standard SQL behavior)
 	if !ok || raw == nil {
 		return prev, nil
 	}
-	
+
 	var v float64
 	switch x := raw.(type) {
 	case int:
@@ -128,7 +128,7 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 			prevI = int64(x)
 		}
 	}
-	
+
 	// If ColName is specified, check if the value is NULL
 	// COUNT(col) ignores NULL values
 	if c.ColName != "" {
@@ -139,7 +139,7 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 		}
 	}
 	// COUNT(*) counts all rows regardless of NULL values
-	
+
 	newI := prevI + td.Count
 	diff := newI - prevI
 	if diff == 0 {
@@ -217,13 +217,13 @@ func (a *AvgAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	if col == "" {
 		col = "v"
 	}
-	
+
 	raw, ok := td.Tuple[col]
 	// Ignore NULL values (standard SQL behavior)
 	if !ok || raw == nil {
 		return monoid, nil
 	}
-	
+
 	var v float64
 	switch x := raw.(type) {
 	case int:

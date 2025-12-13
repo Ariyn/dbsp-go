@@ -18,7 +18,12 @@ func extractSelectColumns(sel *ast.Select) ([]string, error) {
 			// SELECT * - no projection needed
 			return nil, nil
 		case *ast.ColName:
-			cols = append(cols, e.Name)
+			// Use full column name (table.column if table qualifier exists)
+			colName := e.Name
+			if e.Table != "" {
+				colName = e.Table + "." + e.Name
+			}
+			cols = append(cols, colName)
 		case *ast.FuncExpr:
 			// aggregate or other function - handled elsewhere, skip for projection
 			continue
