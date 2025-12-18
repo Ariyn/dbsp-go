@@ -18,6 +18,10 @@ type HTTPSourceConfig struct {
 	Port   int               `yaml:"port"`
 	Path   string            `yaml:"path"`
 	Schema map[string]string `yaml:"schema"`
+
+	BufferSize      int `yaml:"buffer_size"`
+	MaxBatchSize    int `yaml:"max_batch_size"`
+	MaxBatchDelayMS int `yaml:"max_batch_delay_ms"`
 }
 
 type HTTPSource struct {
@@ -26,6 +30,9 @@ type HTTPSource struct {
 	schema map[string]string
 	done   chan struct{}
 	doneOnce sync.Once
+
+	maxBatchSize  int
+	maxBatchDelay time.Duration
 }
 
 func NewHTTPSource(config map[string]interface{}) (*HTTPSource, error) {
@@ -46,11 +53,22 @@ func NewHTTPSource(config map[string]interface{}) (*HTTPSource, error) {
 	if httpConfig.Path == "" {
 		httpConfig.Path = "/ingest"
 	}
+	if httpConfig.BufferSize == 0 {
+		httpConfig.BufferSize = 1000
+	}
+	if httpConfig.MaxBatchSize == 0 {
+		httpConfig.MaxBatchSize = 100
+	}
+	if httpConfig.MaxBatchDelayMS < 0 {
+		httpConfig.MaxBatchDelayMS = 0
+	}
 
 	s := &HTTPSource{
-		buffer: make(chan types.TupleDelta, 1000), // Buffer size 1000
+		buffer: make(chan types.TupleDelta, httpConfig.BufferSize),
 		schema: httpConfig.Schema,
 		done:   make(chan struct{}),
+		maxBatchSize:  httpConfig.MaxBatchSize,
+		maxBatchDelay: time.Duration(httpConfig.MaxBatchDelayMS) * time.Millisecond,
 	}
 
 	mux := http.NewServeMux()
@@ -130,17 +148,46 @@ func (s *HTTPSource) NextBatch() (types.Batch, error) {
 		return nil, nil // Server closed
 	case first := <-s.buffer:
 		batch := types.Batch{first}
-		
-		// Drain buffer for more items without blocking
-		// Limit batch size to avoid blocking too long
-		limit := 100
-	loop:
-		for i := 0; i < limit; i++ {
+
+		maxSize := s.maxBatchSize
+		if maxSize <= 0 {
+			maxSize = 1
+		}
+		if maxSize == 1 {
+			return batch, nil
+		}
+
+		// Fast path: no delay -> drain what's available now up to maxSize.
+		if s.maxBatchDelay <= 0 {
+			for len(batch) < maxSize {
+				select {
+				case item := <-s.buffer:
+					batch = append(batch, item)
+				default:
+					return batch, nil
+				}
+			}
+			return batch, nil
+		}
+
+		timer := time.NewTimer(s.maxBatchDelay)
+		defer func() {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}()
+
+		for len(batch) < maxSize {
 			select {
+			case <-s.done:
+				return nil, nil
 			case item := <-s.buffer:
 				batch = append(batch, item)
-			default:
-				break loop
+			case <-timer.C:
+				return batch, nil
 			}
 		}
 		return batch, nil
