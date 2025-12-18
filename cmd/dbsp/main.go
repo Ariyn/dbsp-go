@@ -81,6 +81,11 @@ func main() {
 		fmt.Printf("Error initializing sink: %v\n", err)
 		os.Exit(1)
 	}
+	sink, err = wrapSinkWithBatchingIfConfigured(config.Pipeline.Sink.Config, sink)
+	if err != nil {
+		fmt.Printf("Error initializing sink batching: %v\n", err)
+		os.Exit(1)
+	}
 	defer sink.Close()
 
 	// 5. Run Pipeline
