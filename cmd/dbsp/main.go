@@ -1,16 +1,23 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
+	"github.com/ariyn/dbsp/internal/dbsp/types"
 	"gopkg.in/yaml.v3"
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
 
@@ -78,30 +85,17 @@ func main() {
 
 	// 5. Run Pipeline
 	fmt.Println("Starting pipeline...")
-	batchCount := 0
-	for {
-		batch, err := source.NextBatch()
-		if err != nil {
-			fmt.Printf("Error reading batch: %v\n", err)
-			break
+	err = runPipeline(ctx, source, sink, func(batch types.Batch) (types.Batch, error) {
+		return op.Execute(rootNode, batch)
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			fmt.Println("Shutdown requested. Exiting...")
+			return
 		}
-		if batch == nil {
-			break // End of input
-		}
-
-		batchCount++
-		fmt.Printf("Processing batch %d with %d records...\n", batchCount, len(batch))
-
-		resultBatch, err := op.Execute(rootNode, batch)
-		if err != nil {
-			fmt.Printf("Error executing pipeline: %v\n", err)
-			break
-		}
-
-		if err := sink.WriteBatch(resultBatch); err != nil {
-			fmt.Printf("Error writing batch: %v\n", err)
-			break
-		}
+		fmt.Printf("Pipeline error: %v\n", err)
+		os.Exit(1)
 	}
 	fmt.Println("Pipeline finished.")
 }
+

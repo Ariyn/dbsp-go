@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
@@ -24,6 +25,7 @@ type HTTPSource struct {
 	buffer chan types.TupleDelta
 	schema map[string]string
 	done   chan struct{}
+	doneOnce sync.Once
 }
 
 func NewHTTPSource(config map[string]interface{}) (*HTTPSource, error) {
@@ -63,7 +65,7 @@ func NewHTTPSource(config map[string]interface{}) (*HTTPSource, error) {
 		fmt.Printf("Starting HTTP Source on port %d path %s\n", httpConfig.Port, httpConfig.Path)
 		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("HTTP Server error: %v\n", err)
-			close(s.done) // Signal error/shutdown
+			s.signalDone() // Signal error/shutdown
 		}
 	}()
 
@@ -146,10 +148,16 @@ func (s *HTTPSource) NextBatch() (types.Batch, error) {
 }
 
 func (s *HTTPSource) Close() error {
+	s.signalDone()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	close(s.done)
 	return s.server.Shutdown(ctx)
+}
+
+func (s *HTTPSource) signalDone() {
+	s.doneOnce.Do(func() {
+		close(s.done)
+	})
 }
 
 func parseValueFromInterface(v interface{}, colType string) (any, error) {
