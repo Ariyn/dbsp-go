@@ -65,6 +65,8 @@ func main() {
 	switch config.Pipeline.Sink.Type {
 	case "console":
 		sink, err = NewConsoleSink(config.Pipeline.Sink.Config)
+	case "file":
+		sink, err = NewFileSink(config.Pipeline.Sink.Config)
 	default:
 		err = fmt.Errorf("unsupported sink type: %s", config.Pipeline.Sink.Type)
 	}

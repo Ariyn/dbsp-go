@@ -32,3 +32,9 @@ type CSVSourceConfig struct {
 	Path   string            `yaml:"path"`
 	Schema map[string]string `yaml:"schema"` // column name -> type (int, float, string)
 }
+
+// FileSinkConfig defines the configuration for the file sink
+type FileSinkConfig struct {
+	Path   string `yaml:"path"`
+	Format string `yaml:"format"` // "json" or "csv"
+}
