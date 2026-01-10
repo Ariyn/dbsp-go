@@ -1,6 +1,7 @@
 package op
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,6 +59,10 @@ type WindowAggOp struct {
 	AggInit     func() any
 	AggFn       AggFunc
 	State       WindowAggState
+	// GroupCounts tracks raw row multiplicity per (window, groupKey).
+	// It is used to evict empty groups/windows so state doesn't retain
+	// entries with aggregate value 0 after deletions.
+	GroupCounts map[WindowID]map[any]int64
 	WatermarkFn func() int64 // optional; nil means no watermark/GC logic
 	// Per-partition ordered buffers for frame-based aggregation
 	PartitionBuffers map[any]*PartitionBuffer
@@ -85,8 +90,59 @@ func NewWindowAggOp(spec WindowSpecLite, keyFn func(types.Tuple) any, groupKeys 
 		State: WindowAggState{
 			Data: make(map[WindowID]map[any]any),
 		},
+		GroupCounts:      make(map[WindowID]map[any]int64),
 		PartitionBuffers: make(map[any]*PartitionBuffer),
 	}
+}
+
+func (w *WindowAggOp) ensureStateMaps() {
+	if w.State.Data == nil {
+		w.State.Data = make(map[WindowID]map[any]any)
+	}
+	if w.GroupCounts == nil {
+		w.GroupCounts = make(map[WindowID]map[any]int64)
+	}
+}
+
+func (w *WindowAggOp) injectGroupKeyColumns(outTuple types.Tuple, inTuple types.Tuple) {
+	if outTuple == nil {
+		return
+	}
+	if len(w.GroupKeys) == 0 {
+		return
+	}
+	for _, col := range w.GroupKeys {
+		outTuple[col] = inTuple[col]
+	}
+}
+
+func (w *WindowAggOp) applyGroupCount(wid WindowID, groupKey any, deltaCount int64) error {
+	cm, ok := w.GroupCounts[wid]
+	if !ok {
+		cm = make(map[any]int64)
+		w.GroupCounts[wid] = cm
+	}
+
+	newCount := cm[groupKey] + deltaCount
+	if newCount < 0 {
+		return fmt.Errorf("window group underflow for window=%v groupKey=%v resultingCount=%d", wid, groupKey, newCount)
+	}
+	if newCount == 0 {
+		delete(cm, groupKey)
+		if len(cm) == 0 {
+			delete(w.GroupCounts, wid)
+		}
+
+		if gm, ok := w.State.Data[wid]; ok {
+			delete(gm, groupKey)
+			if len(gm) == 0 {
+				delete(w.State.Data, wid)
+			}
+		}
+		return nil
+	}
+	cm[groupKey] = newCount
+	return nil
 }
 
 // windowIDsForTumble returns the single tumbling window that ts belongs to.
@@ -169,9 +225,15 @@ func (w *WindowAggOp) Apply(batch types.Batch) (types.Batch, error) {
 // applyTumbling handles tumbling windows (original implementation)
 func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
-	if w.State.Data == nil {
-		w.State.Data = make(map[WindowID]map[any]any)
+	w.ensureStateMaps()
+	// Compact additive deltas per (window, groupKey).
+	type winGroup struct {
+		wid WindowID
+		key any
 	}
+	pending := make(map[winGroup]*types.TupleDelta)
+	baseCounts := make(map[winGroup]int64)
+	countDeltas := make(map[winGroup]int64)
 
 	for _, td := range batch {
 		// Extract event time
@@ -209,6 +271,16 @@ func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
 				prev = w.AggInit()
 			}
 
+			k := winGroup{wid: wid, key: groupKey}
+			if _, ok := baseCounts[k]; !ok {
+				var base int64
+				if cm := w.GroupCounts[wid]; cm != nil {
+					base = cm[groupKey]
+				}
+				baseCounts[k] = base
+			}
+			countDeltas[k] += td.Count
+
 			newVal, delta := w.AggFn.Apply(prev, td)
 			gm[groupKey] = newVal
 
@@ -218,14 +290,85 @@ func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
 				}
 				delta.Tuple["__window_start"] = wid.Start
 				delta.Tuple["__window_end"] = wid.End
+				w.injectGroupKeyColumns(delta.Tuple, td.Tuple)
 
-				if len(w.GroupKeys) == 1 {
-					delta.Tuple[w.GroupKeys[0]] = groupKey
+				if delta.Count == 1 {
+					k := winGroup{wid: wid, key: groupKey}
+					if _, ok := delta.Tuple["agg_delta"]; ok {
+						ex := pending[k]
+						if ex == nil {
+							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+						} else {
+							ex.Tuple["agg_delta"] = toFloat64Local(ex.Tuple["agg_delta"]) + toFloat64Local(delta.Tuple["agg_delta"])
+						}
+						if ex := pending[k]; ex != nil && toFloat64Local(ex.Tuple["agg_delta"]) == 0 {
+							delete(pending, k)
+						}
+						continue
+					}
+					if _, ok := delta.Tuple["avg_delta"]; ok {
+						ex := pending[k]
+						if ex == nil {
+							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+						} else {
+							ex.Tuple["avg_delta"] = toFloat64Local(ex.Tuple["avg_delta"]) + toFloat64Local(delta.Tuple["avg_delta"])
+						}
+						if ex := pending[k]; ex != nil && toFloat64Local(ex.Tuple["avg_delta"]) == 0 {
+							delete(pending, k)
+						}
+						continue
+					}
+					if _, ok := delta.Tuple["count_delta"]; ok {
+						ex := pending[k]
+						if ex == nil {
+							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+						} else {
+							ex.Tuple["count_delta"] = toInt64Local(ex.Tuple["count_delta"]) + toInt64Local(delta.Tuple["count_delta"])
+						}
+						if ex := pending[k]; ex != nil && toInt64Local(ex.Tuple["count_delta"]) == 0 {
+							delete(pending, k)
+						}
+						continue
+					}
 				}
 
 				out = append(out, *delta)
 			}
 		}
+	}
+
+	// Apply raw row count changes and evict empty groups/windows.
+	for k, base := range baseCounts {
+		delta := countDeltas[k]
+		final := base + delta
+		if final < 0 {
+			return nil, fmt.Errorf("window group underflow for window=%v groupKey=%v resultingCount=%d", k.wid, k.key, final)
+		}
+		if final == 0 {
+			if cm := w.GroupCounts[k.wid]; cm != nil {
+				delete(cm, k.key)
+				if len(cm) == 0 {
+					delete(w.GroupCounts, k.wid)
+				}
+			}
+			if gm := w.State.Data[k.wid]; gm != nil {
+				delete(gm, k.key)
+				if len(gm) == 0 {
+					delete(w.State.Data, k.wid)
+				}
+			}
+			continue
+		}
+		cm, ok := w.GroupCounts[k.wid]
+		if !ok {
+			cm = make(map[any]int64)
+			w.GroupCounts[k.wid] = cm
+		}
+		cm[k.key] = final
+	}
+
+	for _, td := range pending {
+		out = append(out, *td)
 	}
 
 	return out, nil
@@ -234,9 +377,15 @@ func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
 // applySliding handles sliding windows
 func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
-	if w.State.Data == nil {
-		w.State.Data = make(map[WindowID]map[any]any)
+	w.ensureStateMaps()
+	// Compact additive deltas per (window, groupKey).
+	type winGroup struct {
+		wid WindowID
+		key any
 	}
+	pending := make(map[winGroup]*types.TupleDelta)
+	baseCounts := make(map[winGroup]int64)
+	countDeltas := make(map[winGroup]int64)
 
 	for _, td := range batch {
 		// Extract event time
@@ -275,6 +424,16 @@ func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 				prev = w.AggInit()
 			}
 
+			k := winGroup{wid: wid, key: groupKey}
+			if _, ok := baseCounts[k]; !ok {
+				var base int64
+				if cm := w.GroupCounts[wid]; cm != nil {
+					base = cm[groupKey]
+				}
+				baseCounts[k] = base
+			}
+			countDeltas[k] += td.Count
+
 			newVal, delta := w.AggFn.Apply(prev, td)
 			gm[groupKey] = newVal
 
@@ -284,14 +443,85 @@ func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 				}
 				delta.Tuple["__window_start"] = wid.Start
 				delta.Tuple["__window_end"] = wid.End
+				w.injectGroupKeyColumns(delta.Tuple, td.Tuple)
 
-				if len(w.GroupKeys) == 1 {
-					delta.Tuple[w.GroupKeys[0]] = groupKey
+				if delta.Count == 1 {
+					k := winGroup{wid: wid, key: groupKey}
+					if _, ok := delta.Tuple["agg_delta"]; ok {
+						ex := pending[k]
+						if ex == nil {
+							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+						} else {
+							ex.Tuple["agg_delta"] = toFloat64Local(ex.Tuple["agg_delta"]) + toFloat64Local(delta.Tuple["agg_delta"])
+						}
+						if ex := pending[k]; ex != nil && toFloat64Local(ex.Tuple["agg_delta"]) == 0 {
+							delete(pending, k)
+						}
+						continue
+					}
+					if _, ok := delta.Tuple["avg_delta"]; ok {
+						ex := pending[k]
+						if ex == nil {
+							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+						} else {
+							ex.Tuple["avg_delta"] = toFloat64Local(ex.Tuple["avg_delta"]) + toFloat64Local(delta.Tuple["avg_delta"])
+						}
+						if ex := pending[k]; ex != nil && toFloat64Local(ex.Tuple["avg_delta"]) == 0 {
+							delete(pending, k)
+						}
+						continue
+					}
+					if _, ok := delta.Tuple["count_delta"]; ok {
+						ex := pending[k]
+						if ex == nil {
+							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+						} else {
+							ex.Tuple["count_delta"] = toInt64Local(ex.Tuple["count_delta"]) + toInt64Local(delta.Tuple["count_delta"])
+						}
+						if ex := pending[k]; ex != nil && toInt64Local(ex.Tuple["count_delta"]) == 0 {
+							delete(pending, k)
+						}
+						continue
+					}
 				}
 
 				out = append(out, *delta)
 			}
 		}
+	}
+
+	// Apply raw row count changes and evict empty groups/windows.
+	for k, base := range baseCounts {
+		delta := countDeltas[k]
+		final := base + delta
+		if final < 0 {
+			return nil, fmt.Errorf("window group underflow for window=%v groupKey=%v resultingCount=%d", k.wid, k.key, final)
+		}
+		if final == 0 {
+			if cm := w.GroupCounts[k.wid]; cm != nil {
+				delete(cm, k.key)
+				if len(cm) == 0 {
+					delete(w.GroupCounts, k.wid)
+				}
+			}
+			if gm := w.State.Data[k.wid]; gm != nil {
+				delete(gm, k.key)
+				if len(gm) == 0 {
+					delete(w.State.Data, k.wid)
+				}
+			}
+			continue
+		}
+		cm, ok := w.GroupCounts[k.wid]
+		if !ok {
+			cm = make(map[any]int64)
+			w.GroupCounts[k.wid] = cm
+		}
+		cm[k.key] = final
+	}
+
+	for _, td := range pending {
+		out = append(out, *td)
 	}
 
 	return out, nil
@@ -307,9 +537,7 @@ type SessionState struct {
 // applySession handles session windows
 func (w *WindowAggOp) applySession(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
-	if w.State.Data == nil {
-		w.State.Data = make(map[WindowID]map[any]any)
-	}
+	w.ensureStateMaps()
 
 	// Group events by partition key
 	partitionEvents := make(map[any][]types.TupleDelta)
@@ -356,8 +584,8 @@ func (w *WindowAggOp) applySession(batch types.Batch) (types.Batch, error) {
 						},
 						Count: 1,
 					}
-					if len(w.GroupKeys) == 1 {
-						delta.Tuple[w.GroupKeys[0]] = groupKey
+					if len(events) > 0 {
+						w.injectGroupKeyColumns(delta.Tuple, events[0].Tuple)
 					}
 					out = append(out, *delta)
 				}
@@ -375,32 +603,31 @@ func (w *WindowAggOp) applySession(batch types.Batch) (types.Batch, error) {
 			newVal, delta := w.AggFn.Apply(currentSession.AggValue, td)
 			currentSession.AggValue = newVal
 
+			wid := WindowID{
+				Start: currentSession.WindowStart,
+				End:   currentSession.LastEventTime + w.Spec.GapMillis,
+			}
+			// Store state and maintain raw row counts even if AggFn emits no delta.
+			gm, ok := w.State.Data[wid]
+			if !ok {
+				gm = make(map[any]any)
+				w.State.Data[wid] = gm
+			}
+			gm[groupKey] = newVal
+			if err := w.applyGroupCount(wid, groupKey, td.Count); err != nil {
+				return nil, err
+			}
+
 			// Emit delta for current session window
 			if delta != nil {
-				wid := WindowID{
-					Start: currentSession.WindowStart,
-					End:   currentSession.LastEventTime + w.Spec.GapMillis,
-				}
-				
 				if delta.Tuple == nil {
 					delta.Tuple = types.Tuple{}
 				}
 				delta.Tuple["__window_start"] = wid.Start
 				delta.Tuple["__window_end"] = wid.End
-
-				if len(w.GroupKeys) == 1 {
-					delta.Tuple[w.GroupKeys[0]] = groupKey
-				}
+				w.injectGroupKeyColumns(delta.Tuple, td.Tuple)
 
 				out = append(out, *delta)
-				
-				// Store state
-				gm, ok := w.State.Data[wid]
-				if !ok {
-					gm = make(map[any]any)
-					w.State.Data[wid] = gm
-				}
-				gm[groupKey] = newVal
 			}
 		}
 	}
@@ -517,8 +744,10 @@ func (w *WindowAggOp) computeFrameAggregates(buffer *PartitionBuffer, partitionK
 		resultTuple = w.extractAggResult(resultTuple, aggState)
 
 		// Add partition key columns
-		if len(w.GroupKeys) == 1 {
-			resultTuple[w.GroupKeys[0]] = partitionKey
+		if len(w.GroupKeys) > 0 {
+			for _, col := range w.GroupKeys {
+				resultTuple[col] = row.Tuple[col]
+			}
 		}
 
 		out = append(out, types.TupleDelta{Tuple: resultTuple, Count: row.Count})

@@ -44,7 +44,12 @@
   - 후보 파일: `internal/dbsp/sql/duckdb_tpch_integration_test.go`, `internal/dbsp/op/*_test.go`
   - [x] SQL JOIN delete/retraction 테스트 추가
   - [x] SQL JOIN+GROUP BY delete/retraction 테스트 추가
+  - [x] SQL JOIN+다중키 GROUP BY delete/retraction 테스트 추가
   - [x] Window(TUMBLING/SLIDING) delete 델타 assert 테스트 추가
+  - [x] Window(TUMBLING) 다중키 그룹키/eviction 단위 테스트 추가
+  - [x] Window(SLIDING) 다중키 그룹키/eviction 단위 테스트 추가
+  - [x] TimeWindowSpec 기반 WindowAgg 다중키 통합 테스트 추가(수동 IR 구성)
+  - [x] TimeWindowSpec 기반 Sliding WindowAgg 다중키 통합 테스트 추가(수동 IR 구성)
   - [x] DuckDB TPCH JOIN+AGG incremental delete 통합 테스트 추가
   - [x] DuckDB 대비 Window incremental delete 통합 테스트 확대
   - [x] Join TTL 만료(retraction) 엣지 케이스 팩(5개) 추가
@@ -56,7 +61,7 @@
 
 ## P1 (SQL/기능 확장)
 
-- [ ] **다중 GROUP BY 키 지원**
+- [x] **다중 GROUP BY 키 지원**
   - 현재 다수 경로에서 single-key 제한
   - 목표: composite key(튜플/struct) 또는 안정적인 key encoding 도입
   - 후보 파일: `internal/dbsp/ir/transform.go`, `internal/dbsp/ir/plan.go`

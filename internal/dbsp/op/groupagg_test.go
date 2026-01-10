@@ -86,6 +86,33 @@ func TestCountAggBasic(t *testing.T) {
 	}
 }
 
+func TestGroupAggOp_MultiKey_OutputIncludesAllKeys(t *testing.T) {
+	// Simulate a composite-key grouping: the internal key can be an encoded string,
+	// but output should carry the original group key columns.
+	keyFn := func(tu types.Tuple) any { return "{\"k1\":\"A\",\"k2\":1}" }
+	aggInit := func() any { return float64(0) }
+	sumAgg := &SumAgg{ColName: "v"}
+
+	g := NewGroupAggOp(keyFn, aggInit, sumAgg)
+	g.SetGroupKeyColNames([]string{"k1", "k2"})
+
+	out, err := g.Apply(types.Batch{
+		{Tuple: types.Tuple{"k1": "A", "k2": int64(1), "v": 2}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 output delta, got %d", len(out))
+	}
+	if out[0].Tuple["k1"] != "A" {
+		t.Fatalf("expected k1=A, got %v", out[0].Tuple["k1"])
+	}
+	if out[0].Tuple["k2"] != int64(1) {
+		t.Fatalf("expected k2=1, got %v", out[0].Tuple["k2"])
+	}
+}
+
 // ============================================================================
 // AVG Aggregation Tests
 // ============================================================================

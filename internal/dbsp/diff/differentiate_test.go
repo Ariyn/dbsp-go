@@ -97,8 +97,18 @@ func TestDifferentiate_GroupAggOp(t *testing.T) {
 		t.Errorf("expected West=200, got %v", state["West"])
 	}
 
-	if len(out2) != 2 {
-		t.Fatalf("expected 2 output deltas, got %d", len(out2))
+	if len(out2) == 0 {
+		t.Fatalf("expected non-empty output deltas")
+	}
+	var net float64
+	for _, td := range out2 {
+		d, ok := td.Tuple["agg_delta"].(float64)
+		if ok {
+			net += d
+		}
+	}
+	if net != 20.0 {
+		t.Fatalf("expected net agg_delta=20, got %v (out=%+v)", net, out2)
 	}
 }
 

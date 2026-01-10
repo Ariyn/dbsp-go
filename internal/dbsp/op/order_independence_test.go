@@ -221,16 +221,18 @@ func TestOrderIndependence_WindowSlidingCount_CancellationSameBatch_OrderIndepen
 	}
 
 	// Both windows that would have been affected should end at 0.
-	if got := op1.State.Data[WindowID{Start: 0, End: 10}][nil].(int64); got != 0 {
-		t.Fatalf("expected state [0,10) = 0, got %v", got)
+	checkZeroOrAbsent := func(opx *WindowAggOp, wid WindowID) {
+		if gm, ok := opx.State.Data[wid]; ok {
+			if v, ok := gm[nil]; ok {
+				got := v.(int64)
+				if got != 0 {
+					t.Fatalf("expected state %v = 0, got %v", wid, got)
+				}
+			}
+		}
 	}
-	if got := op1.State.Data[WindowID{Start: 5, End: 15}][nil].(int64); got != 0 {
-		t.Fatalf("expected state [5,15) = 0, got %v", got)
-	}
-	if got := op2.State.Data[WindowID{Start: 0, End: 10}][nil].(int64); got != 0 {
-		t.Fatalf("expected state [0,10) = 0, got %v", got)
-	}
-	if got := op2.State.Data[WindowID{Start: 5, End: 15}][nil].(int64); got != 0 {
-		t.Fatalf("expected state [5,15) = 0, got %v", got)
-	}
+	checkZeroOrAbsent(op1, WindowID{Start: 0, End: 10})
+	checkZeroOrAbsent(op1, WindowID{Start: 5, End: 15})
+	checkZeroOrAbsent(op2, WindowID{Start: 0, End: 10})
+	checkZeroOrAbsent(op2, WindowID{Start: 5, End: 15})
 }

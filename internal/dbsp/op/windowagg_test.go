@@ -254,9 +254,10 @@ func TestWindowAggOp_TumblingCount_Delete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply(insert) failed: %v", err)
 	}
-	if len(outIns) != 2 {
-		t.Fatalf("expected 2 output deltas on insert, got %d (%+v)", len(outIns), outIns)
+	if len(outIns) == 0 {
+		t.Fatalf("expected non-empty output deltas on insert")
 	}
+	var sumDelta int64
 	for _, td := range outIns {
 		if td.Count != 1 {
 			t.Fatalf("expected output Count=1, got %d (%+v)", td.Count, td)
@@ -271,9 +272,10 @@ func TestWindowAggOp_TumblingCount_Delete(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected count_delta int64, got %T (%+v)", td.Tuple["count_delta"], td)
 		}
-		if d != 1 {
-			t.Fatalf("expected count_delta=1, got %v (%+v)", d, td)
-		}
+		sumDelta += d
+	}
+	if sumDelta != 2 {
+		t.Fatalf("expected net count_delta=2 on insert, got %d (out=%+v)", sumDelta, outIns)
 	}
 
 	del := types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(2)}, Count: -1}}
@@ -299,6 +301,195 @@ func TestWindowAggOp_TumblingCount_Delete(t *testing.T) {
 	}
 	if d != -1 {
 		t.Fatalf("expected count_delta=-1, got %v (%+v)", d, outDel[0])
+	}
+}
+
+func TestWindowAggOp_TumblingCount_MultiKey_IncludesKeys_AndEvictsOnEmpty(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling}
+	keyFn := func(t types.Tuple) any {
+		return stableTupleKey(types.Tuple{"k1": t["k1"], "k2": t["k2"]})
+	}
+	aggInit := func() any { return int64(0) }
+	agg := &CountAgg{}
+
+	op := NewWindowAggOp(spec, keyFn, []string{"k1", "k2"}, aggInit, agg)
+
+	ins := types.Batch{{Tuple: types.Tuple{"k1": "A", "k2": "X", "ts": int64(1)}, Count: 1}}
+	outIns, err := op.Apply(ins)
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(outIns) == 0 {
+		t.Fatalf("expected non-empty output deltas on insert")
+	}
+	var sumIns int64
+	for _, td := range outIns {
+		if td.Count != 1 {
+			t.Fatalf("expected output Count=1, got %d (%+v)", td.Count, td)
+		}
+		if td.Tuple["__window_start"] != int64(0) || td.Tuple["__window_end"] != int64(10) {
+			t.Fatalf("expected window [0,10), got start=%v end=%v (%+v)", td.Tuple["__window_start"], td.Tuple["__window_end"], td)
+		}
+		if td.Tuple["k1"] != "A" || td.Tuple["k2"] != "X" {
+			t.Fatalf("expected group keys k1=A,k2=X, got k1=%v k2=%v (%+v)", td.Tuple["k1"], td.Tuple["k2"], td)
+		}
+		d, ok := td.Tuple["count_delta"].(int64)
+		if !ok {
+			t.Fatalf("expected count_delta int64, got %T (%+v)", td.Tuple["count_delta"], td)
+		}
+		sumIns += d
+	}
+	if sumIns != 1 {
+		t.Fatalf("expected net count_delta=1 on insert, got %d (out=%+v)", sumIns, outIns)
+	}
+
+	del := types.Batch{{Tuple: types.Tuple{"k1": "A", "k2": "X", "ts": int64(1)}, Count: -1}}
+	outDel, err := op.Apply(del)
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(outDel) == 0 {
+		t.Fatalf("expected non-empty output deltas on delete")
+	}
+	var sumDel int64
+	for _, td := range outDel {
+		if td.Count != 1 {
+			t.Fatalf("expected output Count=1, got %d (%+v)", td.Count, td)
+		}
+		if td.Tuple["__window_start"] != int64(0) || td.Tuple["__window_end"] != int64(10) {
+			t.Fatalf("expected window [0,10), got start=%v end=%v (%+v)", td.Tuple["__window_start"], td.Tuple["__window_end"], td)
+		}
+		if td.Tuple["k1"] != "A" || td.Tuple["k2"] != "X" {
+			t.Fatalf("expected group keys k1=A,k2=X, got k1=%v k2=%v (%+v)", td.Tuple["k1"], td.Tuple["k2"], td)
+		}
+		d, ok := td.Tuple["count_delta"].(int64)
+		if !ok {
+			t.Fatalf("expected count_delta int64, got %T (%+v)", td.Tuple["count_delta"], td)
+		}
+		sumDel += d
+	}
+	if sumDel != -1 {
+		t.Fatalf("expected net count_delta=-1 on delete, got %d (out=%+v)", sumDel, outDel)
+	}
+
+	// After delete, the group should be evicted from state and group-counts.
+	wid := WindowID{Start: 0, End: 10}
+	gkey := stableTupleKey(types.Tuple{"k1": "A", "k2": "X"})
+	if wm, ok := op.State.Data[wid]; ok {
+		if _, ok2 := wm[gkey]; ok2 {
+			t.Fatalf("expected group state to be evicted for gkey=%v, but found in State.Data[%+v]", gkey, wid)
+		}
+		if len(wm) != 0 {
+			t.Fatalf("expected no remaining groups for window %+v, got %v", wid, wm)
+		}
+	}
+	if cm, ok := op.GroupCounts[wid]; ok {
+		if _, ok2 := cm[gkey]; ok2 {
+			t.Fatalf("expected group count to be evicted for gkey=%v, but found in GroupCounts[%+v]", gkey, wid)
+		}
+		if len(cm) != 0 {
+			t.Fatalf("expected no remaining group counts for window %+v, got %v", wid, cm)
+		}
+	}
+}
+
+func TestWindowAggOp_SlidingSum_MultiKey_IncludesKeys_AndEvictsOnEmpty(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, SlideMillis: 5, WindowType: WindowTypeSliding}
+	keyFn := func(t types.Tuple) any {
+		return stableTupleKey(types.Tuple{"k1": t["k1"], "k2": t["k2"]})
+	}
+	aggInit := func() any { return float64(0) }
+	agg := &SumAgg{ColName: "v"}
+
+	op := NewWindowAggOp(spec, keyFn, []string{"k1", "k2"}, aggInit, agg)
+
+	ins := types.Batch{{Tuple: types.Tuple{"k1": "A", "k2": "X", "ts": int64(7), "v": float64(10)}, Count: 1}}
+	outIns, err := op.Apply(ins)
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(outIns) != 2 {
+		t.Fatalf("expected 2 window deltas on insert (ts=7 belongs to 2 sliding windows), got %d (%+v)", len(outIns), outIns)
+	}
+	seen := make(map[WindowID]float64)
+	for _, td := range outIns {
+		if td.Count != 1 {
+			t.Fatalf("expected output Count=1, got %d (%+v)", td.Count, td)
+		}
+		if td.Tuple["k1"] != "A" || td.Tuple["k2"] != "X" {
+			t.Fatalf("expected group keys k1=A,k2=X, got k1=%v k2=%v (%+v)", td.Tuple["k1"], td.Tuple["k2"], td)
+		}
+		start, okS := td.Tuple["__window_start"].(int64)
+		end, okE := td.Tuple["__window_end"].(int64)
+		if !okS || !okE {
+			t.Fatalf("expected __window_start/__window_end int64, got start=%T end=%T (%+v)", td.Tuple["__window_start"], td.Tuple["__window_end"], td)
+		}
+		d, ok := td.Tuple["agg_delta"].(float64)
+		if !ok {
+			t.Fatalf("expected agg_delta float64, got %T (%+v)", td.Tuple["agg_delta"], td)
+		}
+		seen[WindowID{Start: start, End: end}] += d
+	}
+	if seen[WindowID{Start: 0, End: 10}] != 10.0 {
+		t.Fatalf("expected agg_delta +10 for window [0,10), got %v (out=%+v)", seen[WindowID{Start: 0, End: 10}], outIns)
+	}
+	if seen[WindowID{Start: 5, End: 15}] != 10.0 {
+		t.Fatalf("expected agg_delta +10 for window [5,15), got %v (out=%+v)", seen[WindowID{Start: 5, End: 15}], outIns)
+	}
+
+	del := types.Batch{{Tuple: types.Tuple{"k1": "A", "k2": "X", "ts": int64(7), "v": float64(10)}, Count: -1}}
+	outDel, err := op.Apply(del)
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(outDel) != 2 {
+		t.Fatalf("expected 2 window deltas on delete, got %d (%+v)", len(outDel), outDel)
+	}
+	seenDel := make(map[WindowID]float64)
+	for _, td := range outDel {
+		if td.Count != 1 {
+			t.Fatalf("expected output Count=1, got %d (%+v)", td.Count, td)
+		}
+		if td.Tuple["k1"] != "A" || td.Tuple["k2"] != "X" {
+			t.Fatalf("expected group keys k1=A,k2=X, got k1=%v k2=%v (%+v)", td.Tuple["k1"], td.Tuple["k2"], td)
+		}
+		start, okS := td.Tuple["__window_start"].(int64)
+		end, okE := td.Tuple["__window_end"].(int64)
+		if !okS || !okE {
+			t.Fatalf("expected __window_start/__window_end int64, got start=%T end=%T (%+v)", td.Tuple["__window_start"], td.Tuple["__window_end"], td)
+		}
+		d, ok := td.Tuple["agg_delta"].(float64)
+		if !ok {
+			t.Fatalf("expected agg_delta float64, got %T (%+v)", td.Tuple["agg_delta"], td)
+		}
+		seenDel[WindowID{Start: start, End: end}] += d
+	}
+	if seenDel[WindowID{Start: 0, End: 10}] != -10.0 {
+		t.Fatalf("expected agg_delta -10 for window [0,10), got %v (out=%+v)", seenDel[WindowID{Start: 0, End: 10}], outDel)
+	}
+	if seenDel[WindowID{Start: 5, End: 15}] != -10.0 {
+		t.Fatalf("expected agg_delta -10 for window [5,15), got %v (out=%+v)", seenDel[WindowID{Start: 5, End: 15}], outDel)
+	}
+
+	// After delete, both windows should be fully evicted.
+	gkey := stableTupleKey(types.Tuple{"k1": "A", "k2": "X"})
+	for _, wid := range []WindowID{{Start: 0, End: 10}, {Start: 5, End: 15}} {
+		if wm, ok := op.State.Data[wid]; ok {
+			if _, ok2 := wm[gkey]; ok2 {
+				t.Fatalf("expected group state to be evicted for gkey=%v, but found in State.Data[%+v]", gkey, wid)
+			}
+			if len(wm) != 0 {
+				t.Fatalf("expected no remaining groups for window %+v, got %v", wid, wm)
+			}
+		}
+		if cm, ok := op.GroupCounts[wid]; ok {
+			if _, ok2 := cm[gkey]; ok2 {
+				t.Fatalf("expected group count to be evicted for gkey=%v, but found in GroupCounts[%+v]", gkey, wid)
+			}
+			if len(cm) != 0 {
+				t.Fatalf("expected no remaining group counts for window %+v, got %v", wid, cm)
+			}
+		}
 	}
 }
 

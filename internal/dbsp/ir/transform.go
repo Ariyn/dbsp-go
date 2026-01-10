@@ -1,6 +1,7 @@
 package ir
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -8,6 +9,28 @@ import (
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
+
+func buildGroupKeyFn(keys []string) func(types.Tuple) any {
+	if len(keys) == 0 {
+		return func(types.Tuple) any { return nil }
+	}
+	if len(keys) == 1 {
+		key := keys[0]
+		return func(t types.Tuple) any { return t[key] }
+	}
+	keyCols := append([]string(nil), keys...)
+	return func(t types.Tuple) any {
+		kt := make(types.Tuple, len(keyCols))
+		for _, col := range keyCols {
+			kt[col] = t[col]
+		}
+		b, err := json.Marshal(kt)
+		if err == nil {
+			return string(b)
+		}
+		return fmt.Sprintf("%#v", kt)
+	}
+}
 
 // buildWindowKeyFn creates a key function for a simple tumbling window
 // over a single time column. For the first version we assume that the
@@ -581,12 +604,8 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 		case *LogicalScan:
 			// Direct scan input
 			if n.WindowSpec == nil {
-				// Non-windowed grouping: keep existing single-key restriction
-				if len(n.Keys) != 1 {
-					return nil, fmt.Errorf("only single-group-key supported")
-				}
-				key := n.Keys[0]
-				keyFn := func(t types.Tuple) any { return t[key] }
+				// Non-windowed grouping: support composite keys.
+				keyFn := buildGroupKeyFn(n.Keys)
 
 				var agg op.AggFunc
 				var aggInit func() any
@@ -608,7 +627,7 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				}
 
 				g := op.NewGroupAggOp(keyFn, aggInit, agg)
-				g.SetKeyColName(key)
+				g.SetGroupKeyColNames(n.Keys)
 				return &op.Node{Op: g}, nil
 			} // Windowed aggregation: use WindowAggOp so that each input delta
 			// only affects its corresponding window(s) and group key.
@@ -618,18 +637,8 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			}
 
 			// If there are group keys, we currently support a single key column
-			// in addition to the window. This can be extended to composite keys
-			// later if needed.
-			var groupKeyFn func(t types.Tuple) any
-			if len(n.Keys) == 0 {
-				groupKeyFn = func(t types.Tuple) any { return nil }
-			} else {
-				if len(n.Keys) != 1 {
-					return nil, fmt.Errorf("only single group key supported in windowed aggregation for now")
-				}
-				keyCol := n.Keys[0]
-				groupKeyFn = func(t types.Tuple) any { return t[keyCol] }
-			}
+			// in addition to the window.
+			groupKeyFn := buildGroupKeyFn(n.Keys)
 
 			var agg op.AggFunc
 			var aggInit func() any
@@ -663,12 +672,8 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 		case *LogicalFilter:
 			// Filter before GroupAgg - create chained MapOp
 			if n.WindowSpec == nil {
-				// Non-windowed grouping with a single group key
-				if len(n.Keys) != 1 {
-					return nil, fmt.Errorf("only single-group-key supported")
-				}
-				key := n.Keys[0]
-				keyFn := func(t types.Tuple) any { return t[key] }
+				// Non-windowed grouping: support composite keys.
+				keyFn := buildGroupKeyFn(n.Keys)
 
 				var agg op.AggFunc
 				var aggInit func() any
@@ -695,7 +700,7 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				// Create filter function
 				predicateFn := BuildPredicateFunc(in.PredicateSQL)
 				g := op.NewGroupAggOp(keyFn, aggInit, agg)
-				g.SetKeyColName(key)
+				g.SetGroupKeyColNames(n.Keys)
 
 				filterOp := &op.MapOp{
 					F: func(td types.TupleDelta) []types.TupleDelta {
@@ -722,13 +727,12 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				return &op.Node{Op: chainedOp}, nil
 			}
 
-			// Windowed aggregation with a filter. For now we only support
-			// a single tumbling window (no extra group keys).
+			// Windowed aggregation with a filter.
 			ws := n.WindowSpec
 			if ws == nil {
 				return nil, fmt.Errorf("windowSpec must not be nil in windowed filter branch")
 			}
-			keyFn := buildWindowKeyFn(ws.TimeCol, ws.SizeMillis)
+			groupKeyFn := buildGroupKeyFn(n.Keys)
 
 			var agg op.AggFunc
 			var aggInit func() any
@@ -755,7 +759,8 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			// Create filter function
 			predicateFn := BuildPredicateFunc(in.PredicateSQL)
 
-			g := op.NewGroupAggOp(keyFn, aggInit, agg) // Wrap with MapOp for filtering
+			waSpec := op.WindowSpecLite{TimeCol: ws.TimeCol, SizeMillis: ws.SizeMillis}
+			wa := op.NewWindowAggOp(waSpec, groupKeyFn, n.Keys, aggInit, agg)
 			filterOp := &op.MapOp{
 				F: func(td types.TupleDelta) []types.TupleDelta {
 					if predicateFn(td.Tuple) {
@@ -765,20 +770,16 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				},
 			}
 
-			// Create a ChainedOp that applies filter then aggregate
+			// Create a ChainedOp that applies filter then window aggregate
 			chainedOp := &op.ChainedOp{
-				Ops: []op.Operator{filterOp, g},
+				Ops: []op.Operator{filterOp, wa},
 			}
 
 			return &op.Node{Op: chainedOp}, nil
 
 		case *LogicalJoin:
 			// JOIN followed by GroupAgg
-			if len(n.Keys) != 1 {
-				return nil, fmt.Errorf("only single-group-key supported")
-			}
-			key := n.Keys[0]
-			keyFn := func(t types.Tuple) any { return t[key] }
+			keyFn := buildGroupKeyFn(n.Keys)
 
 			var agg op.AggFunc
 			var aggInit func() any
@@ -803,7 +804,7 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			}
 
 			g := op.NewGroupAggOp(keyFn, aggInit, agg)
-			g.SetKeyColName(key)
+			g.SetGroupKeyColNames(n.Keys)
 
 			joinNode, err := logicalJoinToDBSP(in)
 			if err != nil {

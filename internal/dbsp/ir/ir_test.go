@@ -103,9 +103,41 @@ func TestLogicalToDBSP_MultipleKeys_Error(t *testing.T) {
 		Input:   scan,
 	}
 
-	_, err := LogicalToDBSP(agg)
-	if err == nil {
-		t.Fatal("expected error for multiple group keys")
+	node, err := LogicalToDBSP(agg)
+	if err != nil {
+		t.Fatalf("LogicalToDBSP failed: %v", err)
+	}
+	if node == nil || node.Op == nil {
+		t.Fatal("expected non-nil node with operator")
+	}
+
+	// Verify it's a GroupAggOp
+	_, ok := node.Op.(*op.GroupAggOp)
+	if !ok {
+		t.Fatalf("expected GroupAggOp, got %T", node.Op)
+	}
+
+	// Test execution and verify output carries both grouping columns.
+	batch := types.Batch{
+		{Tuple: types.Tuple{"region": "APAC", "product": "P1", "revenue": 10}, Count: 1},
+		{Tuple: types.Tuple{"region": "APAC", "product": "P2", "revenue": 20}, Count: 1},
+		{Tuple: types.Tuple{"region": "APAC", "product": "P1", "revenue": 5}, Count: 1},
+	}
+
+	out, err := op.Execute(node, batch)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("expected non-empty output")
+	}
+	for _, td := range out {
+		if _, ok := td.Tuple["region"]; !ok {
+			t.Fatalf("expected output to include region, got %v", td.Tuple)
+		}
+		if _, ok := td.Tuple["product"]; !ok {
+			t.Fatalf("expected output to include product, got %v", td.Tuple)
+		}
 	}
 }
 

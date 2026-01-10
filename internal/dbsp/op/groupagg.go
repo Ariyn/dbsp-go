@@ -19,7 +19,14 @@ type GroupAggOp struct {
 	AggFn   AggFunc
 
 	state      map[any]any
-	KeyColName string // Optional: name of the key column to include in output
+	KeyColName string // Optional: name of the key column to include in output (legacy single-key mode)
+
+	// GroupKeyColNames, when set, injects the original GROUP BY key columns from
+	// the input tuple into the output delta tuple.
+	//
+	// This is preferred for multi-key grouping because the internal key may be an
+	// encoded composite string.
+	GroupKeyColNames []string
 }
 
 func NewGroupAggOp(keyFn func(types.Tuple) any, aggInit func() any, aggFn AggFunc) *GroupAggOp {
@@ -30,8 +37,20 @@ func (g *GroupAggOp) SetKeyColName(name string) {
 	g.KeyColName = name
 }
 
+func (g *GroupAggOp) SetGroupKeyColNames(names []string) {
+	if len(names) == 0 {
+		g.GroupKeyColNames = nil
+		return
+	}
+	// Copy to avoid accidental external mutation.
+	g.GroupKeyColNames = append([]string(nil), names...)
+}
+
 func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
+	// For delta-style aggregates (SUM/COUNT/AVG), compact per group key within
+	// the batch so that net-zero changes don't emit output.
+	pending := make(map[any]*types.TupleDelta)
 	if g.state == nil {
 		g.state = make(map[any]any)
 	}
@@ -44,14 +63,105 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 		newVal, outDelta := g.AggFn.Apply(prev, td)
 		g.state[key] = newVal
 		if outDelta != nil {
-			// If KeyColName is set, inject the key into the output tuple
-			if g.KeyColName != "" {
+			if outDelta.Tuple == nil {
+				outDelta.Tuple = types.Tuple{}
+			}
+
+			if len(g.GroupKeyColNames) > 0 {
+				for _, col := range g.GroupKeyColNames {
+					outDelta.Tuple[col] = td.Tuple[col]
+				}
+			} else if g.KeyColName != "" {
+				// Legacy single-key mode.
 				outDelta.Tuple[g.KeyColName] = key
 			}
+
+			// If this looks like an additive "delta" aggregate, compact by summing
+			// the delta field per group key.
+			if outDelta.Count == 1 {
+				if _, ok := outDelta.Tuple["agg_delta"]; ok {
+					existing := pending[key]
+					if existing == nil {
+						cpy := &types.TupleDelta{Tuple: cloneTupleLocal(outDelta.Tuple), Count: 1}
+						pending[key] = cpy
+					} else {
+						existing.Tuple["agg_delta"] = toFloat64Local(existing.Tuple["agg_delta"]) + toFloat64Local(outDelta.Tuple["agg_delta"])
+					}
+					if existing := pending[key]; existing != nil && toFloat64Local(existing.Tuple["agg_delta"]) == 0 {
+						delete(pending, key)
+					}
+					continue
+				}
+				if _, ok := outDelta.Tuple["avg_delta"]; ok {
+					existing := pending[key]
+					if existing == nil {
+						cpy := &types.TupleDelta{Tuple: cloneTupleLocal(outDelta.Tuple), Count: 1}
+						pending[key] = cpy
+					} else {
+						existing.Tuple["avg_delta"] = toFloat64Local(existing.Tuple["avg_delta"]) + toFloat64Local(outDelta.Tuple["avg_delta"])
+					}
+					if existing := pending[key]; existing != nil && toFloat64Local(existing.Tuple["avg_delta"]) == 0 {
+						delete(pending, key)
+					}
+					continue
+				}
+				if _, ok := outDelta.Tuple["count_delta"]; ok {
+					existing := pending[key]
+					if existing == nil {
+						cpy := &types.TupleDelta{Tuple: cloneTupleLocal(outDelta.Tuple), Count: 1}
+						pending[key] = cpy
+					} else {
+						existing.Tuple["count_delta"] = toInt64Local(existing.Tuple["count_delta"]) + toInt64Local(outDelta.Tuple["count_delta"])
+					}
+					if existing := pending[key]; existing != nil && toInt64Local(existing.Tuple["count_delta"]) == 0 {
+						delete(pending, key)
+					}
+					continue
+				}
+			}
+
 			out = append(out, *outDelta)
 		}
 	}
+
+	for _, td := range pending {
+		out = append(out, *td)
+	}
 	return out, nil
+}
+
+func toFloat64Local(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case float32:
+		return float64(x)
+	case int:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case uint64:
+		return float64(x)
+	default:
+		return 0
+	}
+}
+
+func toInt64Local(v any) int64 {
+	switch x := v.(type) {
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	case uint64:
+		return int64(x)
+	case float64:
+		return int64(x)
+	case float32:
+		return int64(x)
+	default:
+		return 0
+	}
 }
 
 // State returns a copy of the internal aggregate state (for testing/inspection).

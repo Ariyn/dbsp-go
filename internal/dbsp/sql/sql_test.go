@@ -73,6 +73,48 @@ func TestParseAndExecuteSumGroupBy(t *testing.T) {
 	}
 }
 
+func TestParseAndExecuteSumGroupBy_MultiKey(t *testing.T) {
+	q := "SELECT k1, k2, SUM(v) FROM t GROUP BY k1, k2"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP failed: %v", err)
+	}
+	if node == nil || node.Op == nil {
+		t.Fatalf("expected node with op, got nil")
+	}
+
+	batch := types.Batch{
+		{Tuple: types.Tuple{"k1": "A", "k2": int64(1), "v": 2}, Count: 1},
+		{Tuple: types.Tuple{"k1": "A", "k2": int64(2), "v": 3}, Count: 1},
+		{Tuple: types.Tuple{"k1": "A", "k2": int64(1), "v": 4}, Count: 1},
+	}
+	out, err := op.Execute(node, batch)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatalf("expected non-empty output deltas")
+	}
+	for _, td := range out {
+		if _, ok := td.Tuple["k1"]; !ok {
+			t.Fatalf("expected output to include k1, got %v", td.Tuple)
+		}
+		if _, ok := td.Tuple["k2"]; !ok {
+			t.Fatalf("expected output to include k2, got %v", td.Tuple)
+		}
+		if _, ok := td.Tuple["agg_delta"]; !ok {
+			t.Fatalf("expected output to include agg_delta, got %v", td.Tuple)
+		}
+	}
+
+	// Delete one row to ensure multi-key delete path doesn't error.
+	del := types.Batch{{Tuple: types.Tuple{"k1": "A", "k2": int64(1), "v": 2}, Count: -1}}
+	_, err = op.Execute(node, del)
+	if err != nil {
+		t.Fatalf("Execute(delete) failed: %v", err)
+	}
+}
+
 func TestParseQueryToIncrementalDBSP(t *testing.T) {
 	q := "SELECT k, SUM(v) FROM t GROUP BY k"
 	incNode, err := ParseQueryToIncrementalDBSP(q)
@@ -382,6 +424,88 @@ func TestParseQueryJoinGroupBy(t *testing.T) {
 	state2 := gop.State()
 	if state2["A"] != 10.0 {
 		t.Errorf("expected A=10 after delete, got %v", state2["A"])
+	}
+}
+
+func TestParseQueryJoinGroupBy_MultiKey(t *testing.T) {
+	q := "SELECT a.k1, a.k2, SUM(b.v) FROM a JOIN b ON a.id = b.id GROUP BY a.k1, a.k2"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with JOIN+GROUP BY failed: %v", err)
+	}
+	if node == nil || node.Op == nil {
+		t.Fatalf("expected node with op, got nil")
+	}
+
+	// a: (id=1,k1=A,k2=X), (id=2,k1=A,k2=X), (id=3,k1=B,k2=Y)
+	// b: (id=1,v=10), (id=2,v=20), (id=3,v=5)
+	aBatch := types.Batch{
+		{Tuple: types.Tuple{"a.id": 1, "a.k1": "A", "a.k2": "X"}, Count: 1},
+		{Tuple: types.Tuple{"a.id": 2, "a.k1": "A", "a.k2": "X"}, Count: 1},
+		{Tuple: types.Tuple{"a.id": 3, "a.k1": "B", "a.k2": "Y"}, Count: 1},
+	}
+	bBatch := types.Batch{
+		{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 2, "b.v": 20}, Count: 1},
+		{Tuple: types.Tuple{"b.id": 3, "b.v": 5}, Count: 1},
+	}
+
+	_, err = op.ExecuteTick(node, map[string]types.Batch{"a": aBatch})
+	if err != nil {
+		t.Fatalf("ExecuteTick(a) failed: %v", err)
+	}
+	out, err := op.ExecuteTick(node, map[string]types.Batch{"b": bBatch})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b) failed: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatalf("expected non-empty output")
+	}
+
+	got := make(map[string]float64)
+	for _, td := range out {
+		if td.Count != 1 {
+			t.Fatalf("expected output delta Count=1, got %d (%+v)", td.Count, td)
+		}
+		k1 := td.Tuple["a.k1"]
+		k2 := td.Tuple["a.k2"]
+		if k1 == nil || k2 == nil {
+			t.Fatalf("expected output to include a.k1 and a.k2, got tuple=%+v", td.Tuple)
+		}
+		d, ok := td.Tuple["agg_delta"].(float64)
+		if !ok {
+			t.Fatalf("expected agg_delta float64, got %T (%+v)", td.Tuple["agg_delta"], td)
+		}
+		got[fmt.Sprintf("%v|%v", k1, k2)] += d
+	}
+	if got["A|X"] != 30.0 {
+		t.Fatalf("expected net agg_delta=30 for group (A,X), got %v (out=%+v)", got["A|X"], out)
+	}
+	if got["B|Y"] != 5.0 {
+		t.Fatalf("expected net agg_delta=5 for group (B,Y), got %v (out=%+v)", got["B|Y"], out)
+	}
+
+	// Delete contribution b.id=2 (v=20) and verify retraction for group (A,X).
+	bDel := types.Batch{{Tuple: types.Tuple{"b.id": 2, "b.v": 20}, Count: -1}}
+	outDel, err := op.ExecuteTick(node, map[string]types.Batch{"b": bDel})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b delete) failed: %v", err)
+	}
+	if len(outDel) != 1 {
+		t.Fatalf("expected 1 aggregate delta on delete, got %d (%+v)", len(outDel), outDel)
+	}
+	if outDel[0].Count != 1 {
+		t.Fatalf("expected output delta Count=1, got %d (%+v)", outDel[0].Count, outDel[0])
+	}
+	if outDel[0].Tuple["a.k1"] != "A" || outDel[0].Tuple["a.k2"] != "X" {
+		t.Fatalf("expected group key (A,X), got k1=%v k2=%v (%+v)", outDel[0].Tuple["a.k1"], outDel[0].Tuple["a.k2"], outDel[0])
+	}
+	delta, ok := outDel[0].Tuple["agg_delta"].(float64)
+	if !ok {
+		t.Fatalf("expected agg_delta float64, got %T (%+v)", outDel[0].Tuple["agg_delta"], outDel[0])
+	}
+	if delta != -20.0 {
+		t.Fatalf("expected agg_delta=-20, got %v (%+v)", delta, outDel[0])
 	}
 }
 
@@ -1886,5 +2010,252 @@ func TestTimeWindowIntegration(t *testing.T) {
 	t.Logf("Window results: %d deltas", len(out))
 	for i, td := range out {
 		t.Logf("  [%d] %+v", i, td.Tuple)
+	}
+}
+
+func TestTimeWindowIntegration_MultiKey_Tumbling_DeleteEvict(t *testing.T) {
+	// Manual LogicalWindowAgg construction until parser supports TimeWindowSpec end-to-end.
+	timeWindowSpec := &ir.TimeWindowSpec{
+		WindowType:  "TUMBLING",
+		TimeCol:     "ts",
+		SizeMillis:  10,
+		SlideMillis: 0,
+		GapMillis:   0,
+	}
+
+	scan := &ir.LogicalScan{Table: "events"}
+	wa := &ir.LogicalWindowAgg{
+		AggName:        "SUM",
+		AggCol:         "amount",
+		PartitionBy:    []string{"k1", "k2"},
+		TimeWindowSpec: timeWindowSpec,
+		OutputCol:      "total",
+		Input:          scan,
+	}
+
+	node, err := ir.LogicalToDBSP(wa)
+	if err != nil {
+		t.Fatalf("LogicalToDBSP failed: %v", err)
+	}
+
+	windowOp, ok := node.Op.(*op.WindowAggOp)
+	if !ok {
+		t.Fatalf("expected WindowAggOp, got %T", node.Op)
+	}
+
+	ins := types.Batch{
+		{Tuple: types.Tuple{"ts": int64(1), "k1": "A", "k2": "X", "amount": 10.0}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(2), "k1": "A", "k2": "X", "amount": 20.0}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(1), "k1": "B", "k2": "Y", "amount": 5.0}, Count: 1},
+	}
+	outIns, err := windowOp.Apply(ins)
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(outIns) == 0 {
+		t.Fatalf("expected non-empty output deltas on insert")
+	}
+	got := make(map[string]float64)
+	for _, td := range outIns {
+		if td.Count != 1 {
+			t.Fatalf("expected output delta Count=1, got %d (%+v)", td.Count, td)
+		}
+		if td.Tuple["__window_start"] != int64(0) || td.Tuple["__window_end"] != int64(10) {
+			t.Fatalf("expected window [0,10), got start=%v end=%v (%+v)", td.Tuple["__window_start"], td.Tuple["__window_end"], td)
+		}
+		k1 := td.Tuple["k1"]
+		k2 := td.Tuple["k2"]
+		if k1 == nil || k2 == nil {
+			t.Fatalf("expected output to include k1 and k2, got tuple=%+v", td.Tuple)
+		}
+		d, ok := td.Tuple["agg_delta"].(float64)
+		if !ok {
+			t.Fatalf("expected agg_delta float64, got %T (%+v)", td.Tuple["agg_delta"], td)
+		}
+		got[fmt.Sprintf("%v|%v", k1, k2)] += d
+	}
+	if got["A|X"] != 30.0 {
+		t.Fatalf("expected net agg_delta=30 for group (A,X), got %v (out=%+v)", got["A|X"], outIns)
+	}
+	if got["B|Y"] != 5.0 {
+		t.Fatalf("expected net agg_delta=5 for group (B,Y), got %v (out=%+v)", got["B|Y"], outIns)
+	}
+
+	// Delete one contribution in group (A,X).
+	del := types.Batch{{Tuple: types.Tuple{"ts": int64(2), "k1": "A", "k2": "X", "amount": 20.0}, Count: -1}}
+	outDel, err := windowOp.Apply(del)
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(outDel) != 1 {
+		t.Fatalf("expected 1 output delta on delete, got %d (%+v)", len(outDel), outDel)
+	}
+	if outDel[0].Count != 1 {
+		t.Fatalf("expected output delta Count=1, got %d (%+v)", outDel[0].Count, outDel[0])
+	}
+	if outDel[0].Tuple["__window_start"] != int64(0) || outDel[0].Tuple["__window_end"] != int64(10) {
+		t.Fatalf("expected window [0,10), got start=%v end=%v (%+v)", outDel[0].Tuple["__window_start"], outDel[0].Tuple["__window_end"], outDel[0])
+	}
+	if outDel[0].Tuple["k1"] != "A" || outDel[0].Tuple["k2"] != "X" {
+		t.Fatalf("expected group key (A,X), got k1=%v k2=%v (%+v)", outDel[0].Tuple["k1"], outDel[0].Tuple["k2"], outDel[0])
+	}
+	delta, ok := outDel[0].Tuple["agg_delta"].(float64)
+	if !ok {
+		t.Fatalf("expected agg_delta float64, got %T (%+v)", outDel[0].Tuple["agg_delta"], outDel[0])
+	}
+	if delta != -20.0 {
+		t.Fatalf("expected agg_delta=-20, got %v (%+v)", delta, outDel[0])
+	}
+
+	// Delete remaining contributions so group (A,X) evicts.
+	del2 := types.Batch{{Tuple: types.Tuple{"ts": int64(1), "k1": "A", "k2": "X", "amount": 10.0}, Count: -1}}
+	outDel2, err := windowOp.Apply(del2)
+	if err != nil {
+		t.Fatalf("Apply(delete2) failed: %v", err)
+	}
+	if len(outDel2) != 1 {
+		t.Fatalf("expected 1 output delta on delete2, got %d (%+v)", len(outDel2), outDel2)
+	}
+	if outDel2[0].Tuple["k1"] != "A" || outDel2[0].Tuple["k2"] != "X" {
+		t.Fatalf("expected group key (A,X) on delete2, got k1=%v k2=%v (%+v)", outDel2[0].Tuple["k1"], outDel2[0].Tuple["k2"], outDel2[0])
+	}
+	delta2, ok := outDel2[0].Tuple["agg_delta"].(float64)
+	if !ok {
+		t.Fatalf("expected agg_delta float64 on delete2, got %T (%+v)", outDel2[0].Tuple["agg_delta"], outDel2[0])
+	}
+	if delta2 != -10.0 {
+		t.Fatalf("expected agg_delta=-10 on delete2, got %v (%+v)", delta2, outDel2[0])
+	}
+
+	// Now delete (B,Y) too and require full eviction.
+	del3 := types.Batch{{Tuple: types.Tuple{"ts": int64(1), "k1": "B", "k2": "Y", "amount": 5.0}, Count: -1}}
+	_, err = windowOp.Apply(del3)
+	if err != nil {
+		t.Fatalf("Apply(delete3) failed: %v", err)
+	}
+
+	wid := op.WindowID{Start: 0, End: 10}
+	if wm, ok := windowOp.State.Data[wid]; ok {
+		if len(wm) != 0 {
+			t.Fatalf("expected window state fully evicted for %+v, got %v", wid, wm)
+		}
+	}
+	if cm, ok := windowOp.GroupCounts[wid]; ok {
+		if len(cm) != 0 {
+			t.Fatalf("expected window group-counts fully evicted for %+v, got %v", wid, cm)
+		}
+	}
+}
+
+func TestTimeWindowIntegration_MultiKey_Sliding_DeleteEvict(t *testing.T) {
+	// Manual LogicalWindowAgg construction (SLIDING/HOP style) until parser supports TimeWindowSpec end-to-end.
+	timeWindowSpec := &ir.TimeWindowSpec{
+		WindowType:  "SLIDING",
+		TimeCol:     "ts",
+		SizeMillis:  10,
+		SlideMillis: 5,
+		GapMillis:   0,
+	}
+
+	scan := &ir.LogicalScan{Table: "events"}
+	wa := &ir.LogicalWindowAgg{
+		AggName:        "SUM",
+		AggCol:         "amount",
+		PartitionBy:    []string{"k1", "k2"},
+		TimeWindowSpec: timeWindowSpec,
+		OutputCol:      "total",
+		Input:          scan,
+	}
+
+	node, err := ir.LogicalToDBSP(wa)
+	if err != nil {
+		t.Fatalf("LogicalToDBSP failed: %v", err)
+	}
+
+	windowOp, ok := node.Op.(*op.WindowAggOp)
+	if !ok {
+		t.Fatalf("expected WindowAggOp, got %T", node.Op)
+	}
+
+	ins := types.Batch{{Tuple: types.Tuple{"ts": int64(7), "k1": "A", "k2": "X", "amount": 10.0}, Count: 1}}
+	outIns, err := windowOp.Apply(ins)
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(outIns) != 2 {
+		t.Fatalf("expected 2 window deltas on insert (ts=7 belongs to 2 sliding windows), got %d (%+v)", len(outIns), outIns)
+	}
+	seen := make(map[op.WindowID]float64)
+	for _, td := range outIns {
+		if td.Count != 1 {
+			t.Fatalf("expected output delta Count=1, got %d (%+v)", td.Count, td)
+		}
+		if td.Tuple["k1"] != "A" || td.Tuple["k2"] != "X" {
+			t.Fatalf("expected output to include k1=A and k2=X, got tuple=%+v", td.Tuple)
+		}
+		start, okS := td.Tuple["__window_start"].(int64)
+		end, okE := td.Tuple["__window_end"].(int64)
+		if !okS || !okE {
+			t.Fatalf("expected __window_start/__window_end int64, got start=%T end=%T (%+v)", td.Tuple["__window_start"], td.Tuple["__window_end"], td)
+		}
+		d, ok := td.Tuple["agg_delta"].(float64)
+		if !ok {
+			t.Fatalf("expected agg_delta float64, got %T (%+v)", td.Tuple["agg_delta"], td)
+		}
+		seen[op.WindowID{Start: start, End: end}] += d
+	}
+	if seen[op.WindowID{Start: 0, End: 10}] != 10.0 {
+		t.Fatalf("expected agg_delta +10 for window [0,10), got %v (out=%+v)", seen[op.WindowID{Start: 0, End: 10}], outIns)
+	}
+	if seen[op.WindowID{Start: 5, End: 15}] != 10.0 {
+		t.Fatalf("expected agg_delta +10 for window [5,15), got %v (out=%+v)", seen[op.WindowID{Start: 5, End: 15}], outIns)
+	}
+
+	del := types.Batch{{Tuple: types.Tuple{"ts": int64(7), "k1": "A", "k2": "X", "amount": 10.0}, Count: -1}}
+	outDel, err := windowOp.Apply(del)
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(outDel) != 2 {
+		t.Fatalf("expected 2 window deltas on delete, got %d (%+v)", len(outDel), outDel)
+	}
+	seenDel := make(map[op.WindowID]float64)
+	for _, td := range outDel {
+		if td.Count != 1 {
+			t.Fatalf("expected output delta Count=1, got %d (%+v)", td.Count, td)
+		}
+		if td.Tuple["k1"] != "A" || td.Tuple["k2"] != "X" {
+			t.Fatalf("expected output to include k1=A and k2=X, got tuple=%+v", td.Tuple)
+		}
+		start, okS := td.Tuple["__window_start"].(int64)
+		end, okE := td.Tuple["__window_end"].(int64)
+		if !okS || !okE {
+			t.Fatalf("expected __window_start/__window_end int64, got start=%T end=%T (%+v)", td.Tuple["__window_start"], td.Tuple["__window_end"], td)
+		}
+		d, ok := td.Tuple["agg_delta"].(float64)
+		if !ok {
+			t.Fatalf("expected agg_delta float64, got %T (%+v)", td.Tuple["agg_delta"], td)
+		}
+		seenDel[op.WindowID{Start: start, End: end}] += d
+	}
+	if seenDel[op.WindowID{Start: 0, End: 10}] != -10.0 {
+		t.Fatalf("expected agg_delta -10 for window [0,10), got %v (out=%+v)", seenDel[op.WindowID{Start: 0, End: 10}], outDel)
+	}
+	if seenDel[op.WindowID{Start: 5, End: 15}] != -10.0 {
+		t.Fatalf("expected agg_delta -10 for window [5,15), got %v (out=%+v)", seenDel[op.WindowID{Start: 5, End: 15}], outDel)
+	}
+
+	// After delete, both windows should be fully evicted (only one group existed).
+	for _, wid := range []op.WindowID{{Start: 0, End: 10}, {Start: 5, End: 15}} {
+		if wm, ok := windowOp.State.Data[wid]; ok {
+			if len(wm) != 0 {
+				t.Fatalf("expected window state fully evicted for %+v, got %v", wid, wm)
+			}
+		}
+		if cm, ok := windowOp.GroupCounts[wid]; ok {
+			if len(cm) != 0 {
+				t.Fatalf("expected window group-counts fully evicted for %+v, got %v", wid, cm)
+			}
+		}
 	}
 }
