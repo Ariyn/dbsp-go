@@ -26,8 +26,17 @@
 
 - [ ] **Integrate/Delay를 실제 operator로 정착(또는 설계 재정의)**
   - 현재 integrate는 placeholder, diff는 “대부분 동일 operator 반환” 가정
-  - 목표: DBSP 규칙에 맞는 `IntegrateOp`, `DelayOp`를 구현하거나, 현재 방식(상태 내장형 operator)과의 일관된 스펙을 문서화
+  - 목표: DBSP 규칙에 맞는 `IntegrateOp`, `DelayOp`를 구현하고, **Delay 포함 사이클만 허용**하는 tick 실행 모델로 확장
+  - 설계 RFC: `docs/RFC_DELAY_INTEGRATE.md`
   - 후보 파일: `internal/dbsp/op/integrate.go`, `internal/dbsp/diff/differentiate.go`
+  - [x] combinational-cycle validator 추가(“모든 사이클은 Delay 포함” 규칙)
+  - [x] Delay-cycle executor 추가(2-phase: read-old/write-new/commit)
+  - [x] `DelayOp` 구현(seed/prev/next + commit)
+  - [x] `IntegrateOp` 구현(Δ→Value: Z-set 누적) + `ZSetStore/ZSetRef` 정의
+  - [x] Differentiate v2 구현: Join/Union/Diff를 (Join은 3항) **명시적 그래프 조합**으로 생성
+  - [x] Join 연산자 패밀리 정의/구현(Δ⋈V, V⋈Δ, Δ⋈Δ) 및 테스트
+  - [x] tick/사이클 기본 테스트(Delay shift, cycle legality)
+  - [x] 미분 정확성 테스트(delete/retraction 포함)
 
 - [ ] **증분 정확성 테스트 강화(특히 delete 포함)**
   - Join + delete, Join+Agg + delete, Window + delete 같은 케이스가 핵심

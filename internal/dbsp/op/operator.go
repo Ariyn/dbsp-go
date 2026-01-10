@@ -55,6 +55,12 @@ func ExecuteTick(root *Node, sources map[string]types.Batch) (types.Batch, error
 		return nil, nil
 	}
 
+	// If the graph contains DelayOp, we must evaluate with register semantics.
+	// ExecuteTickCyclic supports both acyclic graphs and Delay-separated cycles.
+	if graphHasDelay(root) {
+		return ExecuteTickCyclic(root, sources)
+	}
+
 	memo := make(map[*Node]types.Batch)
 	visiting := make(map[*Node]bool)
 
@@ -122,6 +128,29 @@ func ExecuteTick(root *Node, sources map[string]types.Batch) (types.Batch, error
 	}
 
 	return eval(root)
+}
+
+func graphHasDelay(root *Node) bool {
+	if root == nil {
+		return false
+	}
+	seen := make(map[*Node]bool)
+	stack := []*Node{root}
+	for len(stack) > 0 {
+		n := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if n == nil || seen[n] {
+			continue
+		}
+		seen[n] = true
+		if _, ok := n.Op.(*DelayOp); ok {
+			return true
+		}
+		for _, in := range n.Inputs {
+			stack = append(stack, in)
+		}
+	}
+	return false
 }
 
 // SourceNames returns the sorted unique source names reachable from root.
