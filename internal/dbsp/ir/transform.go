@@ -697,12 +697,10 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				}
 
 				// Create filter function
-				predicateFn := BuildPredicateFunc(in.PredicateSQL) // Create a combined operator: filter then aggregate
-				// For Phase1, we embed filtering in the GroupAgg by wrapping the input
+				predicateFn := BuildPredicateFunc(in.PredicateSQL)
 				g := op.NewGroupAggOp(keyFn, aggInit, agg)
 				g.SetKeyColName(key)
 
-				// Wrap with MapOp for filtering
 				filterOp := &op.MapOp{
 					F: func(td types.TupleDelta) []types.TupleDelta {
 						if predicateFn(td.Tuple) {
@@ -712,11 +710,18 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 					},
 				}
 
-				// Create a ChainedOp that applies filter then aggregate
-				chainedOp := &op.ChainedOp{
-					Ops: []op.Operator{filterOp, g},
+				// If filter is applied on top of a JOIN, we must execute JOIN first.
+				if join, ok := in.Input.(*LogicalJoin); ok {
+					joinNode, err := logicalJoinToDBSP(join)
+					if err != nil {
+						return nil, err
+					}
+					chainedOp := &op.ChainedOp{Ops: []op.Operator{joinNode.Op, filterOp, g}}
+					return &op.Node{Op: chainedOp}, nil
 				}
 
+				// Default: filter then aggregate
+				chainedOp := &op.ChainedOp{Ops: []op.Operator{filterOp, g}}
 				return &op.Node{Op: chainedOp}, nil
 			}
 
@@ -956,7 +961,7 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 	// Check for time-based windowing
 	if wa.TimeWindowSpec != nil {
 		spec := wa.TimeWindowSpec
-		
+
 		// Convert to op.WindowType
 		var windowType op.WindowType
 		switch strings.ToUpper(spec.WindowType) {
