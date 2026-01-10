@@ -1,6 +1,8 @@
 package op
 
 import (
+	"fmt"
+
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
@@ -64,44 +66,16 @@ func NewJoinOp(
 	}
 }
 
-// Apply processes batches from both inputs and returns the output batch.
-// For JOIN, we separate the batch into left and right based on which columns exist.
+// Apply is kept only to satisfy the unary Operator interface, but BinaryOp requires
+// two inputs in a true 2-input DAG.
 func (b *BinaryOp) Apply(batch types.Batch) (types.Batch, error) {
-	if b.Type == BinaryJoin {
-		// Separate batch into left and right based on key columns
-		var leftBatch, rightBatch types.Batch
+	_ = batch
+	return nil, fmt.Errorf("BinaryOp requires two inputs; use Apply2 or ApplyBinary")
+}
 
-		for _, td := range batch {
-			// Check which side this tuple belongs to by looking for key columns
-			hasLeft := false
-			hasRight := false
-
-			// Try to extract keys to determine which side
-			leftKey := b.LeftKeyFn(td.Tuple)
-			rightKey := b.RightKeyFn(td.Tuple)
-
-			// If left key exists and is not nil, it's from left table
-			if leftKey != nil {
-				hasLeft = true
-			}
-			// If right key exists and is not nil, it's from right table
-			if rightKey != nil {
-				hasRight = true
-			}
-
-			// A tuple with only left columns goes to left batch
-			// A tuple with only right columns goes to right batch
-			if hasLeft && !hasRight {
-				leftBatch = append(leftBatch, td)
-			} else if hasRight && !hasLeft {
-				rightBatch = append(rightBatch, td)
-			}
-		}
-
-		return b.ApplyBinary(leftBatch, rightBatch)
-	}
-
-	return nil, nil
+// Apply2 evaluates this binary operator with explicit left/right input batches.
+func (b *BinaryOp) Apply2(left, right types.Batch) (types.Batch, error) {
+	return b.ApplyBinary(left, right)
 }
 
 // ApplyBinary processes delta batches from both left and right inputs.

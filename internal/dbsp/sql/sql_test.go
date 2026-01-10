@@ -110,17 +110,23 @@ func TestParseQueryJoinSimple(t *testing.T) {
 		t.Fatalf("expected node with op, got nil")
 	}
 
-	// Simple batch: a, b matched by id
-	batch := types.Batch{
+	// Drive the join as a true 2-input DAG: feed left and right deltas separately.
+	aBatch := types.Batch{
 		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
 		{Tuple: types.Tuple{"a.id": 2, "a.k": "B"}, Count: 1},
+	}
+	bBatch := types.Batch{
 		{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: 1},
 		{Tuple: types.Tuple{"b.id": 3, "b.v": 30}, Count: 1},
 	}
 
-	out, err := op.Execute(node, batch)
+	_, err = op.ExecuteTick(node, map[string]types.Batch{"a": aBatch})
 	if err != nil {
-		t.Fatalf("Execute failed: %v", err)
+		t.Fatalf("ExecuteTick(a) failed: %v", err)
+	}
+	out, err := op.ExecuteTick(node, map[string]types.Batch{"b": bBatch})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b) failed: %v", err)
 	}
 
 	// Only id=1 should join
@@ -139,16 +145,22 @@ func TestParseQueryJoinWithWhere(t *testing.T) {
 		t.Fatalf("expected node with op, got nil")
 	}
 
-	batch := types.Batch{
+	aBatch := types.Batch{
 		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
 		{Tuple: types.Tuple{"a.id": 2, "a.k": "B"}, Count: 1},
+	}
+	bBatch := types.Batch{
 		{Tuple: types.Tuple{"b.id": 1, "b.v": 5}, Count: 1},
 		{Tuple: types.Tuple{"b.id": 2, "b.v": 20}, Count: 1},
 	}
 
-	out, err := op.Execute(node, batch)
+	_, err = op.ExecuteTick(node, map[string]types.Batch{"a": aBatch})
 	if err != nil {
-		t.Fatalf("Execute failed: %v", err)
+		t.Fatalf("ExecuteTick(a) failed: %v", err)
+	}
+	out, err := op.ExecuteTick(node, map[string]types.Batch{"b": bBatch})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b) failed: %v", err)
 	}
 
 	// Only id=2, v=20 should remain after filter
@@ -170,18 +182,24 @@ func TestParseQueryJoinGroupBy(t *testing.T) {
 
 	// a: (id=1,k=A), (id=2,k=A), (id=3,k=B)
 	// b: (id=1,v=10), (id=2,v=20), (id=3,v=5)
-	batch := types.Batch{
+	aBatch := types.Batch{
 		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
 		{Tuple: types.Tuple{"a.id": 2, "a.k": "A"}, Count: 1},
 		{Tuple: types.Tuple{"a.id": 3, "a.k": "B"}, Count: 1},
+	}
+	bBatch := types.Batch{
 		{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: 1},
 		{Tuple: types.Tuple{"b.id": 2, "b.v": 20}, Count: 1},
 		{Tuple: types.Tuple{"b.id": 3, "b.v": 5}, Count: 1},
 	}
 
-	out, err := op.Execute(node, batch)
+	_, err = op.ExecuteTick(node, map[string]types.Batch{"a": aBatch})
 	if err != nil {
-		t.Fatalf("Execute failed: %v", err)
+		t.Fatalf("ExecuteTick(a) failed: %v", err)
+	}
+	out, err := op.ExecuteTick(node, map[string]types.Batch{"b": bBatch})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b) failed: %v", err)
 	}
 	if len(out) == 0 {
 		t.Fatalf("expected non-empty output")
@@ -1333,16 +1351,22 @@ func TestJoinWithNull(t *testing.T) {
 	}
 
 	// NULL keys should not match
-	batch := types.Batch{
+	aBatch := types.Batch{
 		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
 		{Tuple: types.Tuple{"a.id": nil, "a.k": "B"}, Count: 1},
+	}
+	bBatch := types.Batch{
 		{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: 1},
 		{Tuple: types.Tuple{"b.id": nil, "b.v": 20}, Count: 1},
 	}
 
-	out, err := op.Execute(node, batch)
+	_, err = op.ExecuteTick(node, map[string]types.Batch{"a": aBatch})
 	if err != nil {
-		t.Fatalf("Execute failed: %v", err)
+		t.Fatalf("ExecuteTick(a) failed: %v", err)
+	}
+	out, err := op.ExecuteTick(node, map[string]types.Batch{"b": bBatch})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b) failed: %v", err)
 	}
 
 	// Only id=1 should join, NULL keys don't match

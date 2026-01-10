@@ -540,11 +540,9 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 					if err != nil {
 						return nil, err
 					}
-					// Chain: JOIN -> filter -> project
-					chainedOp := &op.ChainedOp{
-						Ops: []op.Operator{joinNode.Op, filterOp, projectOp},
-					}
-					return &op.Node{Op: chainedOp}, nil
+					// Unary pipeline applied on top of JOIN output
+					chainedOp := &op.ChainedOp{Ops: []op.Operator{filterOp, projectOp}}
+					return &op.Node{Op: chainedOp, Inputs: []*op.Node{joinNode}}, nil
 				}
 
 				// Chain: filter first, then project
@@ -556,10 +554,8 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				if err != nil {
 					return nil, err
 				}
-				chainedOp := &op.ChainedOp{
-					Ops: []op.Operator{joinNode.Op, projectOp},
-				}
-				return &op.Node{Op: chainedOp}, nil
+				chainedOp := &op.ChainedOp{Ops: []op.Operator{projectOp}}
+				return &op.Node{Op: chainedOp, Inputs: []*op.Node{joinNode}}, nil
 			}
 		}
 
@@ -710,14 +706,15 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 					},
 				}
 
-				// If filter is applied on top of a JOIN, we must execute JOIN first.
+				// If filter is applied on top of a JOIN, JOIN must be a real 2-input node.
+				// Wire it as: joinNode -> (filter then aggregate)
 				if join, ok := in.Input.(*LogicalJoin); ok {
 					joinNode, err := logicalJoinToDBSP(join)
 					if err != nil {
 						return nil, err
 					}
-					chainedOp := &op.ChainedOp{Ops: []op.Operator{joinNode.Op, filterOp, g}}
-					return &op.Node{Op: chainedOp}, nil
+					chainedOp := &op.ChainedOp{Ops: []op.Operator{filterOp, g}}
+					return &op.Node{Op: chainedOp, Inputs: []*op.Node{joinNode}}, nil
 				}
 
 				// Default: filter then aggregate
@@ -808,18 +805,13 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			g := op.NewGroupAggOp(keyFn, aggInit, agg)
 			g.SetKeyColName(key)
 
-			// Transform JOIN
 			joinNode, err := logicalJoinToDBSP(in)
 			if err != nil {
 				return nil, err
 			}
-
-			// Chain: JOIN -> GroupAgg
-			chainedOp := &op.ChainedOp{
-				Ops: []op.Operator{joinNode.Op, g},
-			}
-
-			return &op.Node{Op: chainedOp}, nil
+			// Unary aggregate applied on top of JOIN output
+			chainedOp := &op.ChainedOp{Ops: []op.Operator{g}}
+			return &op.Node{Op: chainedOp, Inputs: []*op.Node{joinNode}}, nil
 
 		default:
 			return nil, fmt.Errorf("unsupported input node to GroupAgg: %T", in)
@@ -1061,7 +1053,19 @@ func logicalJoinToDBSP(join *LogicalJoin) (*op.Node, error) {
 	// Create JoinOp
 	joinOp := op.NewJoinOp(leftKeyFn, rightKeyFn, combineFn)
 
-	return &op.Node{Op: joinOp}, nil
+	// For now JOIN inputs are scans (2-way join); model them as true 2-input DAG sources.
+	leftScan, ok := join.Left.(*LogicalScan)
+	if !ok {
+		return nil, fmt.Errorf("JOIN left input must be LogicalScan (got %T)", join.Left)
+	}
+	rightScan, ok := join.Right.(*LogicalScan)
+	if !ok {
+		return nil, fmt.Errorf("JOIN right input must be LogicalScan (got %T)", join.Right)
+	}
+
+	leftNode := &op.Node{Source: leftScan.Table}
+	rightNode := &op.Node{Source: rightScan.Table}
+	return &op.Node{Op: joinOp, Inputs: []*op.Node{leftNode, rightNode}}, nil
 }
 
 // logicalSortToDBSP transforms LogicalSort to SortOp

@@ -499,11 +499,11 @@ func TestDuckDBTPCHJoin_CustomerNation_SumOrderTotalPrice(t *testing.T) {
 	}
 
 	// Execute in two steps to avoid expensive ΔR⋈ΔS cross-product work.
-	_, err = op.Execute(root, customerBatch)
+	_, err = op.ExecuteTick(root, map[string]types.Batch{"customer": customerBatch})
 	if err != nil {
 		t.Fatalf("DBSP execute failed: %v", err)
 	}
-	_, err = op.Execute(root, ordersBatch)
+	_, err = op.ExecuteTick(root, map[string]types.Batch{"orders": ordersBatch})
 	if err != nil {
 		t.Fatalf("DBSP execute failed: %v", err)
 	}
@@ -596,11 +596,11 @@ func TestDuckDBTPCHJoin_FilteredOrdersStatus_ProjectedRows(t *testing.T) {
 
 	// Execute in two steps to avoid expensive ΔR⋈ΔS cross-product work.
 	var got map[string]int64
-	out1, err := op.Execute(root, customerBatch)
+	out1, err := op.ExecuteTick(root, map[string]types.Batch{"customer": customerBatch})
 	if err != nil {
 		t.Fatalf("DBSP execute failed: %v", err)
 	}
-	out2, err := op.Execute(root, ordersBatch)
+	out2, err := op.ExecuteTick(root, map[string]types.Batch{"orders": ordersBatch})
 	if err != nil {
 		t.Fatalf("DBSP execute failed: %v", err)
 	}
@@ -685,11 +685,11 @@ func TestDuckDBTPCHJoin_FilteredOrdersStatus_GroupSumByNation(t *testing.T) {
 	}
 
 	// Execute in two steps to avoid expensive ΔR⋈ΔS cross-product work.
-	_, err = op.Execute(root, customerBatch)
+	_, err = op.ExecuteTick(root, map[string]types.Batch{"customer": customerBatch})
 	if err != nil {
 		t.Fatalf("DBSP execute failed: %v", err)
 	}
-	_, err = op.Execute(root, ordersBatch)
+	_, err = op.ExecuteTick(root, map[string]types.Batch{"orders": ordersBatch})
 	if err != nil {
 		t.Fatalf("DBSP execute failed: %v", err)
 	}

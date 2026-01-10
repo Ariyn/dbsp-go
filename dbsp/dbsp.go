@@ -40,6 +40,7 @@ func (e *Engine) ApplyDML(table string, dml string, h *QueryHandle) ([]map[strin
 
 	var (
 		batch types.Batch
+		out   types.Batch
 		err   error
 	)
 
@@ -56,7 +57,25 @@ func (e *Engine) ApplyDML(table string, dml string, h *QueryHandle) ([]map[strin
 	// 테이블별 state 를 갱신한다.
 	e.store.ApplyBatch(table, batch)
 
-	out, err := op.Execute(h.node, batch)
+	sources := op.SourceNames(h.node)
+	if len(sources) > 0 {
+		seen := false
+		for _, s := range sources {
+			if s == table {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			// This DML does not affect the query inputs, so no output delta.
+			return nil, nil
+		}
+	}
+	if len(sources) > 1 {
+		out, err = op.ExecuteTick(h.node, map[string]types.Batch{table: batch})
+	} else {
+		out, err = op.Execute(h.node, batch)
+	}
 	if err != nil {
 		return nil, err
 	}

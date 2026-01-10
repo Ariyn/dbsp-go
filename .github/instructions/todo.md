@@ -8,12 +8,12 @@
 
 ## P0 (엔진 코어/정확성)
 
-- [ ] **그래프 실행 모델 구현**
+- [x] **그래프 실행 모델 구현**
   - 현재 `op.Execute`가 `root.Op.Apply(delta)`만 호출함 → `Node.Inputs` 기반 DAG 실행 필요
   - 목표: 단일/다중 입력 노드, topological order, 입력 라우팅(특히 BinaryOp), 재사용 가능한 실행기
   - 후보 파일: `internal/dbsp/op/operator.go`
 
-- [ ] **BinaryOp(Join/Union/Diff) 입력 모델 정리**
+- [x] **BinaryOp(Join/Union/Diff) 입력 모델 정리**
   - 현재 Join이 batch의 컬럼 존재 여부로 left/right를 추정 → 취약
   - 목표: left/right 스트림을 명시적으로 분리(예: 별도 노드/포트/태그)하고 실행기가 각 입력을 정확히 전달
   - 후보 파일: `internal/dbsp/op/binary.go`, `internal/dbsp/ir/transform.go`
