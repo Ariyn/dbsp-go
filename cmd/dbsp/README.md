@@ -124,8 +124,12 @@ pipeline:
 pipeline:
   transform:
     type: sql
+    join_ttl: "10 minutes"
     query: "SELECT time_bucket, SUM(amount) AS total_sales FROM sales GROUP BY time_bucket"
 ```
+
+- `join_ttl`(선택): 조인 상태를 처리시간 기준으로 만료시키는 TTL(예: `"10s"`, `"5 minutes"`).
+  - `0` 또는 미설정이면 TTL을 적용하지 않습니다.
 
 ## Sink 타입
 
