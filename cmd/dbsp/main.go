@@ -67,6 +67,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	if config.Pipeline.Transform.JoinTTL != "" {
+		ttl, err := parseJoinTTL(config.Pipeline.Transform.JoinTTL)
+		if err != nil {
+			fmt.Printf("Error parsing join_ttl: %v\n", err)
+			os.Exit(1)
+		}
+		if ttl > 0 {
+			applyJoinTTL(rootNode, ttl)
+			fmt.Printf("Applied join_ttl=%s\n", ttl)
+		}
+	}
+
 	// 4. Initialize Sink
 	var sink Sink
 	switch config.Pipeline.Sink.Type {

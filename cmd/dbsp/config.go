@@ -19,6 +19,9 @@ type SourceConfig struct {
 type TransformConfig struct {
 	Type  string `yaml:"type"` // e.g., "sql"
 	Query string `yaml:"query"`
+
+	// JoinTTL is an optional processing-time TTL for join state (e.g., "10s", "5 minutes").
+	JoinTTL string `yaml:"join_ttl"`
 }
 
 // SinkConfig defines the configuration for the data sink

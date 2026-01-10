@@ -2,6 +2,7 @@ package op
 
 import (
 	"testing"
+	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
@@ -319,5 +320,84 @@ func TestDifferenceOp(t *testing.T) {
 	}
 	if countById[2] != 0 {
 		t.Errorf("Expected net count 0 for id:2 (cancelled out), got %d", countById[2])
+	}
+}
+
+func TestJoinOp_StateCompaction(t *testing.T) {
+	joinOp := NewJoinOp(
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(l, r types.Tuple) types.Tuple {
+			return types.Tuple{"key": l["key"], "l": l["val"], "r": r["val"]}
+		},
+	)
+
+	// Seed right state once.
+	_, err := joinOp.ApplyBinary(nil, types.Batch{{Tuple: types.Tuple{"key": "k", "val": 10}, Count: 1}})
+	if err != nil {
+		t.Fatalf("ApplyBinary failed: %v", err)
+	}
+
+	// Repeated insert/delete on the same left tuple should not grow state.
+	for i := 0; i < 50; i++ {
+		_, err := joinOp.ApplyBinary(types.Batch{{Tuple: types.Tuple{"key": "k", "val": 1}, Count: 1}}, nil)
+		if err != nil {
+			t.Fatalf("ApplyBinary(insert) failed: %v", err)
+		}
+		_, err = joinOp.ApplyBinary(types.Batch{{Tuple: types.Tuple{"key": "k", "val": 1}, Count: -1}}, nil)
+		if err != nil {
+			t.Fatalf("ApplyBinary(delete) failed: %v", err)
+		}
+	}
+
+	if len(joinOp.leftState) != 0 {
+		t.Fatalf("expected leftState to be empty after net-zero churn, got %d keys", len(joinOp.leftState))
+	}
+	if len(joinOp.rightState) != 1 {
+		t.Fatalf("expected rightState to keep seeded key, got %d keys", len(joinOp.rightState))
+	}
+}
+
+func TestJoinOp_TTLExpiryRetractsOutput(t *testing.T) {
+	now := time.Unix(0, 0)
+	joinOp := NewJoinOp(
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(l, r types.Tuple) types.Tuple {
+			return types.Tuple{"key": l["key"], "l_val": l["val"], "r_val": r["val"]}
+		},
+	)
+	joinOp.JoinTTL = 10 * time.Second
+	joinOp.Now = func() time.Time { return now }
+
+	// Insert one row on each side -> produces +1 join.
+	out1, err := joinOp.ApplyBinary(
+		types.Batch{{Tuple: types.Tuple{"key": "k", "val": 1}, Count: 1}},
+		types.Batch{{Tuple: types.Tuple{"key": "k", "val": 10}, Count: 1}},
+	)
+	if err != nil {
+		t.Fatalf("ApplyBinary failed: %v", err)
+	}
+	if len(out1) != 1 || out1[0].Count != 1 {
+		t.Fatalf("expected one +1 join output, got %v", out1)
+	}
+
+	// Advance time beyond TTL and call with empty deltas -> should retract.
+	now = now.Add(11 * time.Second)
+	out2, err := joinOp.ApplyBinary(nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary failed: %v", err)
+	}
+	if len(out2) != 1 {
+		t.Fatalf("expected one retraction due to TTL expiry, got %v", out2)
+	}
+	if out2[0].Count != -1 {
+		t.Fatalf("expected retraction count -1, got %d", out2[0].Count)
+	}
+	if out2[0].Tuple["key"] != "k" || out2[0].Tuple["l_val"] != 1 || out2[0].Tuple["r_val"] != 10 {
+		t.Fatalf("unexpected retraction tuple: %+v", out2[0].Tuple)
+	}
+	if len(joinOp.leftState) != 0 || len(joinOp.rightState) != 0 {
+		t.Fatalf("expected join state to be empty after TTL eviction, left=%d right=%d", len(joinOp.leftState), len(joinOp.rightState))
 	}
 }

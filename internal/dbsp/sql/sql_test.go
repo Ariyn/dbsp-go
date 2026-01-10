@@ -1674,7 +1674,7 @@ func TestParseTimeWindowSQL_Session(t *testing.T) {
 
 func TestTimeWindowIntegration(t *testing.T) {
 	t.Skip("Requires manual TimeWindowSpec creation until parser supports it")
-	
+
 	// Create a manual LogicalWindowAgg with TimeWindowSpec
 	timeWindowSpec := &ir.TimeWindowSpec{
 		WindowType:  "TUMBLING",
@@ -1683,9 +1683,9 @@ func TestTimeWindowIntegration(t *testing.T) {
 		SlideMillis: 0,
 		GapMillis:   0,
 	}
-	
+
 	scan := &ir.LogicalScan{Table: "events"}
-	
+
 	wa := &ir.LogicalWindowAgg{
 		AggName:        "SUM",
 		AggCol:         "amount",
@@ -1694,44 +1694,44 @@ func TestTimeWindowIntegration(t *testing.T) {
 		OutputCol:      "total",
 		Input:          scan,
 	}
-	
+
 	// Convert to DBSP
 	node, err := ir.LogicalToDBSP(wa)
 	if err != nil {
 		t.Fatalf("LogicalToDBSP failed: %v", err)
 	}
-	
+
 	// Verify WindowAggOp was created
 	windowOp, ok := node.Op.(*op.WindowAggOp)
 	if !ok {
 		t.Fatalf("expected WindowAggOp, got %T", node.Op)
 	}
-	
+
 	if windowOp.Spec.WindowType != op.WindowTypeTumbling {
 		t.Errorf("expected TUMBLING window type")
 	}
-	
+
 	if windowOp.Spec.TimeCol != "ts" {
 		t.Errorf("expected TimeCol=ts, got %s", windowOp.Spec.TimeCol)
 	}
-	
+
 	// Test with batch
 	batch := types.Batch{
 		{Tuple: types.Tuple{"ts": int64(100000), "region": "East", "amount": 100.0}, Count: 1},
 		{Tuple: types.Tuple{"ts": int64(350000), "region": "East", "amount": 200.0}, Count: 1},
 		{Tuple: types.Tuple{"ts": int64(100000), "region": "West", "amount": 50.0}, Count: 1},
 	}
-	
+
 	out, err := windowOp.Apply(batch)
 	if err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
-	
+
 	// Should have multiple window results
 	if len(out) == 0 {
 		t.Error("expected window results")
 	}
-	
+
 	t.Logf("Window results: %d deltas", len(out))
 	for i, td := range out {
 		t.Logf("  [%d] %+v", i, td.Tuple)

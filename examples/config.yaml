@@ -20,6 +20,7 @@ pipeline:
               product: string
   transform:
     type: sql
+    join_ttl: "10 minutes"
     query: "SELECT time_bucket, SUM(amount) as total_sales FROM sales GROUP BY time_bucket"
   sink:
     type: console

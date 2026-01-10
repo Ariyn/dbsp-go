@@ -18,9 +18,10 @@
   - 목표: left/right 스트림을 명시적으로 분리(예: 별도 노드/포트/태그)하고 실행기가 각 입력을 정확히 전달
   - 후보 파일: `internal/dbsp/op/binary.go`, `internal/dbsp/ir/transform.go`
 
-- [ ] **Join 상태(compaction) 및 메모리 누수 방지**
-  - 현재 `leftState/rightState`가 `[]TupleDelta` append-only
-  - 목표: multiset(튜플→count) 형태로 정규화, count==0 제거, 장기 실행에서 상태가 커지지 않도록 GC/정리 규칙 추가
+- [x] **Join 상태(compaction) 및 메모리 누수 방지**
+  - 기존 `leftState/rightState`의 `[]TupleDelta` append-only를 multiset(튜플→count)로 정규화
+  - count==0 제거로 churn 시 상태 증가 방지
+  - 안정성 강화를 위해 처리시간 기반 TTL(만료 시 join 결과 리트랙션) 옵션 추가
   - 후보 파일: `internal/dbsp/op/binary.go`
 
 - [ ] **Integrate/Delay를 실제 operator로 정착(또는 설계 재정의)**
