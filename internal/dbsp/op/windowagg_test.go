@@ -238,6 +238,330 @@ func TestWindowAggOp_CountWithDeletions(t *testing.T) {
 	}
 }
 
+func TestWindowAggOp_TumblingCount_Delete(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling}
+	keyFn := func(t types.Tuple) any { return t["region"] }
+	aggInit := func() any { return int64(0) }
+	agg := &CountAgg{}
+
+	op := NewWindowAggOp(spec, keyFn, []string{"region"}, aggInit, agg)
+
+	ins := types.Batch{
+		{Tuple: types.Tuple{"region": "East", "ts": int64(1)}, Count: 1},
+		{Tuple: types.Tuple{"region": "East", "ts": int64(2)}, Count: 1},
+	}
+	outIns, err := op.Apply(ins)
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(outIns) != 2 {
+		t.Fatalf("expected 2 output deltas on insert, got %d (%+v)", len(outIns), outIns)
+	}
+	for _, td := range outIns {
+		if td.Count != 1 {
+			t.Fatalf("expected output Count=1, got %d (%+v)", td.Count, td)
+		}
+		if td.Tuple["__window_start"] != int64(0) || td.Tuple["__window_end"] != int64(10) {
+			t.Fatalf("expected window [0,10), got start=%v end=%v (%+v)", td.Tuple["__window_start"], td.Tuple["__window_end"], td)
+		}
+		if td.Tuple["region"] != "East" {
+			t.Fatalf("expected region=East, got %v (%+v)", td.Tuple["region"], td)
+		}
+		d, ok := td.Tuple["count_delta"].(int64)
+		if !ok {
+			t.Fatalf("expected count_delta int64, got %T (%+v)", td.Tuple["count_delta"], td)
+		}
+		if d != 1 {
+			t.Fatalf("expected count_delta=1, got %v (%+v)", d, td)
+		}
+	}
+
+	del := types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(2)}, Count: -1}}
+	outDel, err := op.Apply(del)
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(outDel) != 1 {
+		t.Fatalf("expected 1 output delta on delete, got %d (%+v)", len(outDel), outDel)
+	}
+	if outDel[0].Count != 1 {
+		t.Fatalf("expected output Count=1, got %d (%+v)", outDel[0].Count, outDel[0])
+	}
+	if outDel[0].Tuple["__window_start"] != int64(0) || outDel[0].Tuple["__window_end"] != int64(10) {
+		t.Fatalf("expected window [0,10), got start=%v end=%v (%+v)", outDel[0].Tuple["__window_start"], outDel[0].Tuple["__window_end"], outDel[0])
+	}
+	if outDel[0].Tuple["region"] != "East" {
+		t.Fatalf("expected region=East, got %v (%+v)", outDel[0].Tuple["region"], outDel[0])
+	}
+	d, ok := outDel[0].Tuple["count_delta"].(int64)
+	if !ok {
+		t.Fatalf("expected count_delta int64, got %T (%+v)", outDel[0].Tuple["count_delta"], outDel[0])
+	}
+	if d != -1 {
+		t.Fatalf("expected count_delta=-1, got %v (%+v)", d, outDel[0])
+	}
+}
+
+func TestWindowAggOp_SlidingSum_DeleteMultiWindows(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, SlideMillis: 5, WindowType: WindowTypeSliding}
+	keyFn := func(t types.Tuple) any { return nil }
+	aggInit := func() any { return float64(0) }
+	agg := &SumAgg{ColName: "v"}
+
+	op := NewWindowAggOp(spec, keyFn, []string{}, aggInit, agg)
+
+	ins := types.Batch{{Tuple: types.Tuple{"ts": int64(7), "v": float64(10)}, Count: 1}}
+	outIns, err := op.Apply(ins)
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(outIns) != 2 {
+		t.Fatalf("expected 2 window deltas on insert (ts=7 belongs to 2 sliding windows), got %d (%+v)", len(outIns), outIns)
+	}
+	seen := make(map[[2]int64]float64)
+	for _, td := range outIns {
+		start, _ := td.Tuple["__window_start"].(int64)
+		end, _ := td.Tuple["__window_end"].(int64)
+		d, ok := td.Tuple["agg_delta"].(float64)
+		if !ok {
+			t.Fatalf("expected agg_delta float64, got %T (%+v)", td.Tuple["agg_delta"], td)
+		}
+		seen[[2]int64{start, end}] += d
+	}
+	if seen[[2]int64{0, 10}] != 10.0 {
+		t.Fatalf("expected agg_delta +10 for window [0,10), got %v (out=%+v)", seen[[2]int64{0, 10}], outIns)
+	}
+	if seen[[2]int64{5, 15}] != 10.0 {
+		t.Fatalf("expected agg_delta +10 for window [5,15), got %v (out=%+v)", seen[[2]int64{5, 15}], outIns)
+	}
+
+	del := types.Batch{{Tuple: types.Tuple{"ts": int64(7), "v": float64(10)}, Count: -1}}
+	outDel, err := op.Apply(del)
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(outDel) != 2 {
+		t.Fatalf("expected 2 window deltas on delete, got %d (%+v)", len(outDel), outDel)
+	}
+	seenDel := make(map[[2]int64]float64)
+	for _, td := range outDel {
+		start, _ := td.Tuple["__window_start"].(int64)
+		end, _ := td.Tuple["__window_end"].(int64)
+		d, ok := td.Tuple["agg_delta"].(float64)
+		if !ok {
+			t.Fatalf("expected agg_delta float64, got %T (%+v)", td.Tuple["agg_delta"], td)
+		}
+		seenDel[[2]int64{start, end}] += d
+	}
+	if seenDel[[2]int64{0, 10}] != -10.0 {
+		t.Fatalf("expected agg_delta -10 for window [0,10), got %v (out=%+v)", seenDel[[2]int64{0, 10}], outDel)
+	}
+	if seenDel[[2]int64{5, 15}] != -10.0 {
+		t.Fatalf("expected agg_delta -10 for window [5,15), got %v (out=%+v)", seenDel[[2]int64{5, 15}], outDel)
+	}
+}
+
+func TestWindowAggOp_TumblingMin_DuplicateDeleteNoChangeThenChange(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling}
+	keyFn := func(t types.Tuple) any { return t["region"] }
+	aggInit := func() any { return NewSortedMultiset() }
+	agg := &MinAgg{ColName: "v"}
+
+	op := NewWindowAggOp(spec, keyFn, []string{"region"}, aggInit, agg)
+
+	ins := types.Batch{
+		{Tuple: types.Tuple{"region": "East", "ts": int64(1), "v": int64(10)}, Count: 1},
+		{Tuple: types.Tuple{"region": "East", "ts": int64(2), "v": int64(10)}, Count: 1},
+		{Tuple: types.Tuple{"region": "East", "ts": int64(3), "v": int64(20)}, Count: 1},
+	}
+	outIns, err := op.Apply(ins)
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(outIns) != 1 {
+		t.Fatalf("expected exactly 1 delta when initial min is established, got %d (%+v)", len(outIns), outIns)
+	}
+	if outIns[0].Tuple["min"] != "10" {
+		t.Fatalf("expected min=10, got %v (%+v)", outIns[0].Tuple["min"], outIns[0])
+	}
+	if outIns[0].Tuple["__window_start"] != int64(0) || outIns[0].Tuple["__window_end"] != int64(10) {
+		t.Fatalf("expected window [0,10), got start=%v end=%v", outIns[0].Tuple["__window_start"], outIns[0].Tuple["__window_end"])
+	}
+	if outIns[0].Tuple["region"] != "East" {
+		t.Fatalf("expected region=East, got %v", outIns[0].Tuple["region"])
+	}
+
+	// Delete one duplicate min (10). Min should remain 10 -> no output.
+	outDel1, err := op.Apply(types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(2), "v": int64(10)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete1) failed: %v", err)
+	}
+	if len(outDel1) != 0 {
+		t.Fatalf("expected no delta when deleting non-last duplicate min, got %d (%+v)", len(outDel1), outDel1)
+	}
+
+	// Delete the last remaining 10. Min should change to 20 -> one output.
+	outDel2, err := op.Apply(types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(1), "v": int64(10)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete2) failed: %v", err)
+	}
+	if len(outDel2) != 1 {
+		t.Fatalf("expected 1 delta when min changes, got %d (%+v)", len(outDel2), outDel2)
+	}
+	if outDel2[0].Tuple["min"] != "20" {
+		t.Fatalf("expected min=20 after deleting last 10, got %v (%+v)", outDel2[0].Tuple["min"], outDel2[0])
+	}
+}
+
+func TestWindowAggOp_TumblingMax_DuplicateDeleteNoChangeThenChange(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling}
+	keyFn := func(t types.Tuple) any { return nil }
+	aggInit := func() any { return NewSortedMultiset() }
+	agg := &MaxAgg{ColName: "v"}
+
+	op := NewWindowAggOp(spec, keyFn, []string{}, aggInit, agg)
+
+	ins := types.Batch{
+		{Tuple: types.Tuple{"ts": int64(1), "v": int64(30)}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(2), "v": int64(20)}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(3), "v": int64(30)}, Count: 1},
+	}
+	outIns, err := op.Apply(ins)
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(outIns) != 1 {
+		t.Fatalf("expected exactly 1 delta when initial max is established, got %d (%+v)", len(outIns), outIns)
+	}
+	if outIns[0].Tuple["max"] != "30" {
+		t.Fatalf("expected max=30, got %v (%+v)", outIns[0].Tuple["max"], outIns[0])
+	}
+
+	// Delete one duplicate max (30). Max should remain 30 -> no output.
+	outDel1, err := op.Apply(types.Batch{{Tuple: types.Tuple{"ts": int64(3), "v": int64(30)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete1) failed: %v", err)
+	}
+	if len(outDel1) != 0 {
+		t.Fatalf("expected no delta when deleting non-last duplicate max, got %d (%+v)", len(outDel1), outDel1)
+	}
+
+	// Delete the last remaining 30. Max should change to 20 -> one output.
+	outDel2, err := op.Apply(types.Batch{{Tuple: types.Tuple{"ts": int64(1), "v": int64(30)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete2) failed: %v", err)
+	}
+	if len(outDel2) != 1 {
+		t.Fatalf("expected 1 delta when max changes, got %d (%+v)", len(outDel2), outDel2)
+	}
+	if outDel2[0].Tuple["max"] != "20" {
+		t.Fatalf("expected max=20 after deleting last 30, got %v (%+v)", outDel2[0].Tuple["max"], outDel2[0])
+	}
+}
+
+func TestWindowAggOp_TumblingMin_DeleteToEmpty_EmitsNil(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling}
+	keyFn := func(t types.Tuple) any { return nil }
+	aggInit := func() any { return NewSortedMultiset() }
+	agg := &MinAgg{ColName: "v"}
+
+	op := NewWindowAggOp(spec, keyFn, []string{}, aggInit, agg)
+
+	outIns, err := op.Apply(types.Batch{{Tuple: types.Tuple{"ts": int64(1), "v": int64(10)}, Count: 1}})
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(outIns) != 1 || outIns[0].Tuple["min"] != "10" {
+		t.Fatalf("expected one delta min=10, got %v", outIns)
+	}
+
+	outDel, err := op.Apply(types.Batch{{Tuple: types.Tuple{"ts": int64(1), "v": int64(10)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(outDel) != 1 {
+		t.Fatalf("expected one delta when min becomes nil, got %v", outDel)
+	}
+	if outDel[0].Tuple["min"] != nil {
+		t.Fatalf("expected min=nil after deleting last value, got %v (%+v)", outDel[0].Tuple["min"], outDel[0])
+	}
+	if outDel[0].Tuple["__window_start"] != int64(0) || outDel[0].Tuple["__window_end"] != int64(10) {
+		t.Fatalf("expected window [0,10), got start=%v end=%v", outDel[0].Tuple["__window_start"], outDel[0].Tuple["__window_end"])
+	}
+}
+
+func TestWindowAggOp_SlidingMin_DeleteAffectsMultipleWindows(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, SlideMillis: 5, WindowType: WindowTypeSliding}
+	keyFn := func(t types.Tuple) any { return nil }
+	aggInit := func() any { return NewSortedMultiset() }
+	agg := &MinAgg{ColName: "v"}
+
+	op := NewWindowAggOp(spec, keyFn, []string{}, aggInit, agg)
+
+	// Insert two values at ts=7 (belongs to [0,10) and [5,15)). min becomes 10.
+	_, err := op.Apply(types.Batch{
+		{Tuple: types.Tuple{"ts": int64(7), "v": int64(10)}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(7), "v": int64(20)}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+
+	// Delete the min (10). min becomes 20 in both windows -> two outputs.
+	outDel, err := op.Apply(types.Batch{{Tuple: types.Tuple{"ts": int64(7), "v": int64(10)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(outDel) != 2 {
+		t.Fatalf("expected 2 deltas (2 windows) when min changes, got %d (%+v)", len(outDel), outDel)
+	}
+	seen := make(map[[2]int64]any)
+	for _, td := range outDel {
+		start, _ := td.Tuple["__window_start"].(int64)
+		end, _ := td.Tuple["__window_end"].(int64)
+		seen[[2]int64{start, end}] = td.Tuple["min"]
+	}
+	if seen[[2]int64{0, 10}] != "20" {
+		t.Fatalf("expected min=20 for window [0,10), got %v (%+v)", seen[[2]int64{0, 10}], outDel)
+	}
+	if seen[[2]int64{5, 15}] != "20" {
+		t.Fatalf("expected min=20 for window [5,15), got %v (%+v)", seen[[2]int64{5, 15}], outDel)
+	}
+}
+
+func TestWindowAggOp_TumblingMax_DeleteAffectsOnlyThatGroup(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling}
+	keyFn := func(t types.Tuple) any { return t["region"] }
+	aggInit := func() any { return NewSortedMultiset() }
+	agg := &MaxAgg{ColName: "v"}
+
+	op := NewWindowAggOp(spec, keyFn, []string{"region"}, aggInit, agg)
+
+	_, err := op.Apply(types.Batch{
+		{Tuple: types.Tuple{"region": "East", "ts": int64(1), "v": int64(10)}, Count: 1},
+		{Tuple: types.Tuple{"region": "East", "ts": int64(2), "v": int64(20)}, Count: 1},
+		{Tuple: types.Tuple{"region": "West", "ts": int64(3), "v": int64(30)}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+
+	// Delete East's max (20): should emit only one delta for East, max becomes 10.
+	outDel, err := op.Apply(types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(2), "v": int64(20)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(outDel) != 1 {
+		t.Fatalf("expected 1 delta for East max change, got %d (%+v)", len(outDel), outDel)
+	}
+	if outDel[0].Tuple["region"] != "East" {
+		t.Fatalf("expected region=East, got %v (%+v)", outDel[0].Tuple["region"], outDel[0])
+	}
+	if outDel[0].Tuple["max"] != "10" {
+		t.Fatalf("expected max=10 after deleting East's 20, got %v (%+v)", outDel[0].Tuple["max"], outDel[0])
+	}
+}
+
 func TestWindowAggOp_MinMaxWithFrame(t *testing.T) {
 	// Test MIN/MAX with frame
 	frameSpec := &FrameSpecLite{
@@ -320,7 +644,7 @@ func TestWindowAggOp_SlidingWindow(t *testing.T) {
 	for i, td := range out {
 		start := td.Tuple["__window_start"]
 		end := td.Tuple["__window_end"]
-		t.Logf("  [%d] window=[%v, %v) count=%d region=%v", 
+		t.Logf("  [%d] window=[%v, %v) count=%d region=%v",
 			i, start, end, td.Count, td.Tuple["region"])
 	}
 
@@ -405,7 +729,7 @@ func TestWindowAggOp_SessionWindow(t *testing.T) {
 	for i, td := range out {
 		start := td.Tuple["__window_start"]
 		end := td.Tuple["__window_end"]
-		t.Logf("  [%d] session=[%v, %v) count=%d user=%v", 
+		t.Logf("  [%d] session=[%v, %v) count=%d user=%v",
 			i, start, end, td.Count, td.Tuple["user"])
 	}
 
@@ -436,7 +760,7 @@ func TestWindowAggOp_SessionWindowMultipleUsers(t *testing.T) {
 		{Tuple: types.Tuple{"user": "Alice", "ts": int64(1000)}, Count: 1},
 		{Tuple: types.Tuple{"user": "Bob", "ts": int64(1500)}, Count: 1},
 		{Tuple: types.Tuple{"user": "Alice", "ts": int64(2000)}, Count: 1},
-		{Tuple: types.Tuple{"user": "Bob", "ts": int64(6000)}, Count: 1}, // Bob's new session
+		{Tuple: types.Tuple{"user": "Bob", "ts": int64(6000)}, Count: 1},   // Bob's new session
 		{Tuple: types.Tuple{"user": "Alice", "ts": int64(7000)}, Count: 1}, // Alice's new session
 	}
 
@@ -450,7 +774,7 @@ func TestWindowAggOp_SessionWindowMultipleUsers(t *testing.T) {
 		start := td.Tuple["__window_start"]
 		end := td.Tuple["__window_end"]
 		user := td.Tuple["user"]
-		t.Logf("  [%d] user=%v session=[%v, %v) count=%d", 
+		t.Logf("  [%d] user=%v session=[%v, %v) count=%d",
 			i, user, start, end, td.Count)
 	}
 
@@ -493,4 +817,3 @@ func TestInterval_Parse(t *testing.T) {
 		})
 	}
 }
-

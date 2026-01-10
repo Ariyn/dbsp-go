@@ -42,6 +42,15 @@
   - Join + delete, Join+Agg + delete, Window + delete 같은 케이스가 핵심
   - DuckDB 대비 통합 테스트를 Join/Window로 확대
   - 후보 파일: `internal/dbsp/sql/duckdb_tpch_integration_test.go`, `internal/dbsp/op/*_test.go`
+  - [x] SQL JOIN delete/retraction 테스트 추가
+  - [x] SQL JOIN+GROUP BY delete/retraction 테스트 추가
+  - [x] Window(TUMBLING/SLIDING) delete 델타 assert 테스트 추가
+  - [x] DuckDB TPCH JOIN+AGG incremental delete 통합 테스트 추가
+  - [x] DuckDB 대비 Window incremental delete 통합 테스트 확대
+  - [x] Join TTL 만료(retraction) 엣지 케이스 팩(5개) 추가
+  - [x] Window MIN/MAX delete 엣지 케이스 팩(5개) 추가
+  - [x] 순서독립/상쇄 성질 테스트 팩(5개) 추가
+  - [x] DuckDB 대비 Sliding window delete 통합 테스트 팩(5개) 추가
 
 ---
 

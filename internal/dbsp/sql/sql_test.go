@@ -1,12 +1,41 @@
 package sqlconv
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/ariyn/dbsp/internal/dbsp/ir"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
+
+func batchToCountMap(b types.Batch) map[string]int64 {
+	m := make(map[string]int64)
+	for _, td := range b {
+		m[tupleKey(td.Tuple)] += td.Count
+	}
+	return m
+}
+
+func tupleKey(tup types.Tuple) string {
+	keys := make([]string, 0, len(tup))
+	for k := range tup {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteString("|")
+		}
+		sb.WriteString(k)
+		sb.WriteString("=")
+		sb.WriteString(fmt.Sprintf("%v", tup[k]))
+	}
+	return sb.String()
+}
 
 // ============================================================================
 // Query Parsing and Conversion Tests
@@ -135,6 +164,100 @@ func TestParseQueryJoinSimple(t *testing.T) {
 	}
 }
 
+func TestParseQueryJoinSimple_DeleteLeft(t *testing.T) {
+	q := "SELECT a.id, a.k, b.v FROM a JOIN b ON a.id = b.id"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with JOIN failed: %v", err)
+	}
+	if node == nil || node.Op == nil {
+		t.Fatalf("expected node with op, got nil")
+	}
+
+	// Insert both sides to create one joined row.
+	aIns := types.Batch{{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1}}
+	bIns := types.Batch{{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: 1}}
+
+	_, err = op.ExecuteTick(node, map[string]types.Batch{"a": aIns})
+	if err != nil {
+		t.Fatalf("ExecuteTick(a insert) failed: %v", err)
+	}
+	outIns, err := op.ExecuteTick(node, map[string]types.Batch{"b": bIns})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b insert) failed: %v", err)
+	}
+	gotIns := batchToCountMap(outIns)
+	wantIns := map[string]int64{tupleKey(types.Tuple{"a.id": 1, "a.k": "A", "b.v": 10}): 1}
+	if len(gotIns) != len(wantIns) {
+		t.Fatalf("insert: expected %d distinct tuples, got %d (%+v)", len(wantIns), len(gotIns), outIns)
+	}
+	for k, want := range wantIns {
+		if got := gotIns[k]; got != want {
+			t.Fatalf("insert: tuple %q count mismatch: got %d, want %d (out=%+v)", k, got, want, outIns)
+		}
+	}
+
+	// Delete left row; should retract the joined output.
+	aDel := types.Batch{{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: -1}}
+	outDel, err := op.ExecuteTick(node, map[string]types.Batch{"a": aDel})
+	if err != nil {
+		t.Fatalf("ExecuteTick(a delete) failed: %v", err)
+	}
+	gotDel := batchToCountMap(outDel)
+	wantDel := map[string]int64{tupleKey(types.Tuple{"a.id": 1, "a.k": "A", "b.v": 10}): -1}
+	if len(gotDel) != len(wantDel) {
+		t.Fatalf("delete: expected %d distinct tuples, got %d (%+v)", len(wantDel), len(gotDel), outDel)
+	}
+	for k, want := range wantDel {
+		if got := gotDel[k]; got != want {
+			t.Fatalf("delete: tuple %q count mismatch: got %d, want %d (out=%+v)", k, got, want, outDel)
+		}
+	}
+}
+
+func TestParseQueryJoinSimple_DeleteRightMultiplicity(t *testing.T) {
+	q := "SELECT a.id, a.k, b.v FROM a JOIN b ON a.id = b.id"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with JOIN failed: %v", err)
+	}
+	if node == nil || node.Op == nil {
+		t.Fatalf("expected node with op, got nil")
+	}
+
+	// Insert two identical left rows (multiplicity 2) and one right row.
+	aIns := types.Batch{
+		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
+		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
+	}
+	bIns := types.Batch{{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: 1}}
+
+	_, err = op.ExecuteTick(node, map[string]types.Batch{"a": aIns})
+	if err != nil {
+		t.Fatalf("ExecuteTick(a insert) failed: %v", err)
+	}
+	outIns, err := op.ExecuteTick(node, map[string]types.Batch{"b": bIns})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b insert) failed: %v", err)
+	}
+	gotIns := batchToCountMap(outIns)
+	wantKey := tupleKey(types.Tuple{"a.id": 1, "a.k": "A", "b.v": 10})
+	if got := gotIns[wantKey]; got != 2 {
+		t.Fatalf("insert: expected joined multiplicity 2, got %d (out=%+v)", got, outIns)
+	}
+
+	// Delete right row; should retract both joined rows (count -2).
+	bDel := types.Batch{{Tuple: types.Tuple{"b.id": 1, "b.v": 10}, Count: -1}}
+	outDel, err := op.ExecuteTick(node, map[string]types.Batch{"b": bDel})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b delete) failed: %v", err)
+	}
+	gotDel := batchToCountMap(outDel)
+	if got := gotDel[wantKey]; got != -2 {
+		t.Fatalf("delete: expected joined retraction -2, got %d (out=%+v)", got, outDel)
+	}
+}
+
 func TestParseQueryJoinWithWhere(t *testing.T) {
 	q := "SELECT a.id, a.k, b.v FROM a JOIN b ON a.id = b.id WHERE b.v > 10"
 	node, err := ParseQueryToDBSP(q)
@@ -231,6 +354,34 @@ func TestParseQueryJoinGroupBy(t *testing.T) {
 	// B: 5
 	if state["B"] != 5.0 {
 		t.Errorf("expected B=5, got %v", state["B"])
+	}
+
+	// Delete a joined row contribution (b.id=2, v=20) and verify retraction.
+	bDel := types.Batch{{Tuple: types.Tuple{"b.id": 2, "b.v": 20}, Count: -1}}
+	outDel, err := op.ExecuteTick(node, map[string]types.Batch{"b": bDel})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b delete) failed: %v", err)
+	}
+	if len(outDel) != 1 {
+		t.Fatalf("expected 1 aggregate delta on delete, got %d (%+v)", len(outDel), outDel)
+	}
+	if outDel[0].Count != 1 {
+		t.Fatalf("expected output delta Count=1, got %d (%+v)", outDel[0].Count, outDel[0])
+	}
+	if outDel[0].Tuple["a.k"] != "A" {
+		t.Fatalf("expected key a.k='A', got %v (%+v)", outDel[0].Tuple["a.k"], outDel[0])
+	}
+	delta, ok := outDel[0].Tuple["agg_delta"].(float64)
+	if !ok {
+		t.Fatalf("expected agg_delta float64, got %T (%+v)", outDel[0].Tuple["agg_delta"], outDel[0])
+	}
+	if delta != -20.0 {
+		t.Fatalf("expected agg_delta=-20, got %v (%+v)", delta, outDel[0])
+	}
+
+	state2 := gop.State()
+	if state2["A"] != 10.0 {
+		t.Errorf("expected A=10 after delete, got %v", state2["A"])
 	}
 }
 

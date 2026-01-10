@@ -1,11 +1,33 @@
 package op
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
+
+func testStableTupleKey(t types.Tuple) string {
+	b, err := json.Marshal(t)
+	if err == nil {
+		return string(b)
+	}
+	return "<unmarshalable>"
+}
+
+func testBatchToCountMap(b types.Batch) map[string]int64 {
+	m := make(map[string]int64)
+	for _, td := range b {
+		m[testStableTupleKey(td.Tuple)] += td.Count
+	}
+	for k, v := range m {
+		if v == 0 {
+			delete(m, k)
+		}
+	}
+	return m
+}
 
 func TestJoinOp_SimpleJoin(t *testing.T) {
 	// Create a simple join: Orders JOIN Customers on customer_id
@@ -399,5 +421,251 @@ func TestJoinOp_TTLExpiryRetractsOutput(t *testing.T) {
 	}
 	if len(joinOp.leftState) != 0 || len(joinOp.rightState) != 0 {
 		t.Fatalf("expected join state to be empty after TTL eviction, left=%d right=%d", len(joinOp.leftState), len(joinOp.rightState))
+	}
+}
+
+func TestJoinOp_TTLExpiryRetractsOutput_MultiplicityProduct(t *testing.T) {
+	now := time.Unix(0, 0)
+	joinOp := NewJoinOp(
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(l, r types.Tuple) types.Tuple {
+			return types.Tuple{"key": l["key"], "l": l["l"], "r": r["r"]}
+		},
+	)
+	joinOp.JoinTTL = 10 * time.Second
+	joinOp.Now = func() time.Time { return now }
+
+	// left count=2, right count=3 => join output +6, TTL expiry => -6
+	out1, err := joinOp.ApplyBinary(
+		types.Batch{{Tuple: types.Tuple{"key": "k", "l": 1}, Count: 2}},
+		types.Batch{{Tuple: types.Tuple{"key": "k", "r": 10}, Count: 3}},
+	)
+	if err != nil {
+		t.Fatalf("ApplyBinary failed: %v", err)
+	}
+	if len(out1) != 1 || out1[0].Count != 6 {
+		t.Fatalf("expected one +6 join output, got %v", out1)
+	}
+
+	now = now.Add(11 * time.Second)
+	out2, err := joinOp.ApplyBinary(nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary failed: %v", err)
+	}
+	if len(out2) != 1 || out2[0].Count != -6 {
+		t.Fatalf("expected one -6 retraction due to TTL expiry, got %v", out2)
+	}
+}
+
+func TestJoinOp_TTLExpiry_LeftExpiresRightRemains_NoSecondRetract(t *testing.T) {
+	now := time.Unix(0, 0)
+	joinOp := NewJoinOp(
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(l, r types.Tuple) types.Tuple {
+			return types.Tuple{"key": l["key"], "l": l["l"], "r": r["r"]}
+		},
+	)
+	joinOp.JoinTTL = 10 * time.Second
+	joinOp.Now = func() time.Time { return now }
+
+	// left at t=0
+	_, err := joinOp.ApplyBinary(types.Batch{{Tuple: types.Tuple{"key": "k", "l": 1}, Count: 1}}, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(left) failed: %v", err)
+	}
+
+	// right at t=5 -> produces +1 join
+	now = now.Add(5 * time.Second)
+	out1, err := joinOp.ApplyBinary(nil, types.Batch{{Tuple: types.Tuple{"key": "k", "r": 10}, Count: 1}})
+	if err != nil {
+		t.Fatalf("ApplyBinary(right) failed: %v", err)
+	}
+	if len(out1) != 1 || out1[0].Count != 1 {
+		t.Fatalf("expected one +1 join output, got %v", out1)
+	}
+
+	// t=11: left expired (t=10), right still alive (t=15) -> retract -1, right remains
+	now = time.Unix(0, 0).Add(11 * time.Second)
+	out2, err := joinOp.ApplyBinary(nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(evict) failed: %v", err)
+	}
+	if len(out2) != 1 || out2[0].Count != -1 {
+		t.Fatalf("expected one -1 retraction due to left TTL expiry, got %v", out2)
+	}
+	if len(joinOp.leftState) != 0 {
+		t.Fatalf("expected leftState empty after eviction, got %d keys", len(joinOp.leftState))
+	}
+	if len(joinOp.rightState) != 1 {
+		t.Fatalf("expected rightState still present after left eviction, got %d keys", len(joinOp.rightState))
+	}
+
+	// t=16: right expired, but no left => no further retractions
+	now = time.Unix(0, 0).Add(16 * time.Second)
+	out3, err := joinOp.ApplyBinary(nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(evict2) failed: %v", err)
+	}
+	if len(out3) != 0 {
+		t.Fatalf("expected no output when only right expires with empty left, got %v", out3)
+	}
+	if len(joinOp.rightState) != 0 {
+		t.Fatalf("expected rightState empty after eviction, got %d keys", len(joinOp.rightState))
+	}
+}
+
+func TestJoinOp_TTLExpiry_BothSidesMultipleTuples_RetractsAllPairsOnce(t *testing.T) {
+	now := time.Unix(0, 0)
+	joinOp := NewJoinOp(
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(l, r types.Tuple) types.Tuple {
+			return types.Tuple{"key": l["key"], "l": l["l"], "r": r["r"]}
+		},
+	)
+	joinOp.JoinTTL = 10 * time.Second
+	joinOp.Now = func() time.Time { return now }
+
+	// Seed both sides with 2 tuples each -> 4 join results.
+	out1, err := joinOp.ApplyBinary(
+		types.Batch{
+			{Tuple: types.Tuple{"key": "k", "l": 1}, Count: 1},
+			{Tuple: types.Tuple{"key": "k", "l": 2}, Count: 1},
+		},
+		types.Batch{
+			{Tuple: types.Tuple{"key": "k", "r": 10}, Count: 1},
+			{Tuple: types.Tuple{"key": "k", "r": 20}, Count: 1},
+		},
+	)
+	if err != nil {
+		t.Fatalf("ApplyBinary failed: %v", err)
+	}
+	if len(out1) != 4 {
+		t.Fatalf("expected 4 join outputs, got %v", out1)
+	}
+
+	now = now.Add(11 * time.Second)
+	out2, err := joinOp.ApplyBinary(nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(evict) failed: %v", err)
+	}
+	counts := testBatchToCountMap(out2)
+
+	expected := testBatchToCountMap(types.Batch{
+		{Tuple: types.Tuple{"key": "k", "l": 1, "r": 10}, Count: -1},
+		{Tuple: types.Tuple{"key": "k", "l": 1, "r": 20}, Count: -1},
+		{Tuple: types.Tuple{"key": "k", "l": 2, "r": 10}, Count: -1},
+		{Tuple: types.Tuple{"key": "k", "l": 2, "r": 20}, Count: -1},
+	})
+
+	if len(counts) != len(expected) {
+		t.Fatalf("expected %d retractions, got %v", len(expected), out2)
+	}
+	for k, v := range expected {
+		if counts[k] != v {
+			t.Fatalf("unexpected retractions: expected %v got %v", expected, counts)
+		}
+	}
+}
+
+func TestJoinOp_TTLExpiry_EvictAndInsertSameTick_ProducesRetractAndNewJoin(t *testing.T) {
+	now := time.Unix(0, 0)
+	joinOp := NewJoinOp(
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(l, r types.Tuple) types.Tuple {
+			return types.Tuple{"key": l["key"], "l": l["l"], "r": r["r"]}
+		},
+	)
+	joinOp.JoinTTL = 10 * time.Second
+	joinOp.Now = func() time.Time { return now }
+
+	// left at t=0
+	_, err := joinOp.ApplyBinary(types.Batch{{Tuple: types.Tuple{"key": "k", "l": 1}, Count: 1}}, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(left) failed: %v", err)
+	}
+
+	// right at t=5 -> +1 join with l=1
+	now = now.Add(5 * time.Second)
+	_, err = joinOp.ApplyBinary(nil, types.Batch{{Tuple: types.Tuple{"key": "k", "r": 10}, Count: 1}})
+	if err != nil {
+		t.Fatalf("ApplyBinary(right) failed: %v", err)
+	}
+
+	// t=11: left expires, but we also insert new left in the same tick.
+	now = time.Unix(0, 0).Add(11 * time.Second)
+	out, err := joinOp.ApplyBinary(types.Batch{{Tuple: types.Tuple{"key": "k", "l": 2}, Count: 1}}, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(evict+insert) failed: %v", err)
+	}
+
+	counts := testBatchToCountMap(out)
+	expected := testBatchToCountMap(types.Batch{
+		{Tuple: types.Tuple{"key": "k", "l": 1, "r": 10}, Count: -1},
+		{Tuple: types.Tuple{"key": "k", "l": 2, "r": 10}, Count: 1},
+	})
+	if len(counts) != len(expected) {
+		t.Fatalf("unexpected output: expected %v got %v", expected, counts)
+	}
+	for k, v := range expected {
+		if counts[k] != v {
+			t.Fatalf("unexpected output: expected %v got %v", expected, counts)
+		}
+	}
+}
+
+func TestJoinOp_TTLExpiry_RefreshExtendsExpiration(t *testing.T) {
+	now := time.Unix(0, 0)
+	joinOp := NewJoinOp(
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(l, r types.Tuple) types.Tuple {
+			return types.Tuple{"key": l["key"], "l": l["l"], "r": r["r"]}
+		},
+	)
+	joinOp.JoinTTL = 10 * time.Second
+	joinOp.Now = func() time.Time { return now }
+
+	// left at t=0
+	_, err := joinOp.ApplyBinary(types.Batch{{Tuple: types.Tuple{"key": "k", "l": 1}, Count: 1}}, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(left) failed: %v", err)
+	}
+
+	// right at t=5 -> +1 join
+	now = now.Add(5 * time.Second)
+	_, err = joinOp.ApplyBinary(nil, types.Batch{{Tuple: types.Tuple{"key": "k", "r": 10}, Count: 1}})
+	if err != nil {
+		t.Fatalf("ApplyBinary(right) failed: %v", err)
+	}
+
+	// refresh/duplicate insert on left at t=9 extends left expiration to t=19 and increases count to 2
+	now = time.Unix(0, 0).Add(9 * time.Second)
+	_, err = joinOp.ApplyBinary(types.Batch{{Tuple: types.Tuple{"key": "k", "l": 1}, Count: 1}}, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(left refresh) failed: %v", err)
+	}
+
+	// t=11: neither side should be evicted (left expires at 19, right expires at 15)
+	now = time.Unix(0, 0).Add(11 * time.Second)
+	out1, err := joinOp.ApplyBinary(nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(t=11) failed: %v", err)
+	}
+	if len(out1) != 0 {
+		t.Fatalf("expected no output at t=11, got %v", out1)
+	}
+
+	// t=16: right expires and should retract against left count=2 -> one tuple with Count=-2
+	now = time.Unix(0, 0).Add(16 * time.Second)
+	out2, err := joinOp.ApplyBinary(nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(t=16) failed: %v", err)
+	}
+	if len(out2) != 1 || out2[0].Count != -2 {
+		t.Fatalf("expected one -2 retraction at t=16, got %v", out2)
 	}
 }
