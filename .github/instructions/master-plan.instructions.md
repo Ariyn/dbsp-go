@@ -6,6 +6,8 @@ applyTo: '**'
 이 문서는 Golang으로 DBSP(DataBase Signal Processing) 모델을 기반으로 한
 Incremental View Maintenance(IVM) 엔진을 구현하기 위한 기술 지침서이다.
 
+작업 규칙: todo.md에서 할 일을 읽고, 완료할때마다 todo.md 파일을 업데이트 할 것
+
 ## 0. Scope
 
 - 초기 버전에서 지원할 대상:
