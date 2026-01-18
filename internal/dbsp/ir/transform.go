@@ -865,6 +865,40 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 			// JOIN followed by GroupAgg
 			keyFn := buildGroupKeyFn(n.Keys)
 
+			// Multi-aggregate: support SUM/COUNT on top of JOIN output.
+			if len(n.Aggs) > 0 {
+				aggSlots := make([]op.AggSlot, 0, len(n.Aggs))
+				for _, a := range n.Aggs {
+					name := strings.ToUpper(a.Name)
+					switch name {
+					case "SUM":
+						aggSlots = append(aggSlots, op.AggSlot{
+							Init: func() any { return float64(0) },
+							Fn:   &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"},
+						})
+					case "COUNT":
+						if a.Col == "" {
+							return nil, fmt.Errorf("COUNT(*) cannot be combined with other aggregates yet")
+						}
+						aggSlots = append(aggSlots, op.AggSlot{
+							Init: func() any { return int64(0) },
+							Fn:   &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"},
+						})
+					default:
+						return nil, fmt.Errorf("unsupported agg %s in multi-aggregate", a.Name)
+					}
+				}
+
+				g := op.NewGroupAggMultiOp(keyFn, aggSlots)
+				g.SetGroupKeyColNames(n.Keys)
+
+				joinNode, err := logicalJoinToDBSP(in)
+				if err != nil {
+					return nil, err
+				}
+				return &op.Node{Op: g, Inputs: []*op.Node{joinNode}}, nil
+			}
+
 			var agg op.AggFunc
 			var aggInit func() any
 			switch n.AggName {

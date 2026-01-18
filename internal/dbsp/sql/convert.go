@@ -596,8 +596,10 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string) (i
 		return wa, nil
 	}
 
-	// Find aggregates from query string
-	aggs, err := findAggregatesFromQuery(sel.String())
+	// Find aggregates from query string.
+	// NOTE: tree-sitter AST String() 출력은 버전에 따라 SELECT 리스트 구문이 변형될 수 있어
+	// rawQuery를 기준으로 파싱하는 편이 안정적이다.
+	aggs, err := findAggregatesFromQuery(rawQuery)
 	if err != nil {
 		return nil, err
 	}

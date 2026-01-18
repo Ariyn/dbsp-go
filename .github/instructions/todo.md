@@ -18,15 +18,15 @@
 
 ### Phase 2 작업 목록
 
-- [ ] **E2E: Parquet sink 결과 동일성 검증**
+- [x] **E2E: Parquet sink 결과 동일성 검증**
   - 파이프라인 실행 → Parquet 파일 생성 → Parquet 재로딩
   - 키별로 `agg_delta`/`count_delta` 누적해 최종 집계 결과 복원
   - 동일 입력을 전체 스캔해 기대 결과 계산 후 비교
 
-- [ ] **E2E: JOIN + GROUP BY (delete 포함) 대표 케이스 1개 추가**
+- [x] **E2E: JOIN + GROUP BY (delete 포함) 대표 케이스 1개 추가**
   - join key 1개, group key 1개부터 시작
 
-- [ ] **E2E: JOIN + GROUP BY (복합키) 대표 케이스 1개 추가**
+- [x] **E2E: JOIN + GROUP BY (복합키) 대표 케이스 1개 추가**
   - join key 2개 또는 group key 2개
 
 - [ ] **운영성(선택): WAL 체크포인트/복구 E2E 1개 추가**
