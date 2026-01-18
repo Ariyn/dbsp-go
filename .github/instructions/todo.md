@@ -25,6 +25,11 @@
 - [x] **E2E(수동 LogicalPlan): Filter(Join 위) → GroupAgg 실행 1개**
 - [x] **E2E(수동 LogicalPlan): Join → Project(필요 시 expr 포함) 실행 1개**
 
+- [x] **E2E(SQL): ParseQueryToDBSP 경로 3개 고정**
+  - Filter + GroupAgg(multi-agg)
+  - Join + GroupAgg(multi-agg)
+  - Filter(Join 위) + GroupAgg(multi-agg)
+
 ### (완료) Phase 2 — Join + GroupAggregate
 
 - [x] JOIN + GROUP BY 쿼리 2종(Q1 SUM, Q2 COUNT)에 대해 delete/retraction 포함 E2E가 통과
