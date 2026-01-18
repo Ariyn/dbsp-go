@@ -134,20 +134,20 @@ func TestE2E_JoinGroupBy_FinalSnapshotEqualsExpected_ExecuteTick(t *testing.T) {
 	}{
 		{
 			a: types.Batch{{Tuple: types.Tuple{"a.id": int64(1), "a.k": "A"}, Count: 1}},
-				b: types.Batch{{Tuple: types.Tuple{"b.id": int64(1), "b.v": 10.0}, Count: 1}},
+			b: types.Batch{{Tuple: types.Tuple{"b.id": int64(1), "b.v": 10.0}, Count: 1}},
 		},
 		{
 			a: types.Batch{{Tuple: types.Tuple{"a.id": int64(2), "a.k": "A"}, Count: 1}},
-				b: types.Batch{{Tuple: types.Tuple{"b.id": int64(2), "b.v": 5.0}, Count: 1}},
+			b: types.Batch{{Tuple: types.Tuple{"b.id": int64(2), "b.v": 5.0}, Count: 1}},
 		},
 		{
 			a: types.Batch{{Tuple: types.Tuple{"a.id": int64(3), "a.k": "B"}, Count: 1}},
-				b: types.Batch{{Tuple: types.Tuple{"b.id": int64(3), "b.v": 7.0}, Count: 1}},
+			b: types.Batch{{Tuple: types.Tuple{"b.id": int64(3), "b.v": 7.0}, Count: 1}},
 		},
 		// Delete one right row (retract its contribution)
 		{
 			a: nil,
-				b: types.Batch{{Tuple: types.Tuple{"b.id": int64(2), "b.v": 5.0}, Count: -1}},
+			b: types.Batch{{Tuple: types.Tuple{"b.id": int64(2), "b.v": 5.0}, Count: -1}},
 		},
 		// Delete one left row
 		{
@@ -208,7 +208,7 @@ func TestE2E_JoinGroupBy_CompositeKeys_FinalSnapshotEqualsExpected_ExecuteTick(t
 	}
 	defer sink.Close()
 
-	ticks := []struct{
+	ticks := []struct {
 		a types.Batch
 		b types.Batch
 	}{

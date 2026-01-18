@@ -99,8 +99,8 @@ func TestLogicalToDBSP_JoinGroupAgg_MultiAgg_StructureAndExecute(t *testing.T) {
 		Right:      &LogicalScan{Table: "b"},
 	}
 	g := &LogicalGroupAgg{
-		Keys: []string{"a.k"},
-		Aggs: []AggSpec{{Name: "SUM", Col: "b.v"}, {Name: "COUNT", Col: "b.id"}},
+		Keys:  []string{"a.k"},
+		Aggs:  []AggSpec{{Name: "SUM", Col: "b.v"}, {Name: "COUNT", Col: "b.id"}},
 		Input: join,
 	}
 
@@ -157,8 +157,8 @@ func TestLogicalToDBSP_FilterOverJoinGroupAgg_StructureAndExecute(t *testing.T) 
 	}
 	filter := &LogicalFilter{PredicateSQL: "b.v >= 10", Input: join}
 	g := &LogicalGroupAgg{
-		Keys: []string{"a.k"},
-		Aggs: []AggSpec{{Name: "SUM", Col: "b.v"}, {Name: "COUNT", Col: "b.id"}},
+		Keys:  []string{"a.k"},
+		Aggs:  []AggSpec{{Name: "SUM", Col: "b.v"}, {Name: "COUNT", Col: "b.id"}},
 		Input: filter,
 	}
 
