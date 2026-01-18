@@ -15,3 +15,9 @@
 - 상태 저장소 최적화(키/값 구조, 압축)
 - 실행 엔진 프로파일링 및 hot path 개선
 - sink 병렬화/버퍼링 정책 정리
+
+## 벤치마크 실행
+
+- 파이프라인(GroupAgg): `go test ./cmd/dbsp -run=^$ -bench=BenchmarkPipeline_ExecuteOnly_GroupAgg -benchmem`
+- 파이프라인(Join+GroupAgg): `go test ./cmd/dbsp -run=^$ -bench=BenchmarkPipeline_ExecuteOnly_JoinGroupAgg -benchmem`
+- 파이프라인(+Parquet sink): `go test ./cmd/dbsp -run=^$ -bench=BenchmarkPipeline_ExecutePlusParquetSink_GroupAgg -benchmem`

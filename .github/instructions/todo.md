@@ -22,7 +22,7 @@
   - Join/GroupAgg state가 커지는 조건 명시
   - watermark/TTL 기반 compaction/GC 트리거 중 하나를 코드+테스트로 고정
 
-- [ ] **벤치마크 기준선 추가(대표 1~2개)**
+- [x] **벤치마크 기준선 추가(대표 1~2개)**
   - 단일 GroupAgg
   - Join + GroupAgg
 

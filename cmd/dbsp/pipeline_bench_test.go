@@ -69,3 +69,41 @@ func BenchmarkPipeline_ExecutePlusParquetSink_GroupAgg(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkPipeline_ExecuteOnly_JoinGroupAgg(b *testing.B) {
+	query := "SELECT a.k, SUM(b.v), COUNT(*) FROM a JOIN b ON a.id = b.id GROUP BY a.k"
+	root, err := sqlconv.ParseQueryToIncrementalDBSP(query)
+	if err != nil {
+		b.Fatalf("ParseQueryToIncrementalDBSP: %v", err)
+	}
+
+	// Pre-load stable right side state (b).
+	rightBatch := make(types.Batch, 0, 1024)
+	for i := 0; i < cap(rightBatch); i++ {
+		rightBatch = append(rightBatch, types.TupleDelta{Tuple: types.Tuple{"b.id": int64(i), "b.v": float64(i % 17)}, Count: 1})
+	}
+	if _, err := op.ExecuteTick(root, map[string]types.Batch{"b": rightBatch}); err != nil {
+		b.Fatalf("ExecuteTick(preload b): %v", err)
+	}
+
+	// Each iteration inserts and deletes the same left rows to keep state bounded.
+	leftInsert := make(types.Batch, 0, 1024)
+	leftDelete := make(types.Batch, 0, 1024)
+	for i := 0; i < cap(leftInsert); i++ {
+		td := types.TupleDelta{Tuple: types.Tuple{"a.id": int64(i), "a.k": int64(i % 64)}, Count: 1}
+		leftInsert = append(leftInsert, td)
+		td.Count = -1
+		leftDelete = append(leftDelete, td)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := op.ExecuteTick(root, map[string]types.Batch{"a": leftInsert}); err != nil {
+			b.Fatalf("ExecuteTick(a insert): %v", err)
+		}
+		if _, err := op.ExecuteTick(root, map[string]types.Batch{"a": leftDelete}); err != nil {
+			b.Fatalf("ExecuteTick(a delete): %v", err)
+		}
+	}
+}
