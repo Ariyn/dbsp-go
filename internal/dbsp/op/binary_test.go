@@ -288,6 +288,66 @@ func TestJoinOp_MultipleKeys(t *testing.T) {
 	}
 }
 
+func TestJoinOp_JoinTTL_EvictsStateAndRetractsOutput(t *testing.T) {
+	base := time.Unix(0, 0)
+	now := base
+
+	joinOp := NewJoinOp(
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(tuple types.Tuple) any { return tuple["key"] },
+		func(l, r types.Tuple) types.Tuple {
+			return types.Tuple{"key": l["key"], "l": l["l"], "r": r["r"]}
+		},
+	)
+	joinOp.JoinTTL = 1 * time.Second
+	joinOp.Now = func() time.Time { return now }
+
+	// Insert matching tuples on both sides.
+	out1, err := joinOp.ApplyBinary(
+		types.Batch{{Tuple: types.Tuple{"key": "k", "l": 1}, Count: 1}},
+		types.Batch{{Tuple: types.Tuple{"key": "k", "r": 10}, Count: 1}},
+	)
+	if err != nil {
+		t.Fatalf("ApplyBinary(insert) failed: %v", err)
+	}
+	if len(out1) != 1 || out1[0].Count != 1 {
+		t.Fatalf("expected 1 join output insertion, got %v", out1)
+	}
+
+	// Before TTL expiry: no eviction/retraction.
+	now = base.Add(500 * time.Millisecond)
+	out2, err := joinOp.ApplyBinary(nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(pre-evict) failed: %v", err)
+	}
+	if len(out2) != 0 {
+		t.Fatalf("expected no output before TTL expiry, got %v", out2)
+	}
+
+	// After TTL expiry: should retract the previously produced join.
+	now = base.Add(2 * time.Second)
+	out3, err := joinOp.ApplyBinary(nil, nil)
+	if err != nil {
+		t.Fatalf("ApplyBinary(evict) failed: %v", err)
+	}
+	if len(out3) != 1 || out3[0].Count != -1 {
+		t.Fatalf("expected 1 retraction after TTL expiry, got %v", out3)
+	}
+
+	// State should be fully evicted.
+	snapAny, err := joinOp.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot failed: %v", err)
+	}
+	snap, ok := snapAny.(binarySnapshotV1)
+	if !ok {
+		t.Fatalf("unexpected snapshot type %T", snapAny)
+	}
+	if len(snap.Left) != 0 || len(snap.Right) != 0 {
+		t.Fatalf("expected join state to be evicted, left=%v right=%v", snap.Left, snap.Right)
+	}
+}
+
 func TestUnionOp(t *testing.T) {
 	unionOp := NewUnionOp()
 

@@ -18,7 +18,7 @@
   - IS NULL / IS NOT NULL
   - 집계(SUM/COUNT)에서 숫자 문자열/NULL 처리
 
-- [ ] **상태/메모리 제어 규칙 정의(최소 1개)**
+- [x] **상태/메모리 제어 규칙 정의(최소 1개)**
   - Join/GroupAgg state가 커지는 조건 명시
   - watermark/TTL 기반 compaction/GC 트리거 중 하나를 코드+테스트로 고정
 
