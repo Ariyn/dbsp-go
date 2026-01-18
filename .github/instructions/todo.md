@@ -5,18 +5,32 @@
 
 - 원칙: 작업을 시작하기 전에 항목을 추가하고, 완료 시 체크/상태를 업데이트합니다.
 - 로드맵: [.github/instructions/master-plan.instructions.md](master-plan.instructions.md)
-- 상세 계획: `.github/instructions/plans/` (특히 `plans/phase-2.md`)
+- 상세 계획: `.github/instructions/plans/` (특히 `plans/phase-3.md`)
 
 ---
 
-## 현재 단계: Phase 2 — Join + GroupAggregate
+## 현재 단계: Phase 3 — Relational IR → DBSP IR 변환기
 
-### Phase 2 완료 조건(최소)
+### Phase 3 완료 조건(최소)
 
-- [ ] JOIN + GROUP BY 쿼리 2종(Q1 SUM, Q2 COUNT)에 대해 delete/retraction 포함 E2E가 통과
-- [ ] E2E는 "델타"가 아니라 "델타 누적 후 최종 스냅샷" 기준으로 동일성 검증
+- [x] 변환기 단위 테스트: LogicalPlan → DBSP 그래프 구조/연산자 타입이 기대와 일치
+- [x] 대표 SQL(또는 수동 LogicalPlan) 3개 이상에 대해 end-to-end 실행 가능
 
-### Phase 2 작업 목록
+### Phase 3 작업 목록
+
+- [x] **단위 테스트: LogicalJoin → DBSP(BinaryJoin) 변환 구조 검증**
+- [x] **단위 테스트: LogicalJoin + LogicalGroupAgg(multi-agg) 변환 구조 검증**
+- [x] **단위 테스트: Filter(Join 위) + GroupAgg 변환 구조 검증**
+- [x] **E2E(수동 LogicalPlan): Join → GroupAgg 실행 1개**
+- [x] **E2E(수동 LogicalPlan): Filter(Join 위) → GroupAgg 실행 1개**
+- [x] **E2E(수동 LogicalPlan): Join → Project(필요 시 expr 포함) 실행 1개**
+
+### (완료) Phase 2 — Join + GroupAggregate
+
+- [x] JOIN + GROUP BY 쿼리 2종(Q1 SUM, Q2 COUNT)에 대해 delete/retraction 포함 E2E가 통과
+- [x] E2E는 "델타"가 아니라 "델타 누적 후 최종 스냅샷" 기준으로 동일성 검증
+
+#### Phase 2 작업 목록
 
 - [x] **E2E: Parquet sink 결과 동일성 검증**
   - 파이프라인 실행 → Parquet 파일 생성 → Parquet 재로딩
