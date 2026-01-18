@@ -46,6 +46,28 @@ func TestSumAggBasic(t *testing.T) {
 	}
 }
 
+func TestSumAgg_ToleratesNumericStringAndNull(t *testing.T) {
+	keyFn := func(tu types.Tuple) any { return tu["k"] }
+	aggInit := func() any { return float64(0) }
+	sumAgg := &SumAgg{ColName: "v"}
+
+	g := NewGroupAggOp(keyFn, aggInit, sumAgg)
+
+	_, err := g.Apply(types.Batch{
+		{Tuple: types.Tuple{"k": "A", "v": "10"}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "v": nil}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "v": "not-a-number"}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	st := g.State()
+	if st["A"] != 10.0 {
+		t.Fatalf("expected A=10 got %v", st["A"])
+	}
+}
+
 // ============================================================================
 // COUNT Aggregation Tests
 // ============================================================================
@@ -83,6 +105,37 @@ func TestCountAggBasic(t *testing.T) {
 	st2 := g.State()
 	if st2["A"] != int64(1) {
 		t.Fatalf("expected A=1 after delete got %v", st2["A"])
+	}
+}
+
+func TestCountAgg_IgnoresNullWhenColSpecified(t *testing.T) {
+	keyFn := func(tu types.Tuple) any { return tu["k"] }
+	aggInit := func() any { return int64(0) }
+	countAgg := &CountAgg{ColName: "v"}
+
+	g := NewGroupAggOp(keyFn, aggInit, countAgg)
+
+	_, err := g.Apply(types.Batch{
+		{Tuple: types.Tuple{"k": "A", "v": nil}, Count: 1},
+		{Tuple: types.Tuple{"k": "A"}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "v": 123}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+	st := g.State()
+	if st["A"] != int64(1) {
+		t.Fatalf("expected A=1 got %v", st["A"])
+	}
+
+	// delete the only counted row
+	_, err = g.Apply(types.Batch{{Tuple: types.Tuple{"k": "A", "v": 123}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	st2 := g.State()
+	if st2["A"] != int64(0) {
+		t.Fatalf("expected A=0 got %v", st2["A"])
 	}
 }
 
