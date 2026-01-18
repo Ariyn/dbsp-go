@@ -6,6 +6,17 @@ import (
 	"fmt"
 )
 
+func init() {
+	// SnapshotGraph encodes operator state behind an interface field (any).
+	// gob requires concrete types used in interface values to be registered.
+	gob.Register(groupAggSnapshotV1{})
+	gob.Register(integrateSnapshotV1{})
+	gob.Register(binarySnapshotV1{})
+	gob.Register(delaySnapshotV1{})
+	gob.Register(windowAggSnapshotV1{})
+	gob.Register(watermarkAwareSnapshotV1{})
+}
+
 // StatefulOperator can persist and restore its internal mutable state.
 //
 // IMPORTANT: Snapshot/Restore must not attempt to encode function fields
