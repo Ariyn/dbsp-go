@@ -81,10 +81,10 @@
 
 ### Phase 3 — Relational IR → DBSP IR 변환기
 
-- [ ] 변환기 단위 테스트(논리 계획 → DBSP 그래프 구조)
-- [ ] SQL/수동 LogicalPlan 3개 이상 end-to-end 실행 가능
+- [x] 변환기 단위 테스트(논리 계획 → DBSP 그래프 구조)
+- [x] SQL/수동 LogicalPlan 3개 이상 end-to-end 실행 가능
 
 ### Phase 4 — 최적화/운영성
 
-- [ ] 타입/NULL 처리 정책 정리(테스트 포함)
-- [ ] 메모리/상태(compaction/GC) 기준 정리 및 벤치마크 기준선 확보
+- [x] 타입/NULL 처리 정책 정리(테스트 포함)
+- [x] 메모리/상태(compaction/GC) 기준 정리 및 벤치마크 기준선 확보
