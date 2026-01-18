@@ -20,6 +20,9 @@ CLI 플래그:
 
 ```yaml
 pipeline:
+  wal:
+    enabled: false
+    path: /tmp/dbsp-wal.db
   source:
     type: csv | http | chain
     config: {}
@@ -30,6 +33,12 @@ pipeline:
     type: console | file
     config: {}
 ```
+
+- `wal.enabled`(선택, 기본 false): 입력 배치를 SQLite에 append-only로 기록(WAL)
+- `wal.path`(선택): SQLite DB 파일 경로
+
+주의: WAL replay는 **엔진 state 복구 목적**이며, 기본 구현은 replay 구간의 결과를 sink로 재출력하지 않습니다(중복 방지).
+추가로, 이 정책에서는 프로세스가 “WAL에는 기록했지만 sink에 쓰기 전에” 크래시되면 해당 구간의 출력이 유실될 수 있습니다(재시작 시 replay가 출력 복구를 하지 않기 때문).
 
 ## Source 타입
 

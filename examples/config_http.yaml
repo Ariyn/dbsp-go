@@ -1,4 +1,7 @@
 pipeline:
+  wal:
+    enabled: false
+    path: /tmp/dbsp-wal.db
   source:
     type: http
     config:

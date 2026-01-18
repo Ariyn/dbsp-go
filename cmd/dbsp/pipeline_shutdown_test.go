@@ -53,7 +53,7 @@ func TestRunPipeline_CancelUnblocksSource(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := runPipeline(ctx, source, sink, func(b types.Batch) (types.Batch, error) { return b, nil })
+	err := runPipeline(ctx, source, sink, func(b types.Batch) (types.Batch, error) { return b, nil }, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}

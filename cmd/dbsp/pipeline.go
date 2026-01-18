@@ -9,7 +9,12 @@ import (
 
 type executeFn func(types.Batch) (types.Batch, error)
 
-func runPipeline(ctx context.Context, source Source, sink Sink, execute executeFn) error {
+type pipelineWAL interface {
+	Append(ctx context.Context, batch types.Batch) error
+	Replay(ctx context.Context, apply func(types.Batch) error) error
+}
+
+func runPipeline(ctx context.Context, source Source, sink Sink, execute executeFn, wal pipelineWAL) error {
 	if ctx == nil {
 		return fmt.Errorf("context is nil")
 	}
@@ -33,6 +38,17 @@ func runPipeline(ctx context.Context, source Source, sink Sink, execute executeF
 	}()
 	defer close(stopCloser)
 
+	// Recovery path: replay previously logged batches to rebuild in-memory operator state.
+	// We intentionally do not forward replay outputs to the sink to avoid duplicates.
+	if wal != nil {
+		if err := wal.Replay(ctx, func(b types.Batch) error {
+			_, err := execute(b)
+			return err
+		}); err != nil {
+			return err
+		}
+	}
+
 	batchCount := 0
 	for {
 		batch, err := source.NextBatch()
@@ -48,6 +64,12 @@ func runPipeline(ctx context.Context, source Source, sink Sink, execute executeF
 
 		batchCount++
 		fmt.Printf("Processing batch %d with %d records...\n", batchCount, len(batch))
+
+		if wal != nil {
+			if err := wal.Append(ctx, batch); err != nil {
+				return err
+			}
+		}
 
 		resultBatch, err := execute(batch)
 		if err != nil {

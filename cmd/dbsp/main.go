@@ -11,6 +11,7 @@ import (
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
+	"github.com/ariyn/dbsp/internal/dbsp/wal"
 	"gopkg.in/yaml.v3"
 )
 
@@ -100,11 +101,23 @@ func main() {
 	}
 	defer sink.Close()
 
+	// 4.5 Initialize WAL (optional)
+	var writeAheadLog *wal.SQLiteWAL
+	if config.Pipeline.WAL.Enabled {
+		writeAheadLog, err = wal.NewSQLiteWAL(config.Pipeline.WAL.Path)
+		if err != nil {
+			fmt.Printf("Error initializing WAL: %v\n", err)
+			os.Exit(1)
+		}
+		defer writeAheadLog.Close()
+		fmt.Printf("WAL enabled: sqlite=%s\n", config.Pipeline.WAL.Path)
+	}
+
 	// 5. Run Pipeline
 	fmt.Println("Starting pipeline...")
 	err = runPipeline(ctx, source, sink, func(batch types.Batch) (types.Batch, error) {
 		return op.Execute(rootNode, batch)
-	})
+	}, writeAheadLog)
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Println("Shutdown requested. Exiting...")

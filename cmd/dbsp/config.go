@@ -6,7 +6,15 @@ type PipelineConfig struct {
 		Source    SourceConfig    `yaml:"source"`
 		Transform TransformConfig `yaml:"transform"`
 		Sink      SinkConfig      `yaml:"sink"`
+		WAL       WALConfig       `yaml:"wal"`
 	} `yaml:"pipeline"`
+}
+
+// WALConfig defines write-ahead log (WAL) settings.
+// WAL stores input batches to enable crash recovery via replay.
+type WALConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
 }
 
 // SourceConfig defines the configuration for the data source
