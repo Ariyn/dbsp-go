@@ -30,6 +30,9 @@
   - Join + GroupAgg(multi-agg)
   - Filter(Join 위) + GroupAgg(multi-agg)
 
+- [x] **COUNT(*)를 multi-agg에서 허용(변환기/SQL 경로) + 테스트 추가**
+- [x] **관대 타입 처리: 숫자 문자열을 비교/집계(SUM)에서 허용 + 테스트 고정**
+
 ### (완료) Phase 2 — Join + GroupAggregate
 
 - [x] JOIN + GROUP BY 쿼리 2종(Q1 SUM, Q2 COUNT)에 대해 delete/retraction 포함 E2E가 통과

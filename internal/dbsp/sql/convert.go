@@ -154,9 +154,6 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 			if name != "SUM" && name != "COUNT" {
 				return nil, errors.New("multiple aggregate functions not supported yet")
 			}
-			if name == "COUNT" && strings.TrimSpace(a.Col) == "*" {
-				return nil, errors.New("COUNT(*) cannot be combined with other aggregates yet")
-			}
 		}
 	}
 
@@ -608,9 +605,6 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string) (i
 			name := strings.ToUpper(a.Name)
 			if name != "SUM" && name != "COUNT" {
 				return nil, errors.New("multiple aggregate functions not supported yet")
-			}
-			if name == "COUNT" && strings.TrimSpace(a.Col) == "*" {
-				return nil, errors.New("COUNT(*) cannot be combined with other aggregates yet")
 			}
 		}
 	}

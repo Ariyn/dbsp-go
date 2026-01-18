@@ -1,7 +1,10 @@
 package op
 
 import (
+	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
@@ -454,10 +457,34 @@ func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	switch x := raw.(type) {
 	case int:
 		v = float64(x)
+	case int32:
+		v = float64(x)
 	case int64:
+		v = float64(x)
+	case uint:
+		v = float64(x)
+	case uint32:
+		v = float64(x)
+	case uint64:
+		v = float64(x)
+	case float32:
 		v = float64(x)
 	case float64:
 		v = x
+	case json.Number:
+		f, err := x.Float64()
+		if err != nil {
+			v = 0
+			break
+		}
+		v = f
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			v = 0
+			break
+		}
+		v = f
 	default:
 		v = 0
 	}

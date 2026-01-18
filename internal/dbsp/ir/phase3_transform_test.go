@@ -147,6 +147,56 @@ func TestLogicalToDBSP_JoinGroupAgg_MultiAgg_StructureAndExecute(t *testing.T) {
 	assertAggSnapshotsEqual(t, snap, want)
 }
 
+func TestLogicalToDBSP_JoinGroupAgg_MultiAgg_CountStarAllowed(t *testing.T) {
+	join := &LogicalJoin{
+		LeftTable:  "a",
+		RightTable: "b",
+		Conditions: []JoinCondition{{LeftCol: "a.id", RightCol: "b.id"}},
+		Left:       &LogicalScan{Table: "a"},
+		Right:      &LogicalScan{Table: "b"},
+	}
+	g := &LogicalGroupAgg{
+		Keys:  []string{"a.k"},
+		Aggs:  []AggSpec{{Name: "SUM", Col: "b.v"}, {Name: "COUNT", Col: ""}},
+		Input: join,
+	}
+
+	root, err := LogicalToDBSP(g)
+	if err != nil {
+		t.Fatalf("LogicalToDBSP: %v", err)
+	}
+	gop, ok := root.Op.(*op.GroupAggOp)
+	if !ok {
+		t.Fatalf("expected *op.GroupAggOp, got %T", root.Op)
+	}
+	if len(gop.Aggs) != 2 {
+		t.Fatalf("expected 2 aggregate slots, got %d", len(gop.Aggs))
+	}
+
+	snap := make(map[string]aggSnapshot)
+	ticks := []map[string]types.Batch{
+		{"a": {{Tuple: types.Tuple{"a.id": int64(1), "a.k": "A"}, Count: 1}}},
+		{"a": {{Tuple: types.Tuple{"a.id": int64(2), "a.k": "B"}, Count: 1}}},
+		{"b": {{Tuple: types.Tuple{"b.id": int64(1), "b.v": 10.0}, Count: 1}}},
+		{"b": {{Tuple: types.Tuple{"b.id": int64(2), "b.v": 7.0}, Count: 1}}},
+		{"b": {{Tuple: types.Tuple{"b.id": int64(1), "b.v": 5.0}, Count: 1}}},
+		{"b": {{Tuple: types.Tuple{"b.id": int64(1), "b.v": 5.0}, Count: -1}}},
+	}
+	for _, in := range ticks {
+		out, err := op.ExecuteTick(root, in)
+		if err != nil {
+			t.Fatalf("ExecuteTick: %v", err)
+		}
+		applyAggDeltas(out, snap)
+	}
+
+	want := map[string]aggSnapshot{
+		"A": {sum: 10.0, count: 1},
+		"B": {sum: 7.0, count: 1},
+	}
+	assertAggSnapshotsEqual(t, snap, want)
+}
+
 func TestLogicalToDBSP_FilterOverJoinGroupAgg_StructureAndExecute(t *testing.T) {
 	join := &LogicalJoin{
 		LeftTable:  "a",

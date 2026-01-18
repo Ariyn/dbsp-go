@@ -168,3 +168,37 @@ func TestPhase3_E2E_SQL_FilterOverJoin_GroupAgg_MultiAgg(t *testing.T) {
 	}
 	phase3AssertAggSnapshotEq(t, snap, want)
 }
+
+func TestPhase3_E2E_SQL_Filter_GroupAgg_MultiAgg_CountStar_TolerantNumericString(t *testing.T) {
+	query := "SELECT k, SUM(v), COUNT(*) FROM t WHERE v >= 10 GROUP BY k"
+	root, err := ParseQueryToDBSP(query)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP: %v", err)
+	}
+
+	// v comes in as a numeric string; the engine should treat it as numeric
+	// for both the filter and SUM aggregate.
+	batches := []types.Batch{
+		{
+			{Tuple: types.Tuple{"k": "A", "v": "9"}, Count: 1},
+			{Tuple: types.Tuple{"k": "A", "v": "10"}, Count: 1},
+		},
+		{{Tuple: types.Tuple{"k": "A", "v": "10"}, Count: -1}},
+		{{Tuple: types.Tuple{"k": "B", "v": "12"}, Count: 1}},
+	}
+
+	snap := make(map[string]phase3AggSnapshot)
+	for _, b := range batches {
+		out, err := op.Execute(root, b)
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		phase3ApplyAggDeltas(out, snap)
+	}
+
+	want := map[string]phase3AggSnapshot{
+		"A": {sum: 0.0, count: 0},
+		"B": {sum: 12.0, count: 1},
+	}
+	phase3AssertAggSnapshotEq(t, snap, want)
+}

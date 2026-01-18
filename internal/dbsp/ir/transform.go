@@ -454,68 +454,78 @@ func buildLessEqualFunc(predicateSQL string) func(types.Tuple) bool {
 
 // Helper comparison functions
 func compareEqual(tupleVal any, val string) bool {
-	// String comparison
+	// If the RHS looks numeric, prefer numeric comparison (tolerant).
+	if rhs, err := strconv.ParseFloat(val, 64); err == nil {
+		if lhs, ok := toFloat64Loose(tupleVal); ok {
+			return lhs == rhs
+		}
+	}
+	// Fallback to string-ish comparison.
 	if strVal, ok := tupleVal.(string); ok {
 		return strVal == val
-	}
-	// Numeric comparison
-	if numVal, err := strconv.ParseFloat(val, 64); err == nil {
-		switch tv := tupleVal.(type) {
-		case int:
-			return float64(tv) == numVal
-		case int64:
-			return float64(tv) == numVal
-		case float64:
-			return tv == numVal
-		}
 	}
 	return fmt.Sprintf("%v", tupleVal) == val
 }
 
-func compareGreater(tupleVal any, threshold float64) bool {
-	switch tv := tupleVal.(type) {
-	case int:
-		return float64(tv) > threshold
-	case int64:
-		return float64(tv) > threshold
+func toFloat64Loose(v any) (float64, bool) {
+	switch x := v.(type) {
 	case float64:
-		return tv > threshold
+		return x, true
+	case float32:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case int32:
+		return float64(x), true
+	case uint:
+		return float64(x), true
+	case uint64:
+		return float64(x), true
+	case uint32:
+		return float64(x), true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case json.Number:
+		f, err := x.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	default:
+		return 0, false
+	}
+}
+
+func compareGreater(tupleVal any, threshold float64) bool {
+	if v, ok := toFloat64Loose(tupleVal); ok {
+		return v > threshold
 	}
 	return false
 }
 
 func compareGreaterOrEqual(tupleVal any, threshold float64) bool {
-	switch tv := tupleVal.(type) {
-	case int:
-		return float64(tv) >= threshold
-	case int64:
-		return float64(tv) >= threshold
-	case float64:
-		return tv >= threshold
+	if v, ok := toFloat64Loose(tupleVal); ok {
+		return v >= threshold
 	}
 	return false
 }
 
 func compareLess(tupleVal any, threshold float64) bool {
-	switch tv := tupleVal.(type) {
-	case int:
-		return float64(tv) < threshold
-	case int64:
-		return float64(tv) < threshold
-	case float64:
-		return tv < threshold
+	if v, ok := toFloat64Loose(tupleVal); ok {
+		return v < threshold
 	}
 	return false
 }
 
 func compareLessOrEqual(tupleVal any, threshold float64) bool {
-	switch tv := tupleVal.(type) {
-	case int:
-		return float64(tv) <= threshold
-	case int64:
-		return float64(tv) <= threshold
-	case float64:
-		return tv <= threshold
+	if v, ok := toFloat64Loose(tupleVal); ok {
+		return v <= threshold
 	}
 	return false
 }
@@ -628,9 +638,6 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 								Fn:   &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"},
 							})
 						case "COUNT":
-							if a.Col == "" {
-								return nil, fmt.Errorf("COUNT(*) cannot be combined with other aggregates yet")
-							}
 							aggSlots = append(aggSlots, op.AggSlot{
 								Init: func() any { return int64(0) },
 								Fn:   &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"},
@@ -725,9 +732,6 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 						case "SUM":
 							aggSlots = append(aggSlots, op.AggSlot{Init: func() any { return float64(0) }, Fn: &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"}})
 						case "COUNT":
-							if a.Col == "" {
-								return nil, fmt.Errorf("COUNT(*) cannot be combined with other aggregates yet")
-							}
 							aggSlots = append(aggSlots, op.AggSlot{Init: func() any { return int64(0) }, Fn: &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"}})
 						default:
 							return nil, fmt.Errorf("unsupported agg %s in multi-aggregate", a.Name)
@@ -877,9 +881,6 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 							Fn:   &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"},
 						})
 					case "COUNT":
-						if a.Col == "" {
-							return nil, fmt.Errorf("COUNT(*) cannot be combined with other aggregates yet")
-						}
 						aggSlots = append(aggSlots, op.AggSlot{
 							Init: func() any { return int64(0) },
 							Fn:   &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"},
