@@ -13,9 +13,14 @@
 - GroupAgg:
 	- non-windowed: composite GROUP BY key 지원
 	- multi-agg: `SUM(col)` + `COUNT(col)` 조합 지원(출력은 `agg_delta`, `count_delta`)
-	- `COUNT(*)`는 multi-agg와 혼합 불가(정책)
+	- `COUNT(*)`도 multi-agg에서 허용(= `COUNT("")`로 정규화)
 - Filter: 단순 WHERE 서브셋(비교, AND/OR, 괄호, IS NULL/NOT NULL)
 - Project: 컬럼 선택(필수) + (옵션) expr projection(`Exprs`)
+
+### 타입/비교(관대 정책)
+
+- 비교 연산(=, <, <=, >, >=)에서 RHS가 숫자로 파싱 가능하면 LHS도 숫자(문자열 숫자 포함)로 느슨하게 해석해 비교한다.
+- `SUM`은 숫자 타입뿐 아니라 숫자 문자열도 누적 대상으로 허용한다(파싱 실패 시 0으로 취급).
 
 ## 산출물(완료 조건)
 

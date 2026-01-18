@@ -137,6 +137,39 @@ func TestPhase3_E2E_SQL_Join_GroupAgg_MultiAgg(t *testing.T) {
 	phase3AssertAggSnapshotEq(t, snap, want)
 }
 
+func TestPhase3_E2E_SQL_Join_GroupAgg_MultiAgg_CountStar_TolerantNumericString(t *testing.T) {
+	query := "SELECT a.k, SUM(b.v), COUNT(*) FROM a JOIN b ON a.id = b.id GROUP BY a.k"
+	root, err := ParseQueryToDBSP(query)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP: %v", err)
+	}
+
+	snap := make(map[string]phase3AggSnapshot)
+	// 2-source graph: alternate ticks.
+	ticks := []map[string]types.Batch{
+		{"a": {{Tuple: types.Tuple{"a.id": int64(1), "a.k": "A"}, Count: 1}}},
+		{"a": {{Tuple: types.Tuple{"a.id": int64(2), "a.k": "B"}, Count: 1}}},
+		// b.v is a numeric string: should work for SUM.
+		{"b": {{Tuple: types.Tuple{"b.id": int64(1), "b.v": "10"}, Count: 1}}},
+		{"b": {{Tuple: types.Tuple{"b.id": int64(2), "b.v": "7"}, Count: 1}}},
+		{"b": {{Tuple: types.Tuple{"b.id": int64(1), "b.v": "5"}, Count: 1}}},
+		{"b": {{Tuple: types.Tuple{"b.id": int64(1), "b.v": "5"}, Count: -1}}},
+	}
+	for _, in := range ticks {
+		out, err := op.ExecuteTick(root, in)
+		if err != nil {
+			t.Fatalf("ExecuteTick: %v", err)
+		}
+		phase3ApplyAggDeltas(out, snap)
+	}
+
+	want := map[string]phase3AggSnapshot{
+		"A": {sum: 10.0, count: 1},
+		"B": {sum: 7.0, count: 1},
+	}
+	phase3AssertAggSnapshotEq(t, snap, want)
+}
+
 func TestPhase3_E2E_SQL_FilterOverJoin_GroupAgg_MultiAgg(t *testing.T) {
 	query := "SELECT a.k, SUM(b.v), COUNT(b.id) FROM a JOIN b ON a.id = b.id WHERE b.v >= 10 GROUP BY a.k"
 	root, err := ParseQueryToDBSP(query)

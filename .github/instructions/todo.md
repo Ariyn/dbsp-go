@@ -16,6 +16,11 @@
 - [x] 변환기 단위 테스트: LogicalPlan → DBSP 그래프 구조/연산자 타입이 기대와 일치
 - [x] 대표 SQL(또는 수동 LogicalPlan) 3개 이상에 대해 end-to-end 실행 가능
 
+### Phase 3 마감(정책/문서/테스트 고정)
+
+- [x] Phase 3 문서에 COUNT(*) multi-agg 허용 및 관대 타입(숫자 문자열) 규칙 반영
+- [x] SQL E2E에서 COUNT(*) + JOIN + multi-agg 경로까지 테스트로 고정
+
 ### Phase 3 작업 목록
 
 - [x] **단위 테스트: LogicalJoin → DBSP(BinaryJoin) 변환 구조 검증**
