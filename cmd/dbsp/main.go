@@ -68,6 +68,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	if config.Pipeline.Transform.Watermark.Enabled {
+		wmCfg, err := buildWatermarkConfig(config.Pipeline.Transform.Watermark)
+		if err != nil {
+			fmt.Printf("Error parsing watermark config: %v\n", err)
+			os.Exit(1)
+		}
+		applyWatermarkConfig(rootNode, wmCfg)
+		fmt.Printf("Applied watermark enabled=%v policy=%v\n", wmCfg.Enabled, wmCfg.Policy)
+	}
+
 	if config.Pipeline.Transform.JoinTTL != "" {
 		ttl, err := parseJoinTTL(config.Pipeline.Transform.JoinTTL)
 		if err != nil {
@@ -117,7 +127,13 @@ func main() {
 	fmt.Println("Starting pipeline...")
 	err = runPipeline(ctx, source, sink, func(batch types.Batch) (types.Batch, error) {
 		return op.Execute(rootNode, batch)
-	}, writeAheadLog)
+	}, writeAheadLog,
+		pipelineSnapshotterFunc{
+			snap: func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
+			restore: func(b []byte) error { return op.RestoreGraph(rootNode, b) },
+		},
+		config.Pipeline.WAL.CheckpointEveryBatches,
+	)
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Println("Shutdown requested. Exiting...")
@@ -128,4 +144,3 @@ func main() {
 	}
 	fmt.Println("Pipeline finished.")
 }
-

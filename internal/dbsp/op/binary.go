@@ -51,6 +51,102 @@ type BinaryOp struct {
 	Now func() time.Time
 }
 
+type binarySnapshotV1 struct {
+	Type     BinaryOpType
+	JoinTTL  time.Duration
+	Left     map[any]map[string]binaryJoinEntryV1
+	Right    map[any]map[string]binaryJoinEntryV1
+}
+
+type binaryJoinEntryV1 struct {
+	Tuple     types.Tuple
+	Count     int64
+	ExpiresAt time.Time
+}
+
+func (b *BinaryOp) Snapshot() (any, error) {
+	if b == nil {
+		return binarySnapshotV1{}, nil
+	}
+	// Note: function fields (key/combine) are part of the graph definition and are
+	// not snapshotted.
+	bs := binarySnapshotV1{Type: b.Type, JoinTTL: b.JoinTTL}
+	bs.Left = make(map[any]map[string]binaryJoinEntryV1)
+	bs.Right = make(map[any]map[string]binaryJoinEntryV1)
+	for k, bucket := range b.leftState {
+		m := make(map[string]binaryJoinEntryV1, len(bucket))
+		for tk, e := range bucket {
+			if e == nil {
+				continue
+			}
+			m[tk] = binaryJoinEntryV1{Tuple: cloneTupleLocal(e.tuple), Count: e.count, ExpiresAt: e.expiresAt}
+		}
+		if len(m) > 0 {
+			bs.Left[k] = m
+		}
+	}
+	for k, bucket := range b.rightState {
+		m := make(map[string]binaryJoinEntryV1, len(bucket))
+		for tk, e := range bucket {
+			if e == nil {
+				continue
+			}
+			m[tk] = binaryJoinEntryV1{Tuple: cloneTupleLocal(e.tuple), Count: e.count, ExpiresAt: e.expiresAt}
+		}
+		if len(m) > 0 {
+			bs.Right[k] = m
+		}
+	}
+	return bs, nil
+}
+
+func (b *BinaryOp) Restore(state any) error {
+	if b == nil {
+		return fmt.Errorf("BinaryOp is nil")
+	}
+	bs, ok := state.(binarySnapshotV1)
+	if !ok {
+		return fmt.Errorf("unexpected snapshot type %T", state)
+	}
+	b.Type = bs.Type
+	b.JoinTTL = bs.JoinTTL
+
+	if b.leftState == nil {
+		b.leftState = make(map[any]joinBucket)
+	} else {
+		for k := range b.leftState {
+			delete(b.leftState, k)
+		}
+	}
+	if b.rightState == nil {
+		b.rightState = make(map[any]joinBucket)
+	} else {
+		for k := range b.rightState {
+			delete(b.rightState, k)
+		}
+	}
+
+	for k, bucket := range bs.Left {
+		jb := make(joinBucket, len(bucket))
+		for tk, e := range bucket {
+			jb[tk] = &joinEntry{tuple: cloneTupleLocal(e.Tuple), count: e.Count, expiresAt: e.ExpiresAt}
+		}
+		if len(jb) > 0 {
+			b.leftState[k] = jb
+		}
+	}
+	for k, bucket := range bs.Right {
+		jb := make(joinBucket, len(bucket))
+		for tk, e := range bucket {
+			jb[tk] = &joinEntry{tuple: cloneTupleLocal(e.Tuple), count: e.Count, expiresAt: e.ExpiresAt}
+		}
+		if len(jb) > 0 {
+			b.rightState[k] = jb
+		}
+	}
+	return nil
+}
+
 // NewUnionOp creates a union operator.
 func NewUnionOp() *BinaryOp {
 	return &BinaryOp{

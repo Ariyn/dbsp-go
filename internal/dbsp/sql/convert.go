@@ -17,6 +17,13 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 	p := parser.NewParser()
 	stmt, err := p.Parse(query)
 	if err != nil {
+		// tree-sitter가 TUMBLE/HOP/SESSION 문법을 못 먹는 경우가 있어
+		// 문자열 기반 fallback으로 time-window GROUP BY만 구제한다.
+		if lp, ok, ferr := parseTimeWindowGroupByFallback(query); ferr != nil {
+			return nil, ferr
+		} else if ok {
+			return lp, nil
+		}
 		return nil, err
 	}
 
@@ -96,11 +103,44 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 	var (
 		groupCols  []string
 		windowSpec *ir.WindowSpec
+		timeWindowSpec *ir.TimeWindowSpec
 	)
 
-	groupCols, windowSpec, err = parseGroupBy(sel.GroupBy)
+	groupCols, windowSpec, timeWindowSpec, err = parseGroupByWithTimeWindow(sel.GroupBy)
 	if err != nil {
 		return nil, err
+	}
+
+	// If this GROUP BY has an event-time window function (TUMBLE/HOP/SESSION),
+	// model it as a LogicalWindowAgg rather than a normal LogicalGroupAgg.
+	if timeWindowSpec != nil {
+		aggs, err := findAggregatesFromQuery(query)
+		if err != nil {
+			return nil, err
+		}
+		if len(aggs) != 1 {
+			return nil, errors.New("time-window GROUP BY supports exactly one aggregate")
+		}
+		aggName := strings.ToUpper(strings.TrimSpace(aggs[0].Name))
+		aggCol := strings.TrimSpace(aggs[0].Col)
+		if aggName == "COUNT" && aggCol == "*" {
+			aggCol = ""
+		}
+
+		outputCol := extractAggAliasFromQuery(query, aggs[0])
+		if strings.TrimSpace(outputCol) == "" {
+			outputCol = strings.ToLower(aggName) + "_" + strings.ReplaceAll(aggs[0].Col, " ", "")
+		}
+
+		wa := &ir.LogicalWindowAgg{
+			AggName:        aggName,
+			AggCol:         aggCol,
+			PartitionBy:    groupCols,
+			TimeWindowSpec: timeWindowSpec,
+			OutputCol:      outputCol,
+			Input:          currentNode,
+		}
+		return wa, nil
 	}
 
 	// Use original query string to find aggregates because parser has bugs
@@ -519,11 +559,41 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string) (i
 	var (
 		groupCols  []string
 		windowSpec *ir.WindowSpec
+		timeWindowSpec *ir.TimeWindowSpec
 	)
 
-	groupCols, windowSpec, err = parseGroupBy(sel.GroupBy)
+	groupCols, windowSpec, timeWindowSpec, err = parseGroupByWithTimeWindow(sel.GroupBy)
 	if err != nil {
 		return nil, err
+	}
+
+	if timeWindowSpec != nil {
+		aggs, err := findAggregatesFromQuery(rawQuery)
+		if err != nil {
+			return nil, err
+		}
+		if len(aggs) != 1 {
+			return nil, errors.New("time-window GROUP BY supports exactly one aggregate")
+		}
+		aggName := strings.ToUpper(strings.TrimSpace(aggs[0].Name))
+		aggCol := strings.TrimSpace(aggs[0].Col)
+		if aggName == "COUNT" && aggCol == "*" {
+			aggCol = ""
+		}
+		outputCol := extractAggAliasFromQuery(rawQuery, aggs[0])
+		if strings.TrimSpace(outputCol) == "" {
+			outputCol = strings.ToLower(aggName) + "_" + strings.ReplaceAll(aggs[0].Col, " ", "")
+		}
+
+		wa := &ir.LogicalWindowAgg{
+			AggName:        aggName,
+			AggCol:         aggCol,
+			PartitionBy:    groupCols,
+			TimeWindowSpec: timeWindowSpec,
+			OutputCol:      outputCol,
+			Input:          currentNode,
+		}
+		return wa, nil
 	}
 
 	// Find aggregates from query string

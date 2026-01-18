@@ -916,19 +916,114 @@ func TestWindowAggOp_SessionWindow(t *testing.T) {
 		t.Fatalf("Apply failed: %v", err)
 	}
 
-	t.Logf("Session Window Output (%d deltas):", len(out))
-	for i, td := range out {
-		start := td.Tuple["__window_start"]
-		end := td.Tuple["__window_end"]
-		t.Logf("  [%d] session=[%v, %v) count=%d user=%v",
-			i, start, end, td.Count, td.Tuple["user"])
+	// Expected: two inserted session outputs
+	// Session 1: [1000, 8000)
+	// Session 2: [10000, 15000)
+	seen := map[[2]int64]int64{}
+	for _, td := range out {
+		start, _ := td.Tuple["__window_start"].(int64)
+		end, _ := td.Tuple["__window_end"].(int64)
+		seen[[2]int64{start, end}] += td.Count
+		if td.Tuple["user"] != "Alice" {
+			t.Fatalf("expected user=Alice, got %v", td.Tuple["user"])
+		}
+	}
+	if seen[[2]int64{1000, 8000}] != 1 {
+		t.Fatalf("expected insert for [1000,8000), got %d", seen[[2]int64{1000, 8000}])
+	}
+	if seen[[2]int64{10000, 15000}] != 1 {
+		t.Fatalf("expected insert for [10000,15000), got %d", seen[[2]int64{10000, 15000}])
+	}
+}
+
+func TestWindowAggOp_SessionWindow_MergeAcrossBatches(t *testing.T) {
+	// gap=5s
+	spec := WindowSpecLite{TimeCol: "ts", WindowType: WindowTypeSession, GapMillis: 5000}
+	keyFn := func(t types.Tuple) any { return t["user"] }
+	aggInit := func() any { return int64(0) }
+	agg := &CountAgg{}
+	op := NewWindowAggOp(spec, keyFn, []string{"user"}, aggInit, agg)
+
+	// Batch1: two sessions
+	out1, err := op.Apply(types.Batch{
+		{Tuple: types.Tuple{"user": "Alice", "ts": int64(1000)}, Count: 1},
+		{Tuple: types.Tuple{"user": "Alice", "ts": int64(10000)}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply batch1 failed: %v", err)
+	}
+	if len(out1) == 0 {
+		t.Fatalf("expected outputs in batch1")
 	}
 
-	// Expected: 2 sessions
-	// Session 1: [1000, 8000) - events at 1s, 3s
-	// Session 2: [10000, 15000) - event at 10s
-	if len(out) < 2 {
-		t.Errorf("expected at least 2 session windows, got %d", len(out))
+	// Batch2: event at 6000 bridges sessions -> should merge into one
+	out2, err := op.Apply(types.Batch{{Tuple: types.Tuple{"user": "Alice", "ts": int64(6000)}, Count: 1}})
+	if err != nil {
+		t.Fatalf("Apply batch2 failed: %v", err)
+	}
+	seen := map[[2]int64]int64{}
+	for _, td := range out2 {
+		start, _ := td.Tuple["__window_start"].(int64)
+		end, _ := td.Tuple["__window_end"].(int64)
+		seen[[2]int64{start, end}] += td.Count
+	}
+	// retract old two, insert merged [1000,15000)
+	if seen[[2]int64{1000, 6000}] != -1 && seen[[2]int64{1000, 6000}] != 0 {
+		// Depending on sessionization, [1000,6000) is possible only if last event was 1000.
+		// We assert stronger via required merge output below.
+		_ = seen
+	}
+	if seen[[2]int64{1000, 15000}] != 1 {
+		t.Fatalf("expected insert for merged [1000,15000), got %d (full=%v)", seen[[2]int64{1000, 15000}], seen)
+	}
+	// Total net count should be -1 (remove 2 add 1) => -1 over all deltas.
+	var net int64
+	for _, c := range seen {
+		net += c
+	}
+	if net != -1 {
+		t.Fatalf("expected net -1 (merge), got %d (full=%v)", net, seen)
+	}
+}
+
+func TestWindowAggOp_SessionWindow_SplitOnDeletion(t *testing.T) {
+	// gap=5s
+	spec := WindowSpecLite{TimeCol: "ts", WindowType: WindowTypeSession, GapMillis: 5000}
+	keyFn := func(t types.Tuple) any { return t["user"] }
+	aggInit := func() any { return int64(0) }
+	agg := &CountAgg{}
+	op := NewWindowAggOp(spec, keyFn, []string{"user"}, aggInit, agg)
+
+	// Start with one merged session: 1s, 6s, 10s
+	_, err := op.Apply(types.Batch{
+		{Tuple: types.Tuple{"user": "Alice", "ts": int64(1000)}, Count: 1},
+		{Tuple: types.Tuple{"user": "Alice", "ts": int64(6000)}, Count: 1},
+		{Tuple: types.Tuple{"user": "Alice", "ts": int64(10000)}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply insert failed: %v", err)
+	}
+
+	// Delete the bridging event at 6s -> split into two sessions
+	out, err := op.Apply(types.Batch{{Tuple: types.Tuple{"user": "Alice", "ts": int64(6000)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply delete failed: %v", err)
+	}
+	seen := map[[2]int64]int64{}
+	for _, td := range out {
+		start, _ := td.Tuple["__window_start"].(int64)
+		end, _ := td.Tuple["__window_end"].(int64)
+		seen[[2]int64{start, end}] += td.Count
+	}
+	// retract merged [1000,15000), insert [1000,6000) and [10000,15000)
+	if seen[[2]int64{1000, 15000}] != -1 {
+		t.Fatalf("expected retraction for [1000,15000), got %d (full=%v)", seen[[2]int64{1000, 15000}], seen)
+	}
+	if seen[[2]int64{1000, 6000}] != 1 {
+		t.Fatalf("expected insert for [1000,6000), got %d (full=%v)", seen[[2]int64{1000, 6000}], seen)
+	}
+	if seen[[2]int64{10000, 15000}] != 1 {
+		t.Fatalf("expected insert for [10000,15000), got %d (full=%v)", seen[[2]int64{10000, 15000}], seen)
 	}
 }
 

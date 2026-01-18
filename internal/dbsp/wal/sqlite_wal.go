@@ -15,7 +15,16 @@ import (
 
 const (
 	sqliteCodecGobV1 = "gob-v1"
+	sqliteCodecGraphGobV1 = "graph-gob-v1"
 )
+
+// Checkpoint represents a persisted operator-graph snapshot paired with a WAL position.
+// lastSeq is the maximum seq included in the snapshot; replay should continue with seq > lastSeq.
+type Checkpoint struct {
+	LastSeq  int64
+	Codec    string
+	Snapshot []byte
+}
 
 type SQLiteWAL struct {
 	db         *sql.DB
@@ -73,6 +82,15 @@ CREATE TABLE IF NOT EXISTS wal_batches (
 	payload BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wal_batches_created_at ON wal_batches(created_at_unix_ms);
+
+CREATE TABLE IF NOT EXISTS wal_checkpoints (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	created_at_unix_ms INTEGER NOT NULL,
+	last_seq INTEGER NOT NULL,
+	codec TEXT NOT NULL,
+	snapshot BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wal_checkpoints_created_at ON wal_checkpoints(created_at_unix_ms);
 `)
 	if err != nil {
 		return fmt.Errorf("create wal schema: %w", err)
@@ -146,6 +164,114 @@ func (w *SQLiteWAL) Replay(ctx context.Context, apply func(types.Batch) error) e
 	}
 
 	return nil
+}
+
+// MaxSeq returns the current maximum wal_batches.seq (or 0 if empty).
+func (w *SQLiteWAL) MaxSeq(ctx context.Context) (int64, error) {
+	if w == nil || w.db == nil {
+		return 0, fmt.Errorf("wal is nil")
+	}
+	var maxSeq sql.NullInt64
+	if err := w.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM wal_batches`).Scan(&maxSeq); err != nil {
+		return 0, fmt.Errorf("query max seq: %w", err)
+	}
+	if !maxSeq.Valid {
+		return 0, nil
+	}
+	return maxSeq.Int64, nil
+}
+
+// ReplayFrom replays wal_batches with seq > afterSeq.
+func (w *SQLiteWAL) ReplayFrom(ctx context.Context, afterSeq int64, apply func(types.Batch) error) error {
+	if w == nil || w.db == nil {
+		return fmt.Errorf("wal is nil")
+	}
+	if apply == nil {
+		return fmt.Errorf("apply callback is nil")
+	}
+
+	rows, err := w.db.QueryContext(ctx, `SELECT codec, payload FROM wal_batches WHERE seq > ? ORDER BY seq ASC`, afterSeq)
+	if err != nil {
+		return fmt.Errorf("query wal from seq: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		var codec string
+		var payload []byte
+		if err := rows.Scan(&codec, &payload); err != nil {
+			return fmt.Errorf("scan wal row: %w", err)
+		}
+
+		var batch types.Batch
+		switch codec {
+		case sqliteCodecGobV1:
+			b, err := decodeBatchGobV1(payload)
+			if err != nil {
+				return err
+			}
+			batch = b
+		default:
+			return fmt.Errorf("unknown wal codec: %s", codec)
+		}
+
+		if err := apply(batch); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate wal rows: %w", err)
+	}
+	return nil
+}
+
+// SaveCheckpoint stores a snapshot with a WAL position.
+func (w *SQLiteWAL) SaveCheckpoint(ctx context.Context, cp Checkpoint) error {
+	if w == nil || w.db == nil {
+		return fmt.Errorf("wal is nil")
+	}
+	if len(cp.Snapshot) == 0 {
+		return fmt.Errorf("checkpoint snapshot is empty")
+	}
+	if cp.Codec == "" {
+		cp.Codec = sqliteCodecGraphGobV1
+	}
+	if cp.LastSeq < 0 {
+		return fmt.Errorf("checkpoint last seq is negative")
+	}
+	_, err := w.db.ExecContext(ctx,
+		`INSERT INTO wal_checkpoints(created_at_unix_ms, last_seq, codec, snapshot) VALUES (?, ?, ?, ?)`,
+		time.Now().UnixMilli(), cp.LastSeq, cp.Codec, cp.Snapshot,
+	)
+	if err != nil {
+		return fmt.Errorf("save checkpoint: %w", err)
+	}
+	return nil
+}
+
+// LoadLatestCheckpoint returns the most recent checkpoint, or (nil, nil) if none.
+func (w *SQLiteWAL) LoadLatestCheckpoint(ctx context.Context) (*Checkpoint, error) {
+	if w == nil || w.db == nil {
+		return nil, fmt.Errorf("wal is nil")
+	}
+	row := w.db.QueryRowContext(ctx,
+		`SELECT last_seq, codec, snapshot FROM wal_checkpoints ORDER BY id DESC LIMIT 1`)
+	var lastSeq int64
+	var codec string
+	var snapshot []byte
+	if err := row.Scan(&lastSeq, &codec, &snapshot); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load latest checkpoint: %w", err)
+	}
+	return &Checkpoint{LastSeq: lastSeq, Codec: codec, Snapshot: snapshot}, nil
 }
 
 func (w *SQLiteWAL) Close() error {

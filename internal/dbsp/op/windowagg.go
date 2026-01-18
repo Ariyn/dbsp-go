@@ -32,9 +32,9 @@ const (
 // WindowSpecLite is a minimal view of window spec used by WindowAggOp.
 // We keep it local to avoid import cycles with ir.
 type WindowSpecLite struct {
-	TimeCol    string
-	SizeMillis int64
-	WindowType WindowType // TUMBLING, SLIDING, or SESSION
+	TimeCol     string
+	SizeMillis  int64
+	WindowType  WindowType // TUMBLING, SLIDING, or SESSION
 	SlideMillis int64      // For sliding windows (hop size)
 	GapMillis   int64      // For session windows (inactivity gap)
 }
@@ -51,14 +51,14 @@ type FrameSpecLite struct {
 // WindowAggOp maintains per-window aggregate state and emits deltas only
 // for windows affected by each input delta.
 type WindowAggOp struct {
-	Spec        WindowSpecLite
-	KeyFn       func(types.Tuple) any
-	GroupKeys   []string // column names for group keys (empty if no grouping)
-	OrderByCol  string   // ORDER BY column for frame-based windows
-	FrameSpec   *FrameSpecLite
-	AggInit     func() any
-	AggFn       AggFunc
-	State       WindowAggState
+	Spec       WindowSpecLite
+	KeyFn      func(types.Tuple) any
+	GroupKeys  []string // column names for group keys (empty if no grouping)
+	OrderByCol string   // ORDER BY column for frame-based windows
+	FrameSpec  *FrameSpecLite
+	AggInit    func() any
+	AggFn      AggFunc
+	State      WindowAggState
 	// GroupCounts tracks raw row multiplicity per (window, groupKey).
 	// It is used to evict empty groups/windows so state doesn't retain
 	// entries with aggregate value 0 after deletions.
@@ -66,6 +66,64 @@ type WindowAggOp struct {
 	WatermarkFn func() int64 // optional; nil means no watermark/GC logic
 	// Per-partition ordered buffers for frame-based aggregation
 	PartitionBuffers map[any]*PartitionBuffer
+
+	// SessionBuffers maintains per-partition event buffers for session windows.
+	// It stores rows ordered by event time and supports deletions.
+	SessionBuffers map[any]*PartitionBuffer
+	// sessionOut stores the last computed session output tuples per partition.
+	// We diff against this to emit retractions/insertions when sessions merge/split/extend.
+	sessionOut map[any]map[string]types.Tuple
+}
+
+type windowAggSnapshotV1 struct {
+	Spec             WindowSpecLite
+	State            WindowAggState
+	GroupCounts      map[WindowID]map[any]int64
+	PartitionBuffers map[any]*PartitionBuffer
+	SessionBuffers   map[any]*PartitionBuffer
+	SessionOut       map[any]map[string]types.Tuple
+}
+
+func (w *WindowAggOp) Snapshot() (any, error) {
+	if w == nil {
+		return windowAggSnapshotV1{}, nil
+	}
+	w.ensureStateMaps()
+
+	snap := windowAggSnapshotV1{
+		Spec:        w.Spec,
+		State:       w.State,
+		GroupCounts: w.GroupCounts,
+	}
+	if w.PartitionBuffers != nil {
+		snap.PartitionBuffers = w.PartitionBuffers
+	}
+	if w.SessionBuffers != nil {
+		snap.SessionBuffers = w.SessionBuffers
+	}
+	if w.sessionOut != nil {
+		snap.SessionOut = w.sessionOut
+	}
+	return snap, nil
+}
+
+func (w *WindowAggOp) Restore(state any) error {
+	if w == nil {
+		return fmt.Errorf("WindowAggOp is nil")
+	}
+	s, ok := state.(windowAggSnapshotV1)
+	if !ok {
+		return fmt.Errorf("unexpected snapshot type %T", state)
+	}
+	// Spec is part of the operator definition; restore it anyway for safety.
+	w.Spec = s.Spec
+	w.State = s.State
+	w.GroupCounts = s.GroupCounts
+	w.PartitionBuffers = s.PartitionBuffers
+	w.SessionBuffers = s.SessionBuffers
+	w.sessionOut = s.SessionOut
+	w.ensureStateMaps()
+	return nil
 }
 
 // PartitionBuffer maintains ordered rows within a partition for frame-based aggregation
@@ -92,6 +150,8 @@ func NewWindowAggOp(spec WindowSpecLite, keyFn func(types.Tuple) any, groupKeys 
 		},
 		GroupCounts:      make(map[WindowID]map[any]int64),
 		PartitionBuffers: make(map[any]*PartitionBuffer),
+		SessionBuffers:   make(map[any]*PartitionBuffer),
+		sessionOut:       make(map[any]map[string]types.Tuple),
 	}
 }
 
@@ -101,6 +161,12 @@ func (w *WindowAggOp) ensureStateMaps() {
 	}
 	if w.GroupCounts == nil {
 		w.GroupCounts = make(map[WindowID]map[any]int64)
+	}
+	if w.SessionBuffers == nil {
+		w.SessionBuffers = make(map[any]*PartitionBuffer)
+	}
+	if w.sessionOut == nil {
+		w.sessionOut = make(map[any]map[string]types.Tuple)
 	}
 }
 
@@ -162,19 +228,19 @@ func windowIDsForSliding(spec WindowSpecLite, ts int64) []WindowID {
 	if spec.SizeMillis <= 0 || spec.SlideMillis <= 0 {
 		return nil
 	}
-	
+
 	var windows []WindowID
-	
+
 	// Find the earliest window that could contain this timestamp
 	// Window starts are at 0, slide, 2*slide, 3*slide, ...
 	// We need windows where: windowStart <= ts < windowStart + size
-	
+
 	// Calculate the first window start that ends after ts
 	firstPossibleStart := ((ts - spec.SizeMillis + 1) / spec.SlideMillis) * spec.SlideMillis
 	if firstPossibleStart < 0 {
 		firstPossibleStart = 0
 	}
-	
+
 	// Generate all windows that contain ts
 	for start := firstPossibleStart; start <= ts; start += spec.SlideMillis {
 		end := start + spec.SizeMillis
@@ -186,7 +252,7 @@ func windowIDsForSliding(spec WindowSpecLite, ts int64) []WindowID {
 			break
 		}
 	}
-	
+
 	return windows
 }
 
@@ -210,7 +276,7 @@ func (w *WindowAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	if w.FrameSpec != nil && w.OrderByCol != "" {
 		return w.applyFrameBased(batch)
 	}
-	
+
 	// Choose window type
 	switch w.Spec.WindowType {
 	case WindowTypeSliding:
@@ -527,112 +593,208 @@ func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 	return out, nil
 }
 
-// SessionState tracks active sessions per partition
-type SessionState struct {
-	LastEventTime int64
-	WindowStart   int64
-	AggValue      any
-}
-
-// applySession handles session windows
+// applySession handles session windows.
+// This implementation is stateful across batches and supports session extend/merge/split.
+// For correctness and simplicity, we buffer per-partition events and recompute the
+// sessionization for each touched partition, then emit output deltas as full tuple
+// retractions/insertions.
 func (w *WindowAggOp) applySession(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
 	w.ensureStateMaps()
-
-	// Group events by partition key
-	partitionEvents := make(map[any][]types.TupleDelta)
-	for _, td := range batch {
-		groupKey := w.KeyFn(td.Tuple)
-		partitionEvents[groupKey] = append(partitionEvents[groupKey], td)
+	if w.Spec.GapMillis <= 0 {
+		return nil, fmt.Errorf("session window requires GapMillis > 0")
 	}
 
-	// Process each partition separately
-	for groupKey, events := range partitionEvents {
-		// Sort events by timestamp
-		sort.Slice(events, func(i, j int) bool {
-			ti, _ := events[i].Tuple[w.Spec.TimeCol].(int64)
-			tj, _ := events[j].Tuple[w.Spec.TimeCol].(int64)
-			return ti < tj
-		})
+	// Track which partitions are touched by this batch.
+	touched := make(map[any]struct{})
 
-		var currentSession *SessionState
-		
-		for _, td := range events {
-			rawTs, ok := td.Tuple[w.Spec.TimeCol]
-			if !ok || rawTs == nil {
-				continue
-			}
-			ts, ok := rawTs.(int64)
-			if !ok {
-				continue
-			}
-
-			// Check if we need to start a new session
-			if currentSession == nil || (ts - currentSession.LastEventTime) > w.Spec.GapMillis {
-				// Close previous session if exists
-				if currentSession != nil {
-					wid := WindowID{
-						Start: currentSession.WindowStart,
-						End:   currentSession.LastEventTime + w.Spec.GapMillis,
-					}
-					
-					// Emit session close delta
-					delta := &types.TupleDelta{
-						Tuple: types.Tuple{
-							"__window_start": wid.Start,
-							"__window_end":   wid.End,
-						},
-						Count: 1,
-					}
-					if len(events) > 0 {
-						w.injectGroupKeyColumns(delta.Tuple, events[0].Tuple)
-					}
-					out = append(out, *delta)
-				}
-				
-				// Start new session
-				currentSession = &SessionState{
-					WindowStart:   ts,
-					LastEventTime: ts,
-					AggValue:      w.AggInit(),
-				}
-			}
-
-			// Update session
-			currentSession.LastEventTime = ts
-			newVal, delta := w.AggFn.Apply(currentSession.AggValue, td)
-			currentSession.AggValue = newVal
-
-			wid := WindowID{
-				Start: currentSession.WindowStart,
-				End:   currentSession.LastEventTime + w.Spec.GapMillis,
-			}
-			// Store state and maintain raw row counts even if AggFn emits no delta.
-			gm, ok := w.State.Data[wid]
-			if !ok {
-				gm = make(map[any]any)
-				w.State.Data[wid] = gm
-			}
-			gm[groupKey] = newVal
-			if err := w.applyGroupCount(wid, groupKey, td.Count); err != nil {
-				return nil, err
-			}
-
-			// Emit delta for current session window
-			if delta != nil {
-				if delta.Tuple == nil {
-					delta.Tuple = types.Tuple{}
-				}
-				delta.Tuple["__window_start"] = wid.Start
-				delta.Tuple["__window_end"] = wid.End
-				w.injectGroupKeyColumns(delta.Tuple, td.Tuple)
-
-				out = append(out, *delta)
-			}
+	// Update per-partition event buffers (insert/delete).
+	for _, td := range batch {
+		groupKey := w.KeyFn(td.Tuple)
+		touched[groupKey] = struct{}{}
+		pb := w.getOrCreateSessionBuffer(groupKey)
+		if err := pb.addRowStrict(td, w.Spec.TimeCol); err != nil {
+			return nil, err
 		}
 	}
 
+	// Recompute sessions for each touched partition and diff against previous output.
+	for groupKey := range touched {
+		pb := w.getOrCreateSessionBuffer(groupKey)
+		newTuples, err := w.computeSessionOutputForPartition(pb)
+		if err != nil {
+			return nil, err
+		}
+		newMap := make(map[string]types.Tuple, len(newTuples))
+		for _, t := range newTuples {
+			newMap[tupleKeyLocal(t)] = t
+		}
+
+		oldMap := w.sessionOut[groupKey]
+		if oldMap == nil {
+			oldMap = make(map[string]types.Tuple)
+		}
+
+		// Retractions
+		for k, tup := range oldMap {
+			if _, ok := newMap[k]; !ok {
+				out = append(out, types.TupleDelta{Tuple: tup, Count: -1})
+			}
+		}
+		// Insertions
+		for k, tup := range newMap {
+			if _, ok := oldMap[k]; !ok {
+				out = append(out, types.TupleDelta{Tuple: tup, Count: 1})
+			}
+		}
+
+		// Save
+		w.sessionOut[groupKey] = newMap
+	}
+
 	return out, nil
+}
+
+func (w *WindowAggOp) getOrCreateSessionBuffer(key any) *PartitionBuffer {
+	if w.SessionBuffers == nil {
+		w.SessionBuffers = make(map[any]*PartitionBuffer)
+	}
+	buffer, ok := w.SessionBuffers[key]
+	if !ok {
+		buffer = &PartitionBuffer{Rows: []RowWithOrder{}}
+		w.SessionBuffers[key] = buffer
+	}
+	return buffer
+}
+
+func (pb *PartitionBuffer) addRowStrict(td types.TupleDelta, orderByCol string) error {
+	orderValue := td.Tuple[orderByCol]
+	idx := -1
+	for i, row := range pb.Rows {
+		if compareValues(row.OrderValue, orderValue) == 0 && tuplesEqual(row.Tuple, td.Tuple) {
+			idx = i
+			break
+		}
+	}
+
+	if idx >= 0 {
+		pb.Rows[idx].Count += td.Count
+		if pb.Rows[idx].Count < 0 {
+			return fmt.Errorf("row underflow for order=%v tuple=%v", orderValue, td.Tuple)
+		}
+		if pb.Rows[idx].Count == 0 {
+			pb.Rows = append(pb.Rows[:idx], pb.Rows[idx+1:]...)
+		}
+		return nil
+	}
+
+	if td.Count < 0 {
+		return fmt.Errorf("row not found for deletion order=%v tuple=%v", orderValue, td.Tuple)
+	}
+
+	newRow := RowWithOrder{OrderValue: orderValue, Tuple: td.Tuple, Count: td.Count}
+	pb.Rows = append(pb.Rows, newRow)
+	sort.Slice(pb.Rows, func(i, j int) bool {
+		return compareValues(pb.Rows[i].OrderValue, pb.Rows[j].OrderValue) < 0
+	})
+	return nil
+}
+
+func (w *WindowAggOp) computeSessionOutputForPartition(buffer *PartitionBuffer) ([]types.Tuple, error) {
+	if buffer == nil || len(buffer.Rows) == 0 {
+		return nil, nil
+	}
+	// Ensure time column values are int64.
+	getTS := func(row RowWithOrder) (int64, bool) {
+		if row.OrderValue == nil {
+			return 0, false
+		}
+		v, ok := row.OrderValue.(int64)
+		return v, ok
+	}
+
+	var out []types.Tuple
+
+	var sessionRows []RowWithOrder
+	var startTS int64
+	var lastTS int64
+	var haveSession bool
+
+	flush := func() error {
+		if !haveSession || len(sessionRows) == 0 {
+			return nil
+		}
+		aggState := w.AggInit()
+		for _, r := range sessionRows {
+			td := types.TupleDelta{Tuple: r.Tuple, Count: r.Count}
+			newVal, _ := w.AggFn.Apply(aggState, td)
+			aggState = newVal
+		}
+		wid := WindowID{Start: startTS, End: lastTS + w.Spec.GapMillis}
+		tup := types.Tuple{
+			"__window_start": wid.Start,
+			"__window_end":   wid.End,
+		}
+		w.injectGroupKeyColumns(tup, sessionRows[0].Tuple)
+		tup = w.extractAggResult(tup, aggState)
+		out = append(out, tup)
+		return nil
+	}
+
+	for _, r := range buffer.Rows {
+		ts, ok := getTS(r)
+		if !ok {
+			continue
+		}
+		if !haveSession {
+			haveSession = true
+			startTS = ts
+			lastTS = ts
+			sessionRows = sessionRows[:0]
+			sessionRows = append(sessionRows, r)
+			continue
+		}
+		if (ts - lastTS) > w.Spec.GapMillis {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			startTS = ts
+			lastTS = ts
+			sessionRows = sessionRows[:0]
+			sessionRows = append(sessionRows, r)
+			continue
+		}
+		// Extend current session.
+		if ts > lastTS {
+			lastTS = ts
+		}
+		sessionRows = append(sessionRows, r)
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func tupleKeyLocal(tup types.Tuple) string {
+	if tup == nil {
+		return ""
+	}
+	keys := make([]string, 0, len(tup))
+	for k := range tup {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteString("|")
+		}
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(fmt.Sprintf("%v", tup[k]))
+	}
+	return b.String()
 }
 
 // applyFrameBased handles frame-based windows (RANGE/ROWS BETWEEN)
@@ -649,7 +811,7 @@ func (w *WindowAggOp) applyFrameBased(batch types.Batch) (types.Batch, error) {
 	// Process each partition
 	for partitionKey, deltas := range partitionDeltas {
 		buffer := w.getOrCreatePartitionBuffer(partitionKey)
-		
+
 		// Apply deltas to buffer
 		for _, td := range deltas {
 			buffer.addRow(td, w.OrderByCol)
@@ -682,7 +844,7 @@ func (w *WindowAggOp) getOrCreatePartitionBuffer(key any) *PartitionBuffer {
 // addRow adds or removes a row from the partition buffer
 func (pb *PartitionBuffer) addRow(td types.TupleDelta, orderByCol string) {
 	orderValue := td.Tuple[orderByCol]
-	
+
 	// Find existing row or insert position
 	idx := -1
 	for i, row := range pb.Rows {

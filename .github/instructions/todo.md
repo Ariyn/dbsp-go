@@ -95,20 +95,23 @@
 
 ## P2 (스트리밍 운영성/완성도)
 
-- [ ] **Window 세션 윈도우 정식 구현(merge/extend)**
-  - 현재 주석대로 단순화 구현(이벤트별 새 세션)
-  - 목표: 동일 파티션에서 gap 내 이벤트로 세션 확장/병합
+- [x] **Window 세션 윈도우 정식 구현(merge/extend)**
+  - 구현: 파티션별 이벤트 버퍼 유지 후 세션 재계산 + (이전 출력 vs 신규 출력) diff로 retraction/insert emit
+  - 포함: 배치 간 extend/merge, delete로 split
   - 후보 파일: `internal/dbsp/op/windowagg.go`
 
-- [ ] **워터마크/late-event 처리 end-to-end 연결**
+- [x] **워터마크/late-event 처리 end-to-end 연결**
   - `WatermarkAwareWindowOp`는 있으나 SQL 변환/파이프라인과 일관 결합 부족
   - 목표: 설정/플래그로 watermark 활성화, GC 규칙/late policy가 실제 결과에 반영
   - 후보 파일: `internal/dbsp/op/watermark.go`, `internal/dbsp/ir/transform.go`, `cmd/dbsp/*`
+  - [x] cmd/dbsp: YAML 설정 + 그래프(WindowAggOp) wrapping 지원
+  - [x] SQL: GROUP BY TUMBLE/HOP/SESSION → TimeWindowSpec → WindowAggOp end-to-end 연결 + cmd E2E 테스트
 
-- [ ] **상태 스냅샷/복구(옵션)**
+- [x] **상태 스냅샷/복구(옵션)**
   - 목표: 장기 실행/재시작 가능
   - 후보 파일: `internal/dbsp/state/*`
   - [x] SQLite 기반 입력 WAL(append-only) + 재시작 replay (체크포인트 전 단계)
+  - [x] 체크포인트(그래프 snapshot) 저장/복구 + suffix replay 연결
 
 - [ ] **타입/NULL 처리 정책 정리**
   - 목표: 비교/캐스팅/NULL 전파를 일관된 규칙으로(테스트 포함)

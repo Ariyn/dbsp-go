@@ -31,6 +31,80 @@ type GroupAggOp struct {
 	GroupKeyColNames []string
 }
 
+type groupAggSnapshotV1 struct {
+	State           map[any]any
+	MultiState      map[any][]any
+	KeyColName      string
+	GroupKeyColNames []string
+}
+
+func (g *GroupAggOp) Snapshot() (any, error) {
+	if g == nil {
+		return groupAggSnapshotV1{}, nil
+	}
+	snap := groupAggSnapshotV1{KeyColName: g.KeyColName}
+	if len(g.GroupKeyColNames) > 0 {
+		snap.GroupKeyColNames = append([]string(nil), g.GroupKeyColNames...)
+	}
+	if g.state != nil {
+		snap.State = make(map[any]any, len(g.state))
+		for k, v := range g.state {
+			snap.State[k] = v
+		}
+	}
+	if g.multiState != nil {
+		snap.MultiState = make(map[any][]any, len(g.multiState))
+		for k, v := range g.multiState {
+			if v == nil {
+				continue
+			}
+			cpy := make([]any, len(v))
+			copy(cpy, v)
+			snap.MultiState[k] = cpy
+		}
+	}
+	return snap, nil
+}
+
+func (g *GroupAggOp) Restore(state any) error {
+	if g == nil {
+		return fmt.Errorf("GroupAggOp is nil")
+	}
+	s, ok := state.(groupAggSnapshotV1)
+	if !ok {
+		return fmt.Errorf("unexpected snapshot type %T", state)
+	}
+	g.KeyColName = s.KeyColName
+	if len(s.GroupKeyColNames) > 0 {
+		g.GroupKeyColNames = append([]string(nil), s.GroupKeyColNames...)
+	} else {
+		g.GroupKeyColNames = nil
+	}
+
+	if s.State != nil {
+		g.state = make(map[any]any, len(s.State))
+		for k, v := range s.State {
+			g.state[k] = v
+		}
+	} else {
+		g.state = make(map[any]any)
+	}
+	if s.MultiState != nil {
+		g.multiState = make(map[any][]any, len(s.MultiState))
+		for k, v := range s.MultiState {
+			if v == nil {
+				continue
+			}
+			cpy := make([]any, len(v))
+			copy(cpy, v)
+			g.multiState[k] = cpy
+		}
+	} else {
+		g.multiState = make(map[any][]any)
+	}
+	return nil
+}
+
 // AggSlot describes a single aggregate inside a multi-aggregate GroupAggOp.
 // Init returns the initial aggregate state; Fn applies TupleDelta updates.
 type AggSlot struct {

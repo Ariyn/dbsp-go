@@ -1,6 +1,7 @@
 package op
 
 import (
+	"fmt"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
@@ -131,6 +132,71 @@ type WatermarkAwareWindowOp struct {
 	lateBuffer2   []types.TupleDelta // Buffer for late events
 }
 
+type watermarkAwareSnapshotV1 struct {
+	Base          windowAggSnapshotV1
+	Config        WatermarkConfig
+	MaxTimestamp  int64
+	MaxOutOfOrder int64
+	LateBuf       []types.TupleDelta
+}
+
+func (w *WatermarkAwareWindowOp) Snapshot() (any, error) {
+	if w == nil {
+		return watermarkAwareSnapshotV1{}, nil
+	}
+	baseAny, err := w.WindowAggOp.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	base, _ := baseAny.(windowAggSnapshotV1)
+
+	snap := watermarkAwareSnapshotV1{Base: base, Config: w.config}
+	if gen, ok := w.watermarkGen.(*BoundedOutOfOrdernessWatermark); ok && gen != nil {
+		snap.MaxTimestamp = gen.maxTimestamp
+		snap.MaxOutOfOrder = gen.maxOutOfOrderness
+	}
+	if w.lateBuffer != nil {
+		// Copy buffer contents without mutating the buffer.
+		snap.LateBuf = append([]types.TupleDelta(nil), w.lateBuffer.buffer...)
+	}
+	return snap, nil
+}
+
+func (w *WatermarkAwareWindowOp) Restore(state any) error {
+	if w == nil {
+		return fmt.Errorf("WatermarkAwareWindowOp is nil")
+	}
+	s, ok := state.(watermarkAwareSnapshotV1)
+	if !ok {
+		return fmt.Errorf("unexpected snapshot type %T", state)
+	}
+
+	// Restore base window state
+	if err := w.WindowAggOp.Restore(s.Base); err != nil {
+		return err
+	}
+
+	w.config = s.Config
+	if w.config.Enabled {
+		w.watermarkGen = NewBoundedOutOfOrdernessWatermark(s.MaxOutOfOrder)
+		if gen, ok := w.watermarkGen.(*BoundedOutOfOrdernessWatermark); ok {
+			gen.maxTimestamp = s.MaxTimestamp
+		}
+		if w.config.Policy == BufferLateEvents {
+			w.lateBuffer = NewLateEventBuffer(w.config.MaxBufferSize, w.config.AllowedLateness)
+			for _, td := range s.LateBuf {
+				_ = w.lateBuffer.Add(td)
+			}
+		} else {
+			w.lateBuffer = nil
+		}
+	} else {
+		w.watermarkGen = nil
+		w.lateBuffer = nil
+	}
+	return nil
+}
+
 // NewWatermarkAwareWindowOp creates a windowed aggregation operator with watermark support
 func NewWatermarkAwareWindowOp(
 	spec WindowSpecLite,
@@ -189,8 +255,13 @@ func (w *WatermarkAwareWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 		
 		// Check if event is late
 		watermark := w.watermarkGen.GetWatermark()
+		tooLateCutoff := watermark - w.config.AllowedLateness
+		if eventTime < tooLateCutoff {
+			// Too-late: always drop.
+			continue
+		}
 		if eventTime < watermark {
-			// Late event
+			// Late but within allowed lateness
 			switch w.config.Policy {
 			case DropLateEvents:
 				// Drop silently
@@ -205,7 +276,9 @@ func (w *WatermarkAwareWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 				// Process separately
 				w.lateBuffer2 = append(w.lateBuffer2, td)
 			}
-		} else {
+			continue
+		}
+		{
 			// On-time event
 			w.onTimeBuffer = append(w.onTimeBuffer, td)
 		}

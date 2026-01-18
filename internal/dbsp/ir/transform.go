@@ -1023,7 +1023,7 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 		agg = &op.AvgAgg{ColName: wa.AggCol}
 		aggInit = func() any { return op.AvgMonoid{} }
 	case "COUNT":
-		agg = &op.CountAgg{}
+		agg = &op.CountAgg{ColName: wa.AggCol}
 		aggInit = func() any { return int64(0) }
 	case "MIN":
 		agg = &op.MinAgg{ColName: wa.AggCol}
@@ -1062,7 +1062,7 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 		}
 
 		windowOp := op.NewWindowAggOp(windowSpec, keyFn, wa.PartitionBy, aggInit, agg)
-		return &op.Node{Op: windowOp}, nil
+		return attachLogicalWindowAggInput(wa, windowOp)
 	}
 
 	// For DuckDB window aggregates with ORDER BY and frame specification,
@@ -1081,7 +1081,7 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 		windowOp.OrderByCol = wa.OrderBy
 		windowOp.FrameSpec = frameSpec
 
-		return &op.Node{Op: windowOp}, nil
+		return attachLogicalWindowAggInput(wa, windowOp)
 	}
 
 	// Fallback to GroupAggOp for simple aggregations without frame
@@ -1090,7 +1090,57 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 		g.SetKeyColName(wa.PartitionBy[0])
 	}
 
-	return &op.Node{Op: g}, nil
+	return attachLogicalWindowAggInput(wa, g)
+}
+
+func attachLogicalWindowAggInput(wa *LogicalWindowAgg, aggOp op.Operator) (*op.Node, error) {
+	if wa == nil {
+		return &op.Node{Op: aggOp}, nil
+	}
+
+	// If there is no logical input, or it's a plain scan (not modeled as a node yet),
+	// return as a single-op node.
+	if wa.Input == nil {
+		return &op.Node{Op: aggOp}, nil
+	}
+	if _, ok := wa.Input.(*LogicalScan); ok {
+		return &op.Node{Op: aggOp}, nil
+	}
+
+	// Filter before window agg: chain filter MapOp then the window agg op.
+	if f, ok := wa.Input.(*LogicalFilter); ok {
+		predicateFn := BuildPredicateFunc(f.PredicateSQL)
+		filterOp := &op.MapOp{F: func(td types.TupleDelta) []types.TupleDelta {
+			if predicateFn(td.Tuple) {
+				return []types.TupleDelta{td}
+			}
+			return nil
+		}}
+
+		// Filter input may be a JOIN; preserve it as a true 2-input node.
+		if join, ok := f.Input.(*LogicalJoin); ok {
+			joinNode, err := logicalJoinToDBSP(join)
+			if err != nil {
+				return nil, err
+			}
+			chained := &op.ChainedOp{Ops: []op.Operator{filterOp, aggOp}}
+			return &op.Node{Op: chained, Inputs: []*op.Node{joinNode}}, nil
+		}
+
+		chained := &op.ChainedOp{Ops: []op.Operator{filterOp, aggOp}}
+		return &op.Node{Op: chained}, nil
+	}
+
+	// Window agg over JOIN output.
+	if join, ok := wa.Input.(*LogicalJoin); ok {
+		joinNode, err := logicalJoinToDBSP(join)
+		if err != nil {
+			return nil, err
+		}
+		return &op.Node{Op: aggOp, Inputs: []*op.Node{joinNode}}, nil
+	}
+
+	return &op.Node{Op: aggOp}, nil
 }
 
 // logicalJoinToDBSP transforms LogicalJoin to BinaryOp (JoinOp)

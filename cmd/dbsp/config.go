@@ -15,6 +15,10 @@ type PipelineConfig struct {
 type WALConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
+
+	// CheckpointEveryBatches enables periodic operator-graph snapshots.
+	// If 0, checkpointing is disabled.
+	CheckpointEveryBatches int `yaml:"checkpoint_every_batches"`
 }
 
 // SourceConfig defines the configuration for the data source
@@ -30,6 +34,17 @@ type TransformConfig struct {
 
 	// JoinTTL is an optional processing-time TTL for join state (e.g., "10s", "5 minutes").
 	JoinTTL string `yaml:"join_ttl"`
+
+	// Watermark configures watermark/late-event handling for time windows.
+	Watermark WatermarkYAMLConfig `yaml:"watermark"`
+}
+
+type WatermarkYAMLConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	MaxOutOfOrderness string `yaml:"max_out_of_orderness"` // e.g. "2s"
+	AllowedLateness   string `yaml:"allowed_lateness"`     // e.g. "1s"
+	Policy            string `yaml:"policy"`               // drop|buffer|emit
+	MaxBufferSize     int    `yaml:"max_buffer_size"`
 }
 
 // SinkConfig defines the configuration for the data sink

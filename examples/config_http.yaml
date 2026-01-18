@@ -14,6 +14,12 @@ pipeline:
   transform:
     type: sql
     join_ttl: "10 minutes"
+    # watermark:
+    #   enabled: true
+    #   max_out_of_orderness: "2s"
+    #   allowed_lateness: "1s"
+    #   policy: drop   # drop|buffer|emit
+    #   max_buffer_size: 1000
     query: "SELECT time_bucket, SUM(amount) as total_sales FROM sales GROUP BY time_bucket"
   sink:
     type: console

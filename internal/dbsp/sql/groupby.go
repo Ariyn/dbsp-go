@@ -10,6 +10,18 @@ import (
 // parseGroupBy parses GROUP BY expressions, extracting grouping columns and time windows.
 // Supports both standard columns and time window functions like TUMBLE(), HOP(), SESSION()
 func parseGroupBy(groupBy ast.GroupBy) ([]string, *ir.WindowSpec, error) {
+    groupCols, windowSpec, _, err := parseGroupByWithTimeWindow(groupBy)
+    return groupCols, windowSpec, err
+}
+
+// parseGroupByWithTimeWindow parses GROUP BY expressions, extracting grouping columns and
+// time-based windows (TUMBLE/HOP/SESSION).
+//
+// It returns:
+// - groupCols: grouping columns excluding the time window function (if present)
+// - windowSpec: legacy simple tumbling window spec (unused currently)
+// - timeWindowSpec: event-time window spec for WindowAggOp (if present)
+func parseGroupByWithTimeWindow(groupBy ast.GroupBy) ([]string, *ir.WindowSpec, *ir.TimeWindowSpec, error) {
 	var groupCols []string
 	var groupExprs []string
 
@@ -34,13 +46,13 @@ func parseGroupBy(groupBy ast.GroupBy) ([]string, *ir.WindowSpec, error) {
 	// Check for time window functions in group expressions
 	timeWindowSpec, remainingCols, err := ParseTimeWindowFromGroupBy(groupExprs)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	if timeWindowSpec != nil {
 		// Return remaining columns (non-window columns)
-		return remainingCols, nil, nil
+		return remainingCols, nil, timeWindowSpec, nil
 	}
 
-	return groupCols, nil, nil
+	return groupCols, nil, nil, nil
 }

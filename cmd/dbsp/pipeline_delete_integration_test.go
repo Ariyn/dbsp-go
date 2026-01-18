@@ -29,7 +29,7 @@ func TestRunPipeline_SQL_MultiAgg_DeleteRetraction(t *testing.T) {
 		return op.Execute(root, b)
 	}
 
-	if err := runPipeline(context.Background(), source, sink, execute, nil); err != nil {
+	if err := runPipeline(context.Background(), source, sink, execute, nil, nil, 0); err != nil {
 		t.Fatalf("runPipeline: %v", err)
 	}
 

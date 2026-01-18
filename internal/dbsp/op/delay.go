@@ -1,6 +1,7 @@
 package op
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
@@ -21,6 +22,44 @@ type DelayOp struct {
 	next types.Batch
 
 	initialized bool
+}
+
+type delaySnapshotV1 struct {
+	Seed        types.Batch
+	Prev        types.Batch
+	Next        types.Batch
+	Initialized bool
+}
+
+func (d *DelayOp) Snapshot() (any, error) {
+	if d == nil {
+		return delaySnapshotV1{}, nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return delaySnapshotV1{
+		Seed:        cloneBatch(d.seed),
+		Prev:        cloneBatch(d.prev),
+		Next:        cloneBatch(d.next),
+		Initialized: d.initialized,
+	}, nil
+}
+
+func (d *DelayOp) Restore(state any) error {
+	if d == nil {
+		return fmt.Errorf("DelayOp is nil")
+	}
+	s, ok := state.(delaySnapshotV1)
+	if !ok {
+		return fmt.Errorf("unexpected snapshot type %T", state)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.seed = cloneBatch(s.Seed)
+	d.prev = cloneBatch(s.Prev)
+	d.next = cloneBatch(s.Next)
+	d.initialized = s.Initialized
+	return nil
 }
 
 func NewDelayOp(seed types.Batch) *DelayOp {
