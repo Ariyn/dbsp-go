@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
-	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
+	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 )
 
 func TestApplyWatermarkConfig_WrapsWindowAgg(t *testing.T) {
@@ -39,6 +39,6 @@ func TestApplyWatermarkConfig_WrapsWindowAgg(t *testing.T) {
 			}
 		}
 	}
-	
+
 	t.Fatalf("expected a WindowAggOp to be wrapped with WatermarkAwareWindowOp somewhere, got root=%T", root.Op)
 }

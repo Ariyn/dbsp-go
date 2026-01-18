@@ -166,6 +166,29 @@ pipeline:
 - `format: json`은 TupleDelta를 **한 줄당 1개(JSON Lines)**로 append
 - `format: csv`는 헤더를 자동 생성하고 마지막 컬럼에 `__count`를 씁니다
 
+### 3) Parquet Sink (`type: parquet`)
+
+Arrow 기반 Parquet 파일로 출력합니다. 기본적으로 배치/시간 기준 파일 회전을 지원합니다.
+
+```yaml
+pipeline:
+  sink:
+    type: parquet
+    config:
+      path: /tmp/dbsp-out # prefix (파일은 /tmp/dbsp-out-<ts>-<seq>.parquet)
+      schema_cache_path: /tmp/dbsp-out.schema.json
+      compression: zstd # zstd(기본) | snappy | gzip | uncompressed
+      row_group_size: 65536
+      rotate_every_batches: 1000
+      rotate_every: "30s"
+      batch:
+        max_batch_size: 100
+        max_batch_delay_ms: 200
+```
+
+- `schema_cache_path`에 SQL 분석 결과로 추론한 출력 스키마를 저장하고, 이후 실행에서 재사용합니다.
+- 출력은 기본적으로 TupleDelta의 `Count`를 `__count` 컬럼에 저장합니다.
+
 ### (선택) Sink 배치 래핑
 
 Sink의 `config.batch`를 설정하면 출력 배치를 모아서 flush 합니다.

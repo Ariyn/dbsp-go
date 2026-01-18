@@ -113,6 +113,11 @@
   - [x] SQLite 기반 입력 WAL(append-only) + 재시작 replay (체크포인트 전 단계)
   - [x] 체크포인트(그래프 snapshot) 저장/복구 + suffix replay 연결
 
+- [x] **Parquet Sink (Arrow) + 회전 + 스키마 캐시**
+  - 목표: 집계 결과(델타)를 Parquet으로 고속 저장, 시간/배치 단위 파일 회전
+  - SQL 분석 시 출력 스키마를 추론하고 `schema_cache_path`에 저장하여 재사용
+  - 후보 파일: `cmd/dbsp/sink_parquet.go`, `cmd/dbsp/schema_cache.go`
+
 - [ ] **타입/NULL 처리 정책 정리**
   - 목표: 비교/캐스팅/NULL 전파를 일관된 규칙으로(테스트 포함)
   - 후보 파일: `internal/dbsp/types/*`, `internal/dbsp/op/*`, `internal/dbsp/ir/*`

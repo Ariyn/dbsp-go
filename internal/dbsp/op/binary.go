@@ -52,10 +52,10 @@ type BinaryOp struct {
 }
 
 type binarySnapshotV1 struct {
-	Type     BinaryOpType
-	JoinTTL  time.Duration
-	Left     map[any]map[string]binaryJoinEntryV1
-	Right    map[any]map[string]binaryJoinEntryV1
+	Type    BinaryOpType
+	JoinTTL time.Duration
+	Left    map[any]map[string]binaryJoinEntryV1
+	Right   map[any]map[string]binaryJoinEntryV1
 }
 
 type binaryJoinEntryV1 struct {

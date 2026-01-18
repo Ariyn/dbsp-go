@@ -64,3 +64,26 @@ type FileSinkConfig struct {
 	Path   string `yaml:"path"`
 	Format string `yaml:"format"` // "json" or "csv"
 }
+
+// ParquetSinkConfig defines the configuration for the Parquet sink.
+//
+// Notes:
+//   - Path is treated as an output prefix. Files are written as
+//     <prefix>-<timestamp>-<seq>.parquet
+//   - SchemaCachePath stores an inferred output schema (from SQL analysis) so it
+//     can be reused on subsequent runs.
+type ParquetSinkConfig struct {
+	Path            string `yaml:"path"`
+	SchemaCachePath string `yaml:"schema_cache_path"`
+
+	// Compression: "zstd" | "snappy" | "gzip" | "uncompressed" (default: zstd)
+	Compression string `yaml:"compression"`
+
+	// RowGroupSize controls buffered rows per write call (default: 65536).
+	RowGroupSize int `yaml:"row_group_size"`
+
+	// RotateEveryBatches rotates files every N input batches (0 disables).
+	RotateEveryBatches int `yaml:"rotate_every_batches"`
+	// RotateEvery rotates files by time interval (e.g., "10s", "5 minutes"). Empty disables.
+	RotateEvery string `yaml:"rotate_every"`
+}

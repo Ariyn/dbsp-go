@@ -101,8 +101,8 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 
 	// Handle GROUP BY with aggregation
 	var (
-		groupCols  []string
-		windowSpec *ir.WindowSpec
+		groupCols      []string
+		windowSpec     *ir.WindowSpec
 		timeWindowSpec *ir.TimeWindowSpec
 	)
 
@@ -557,8 +557,8 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string) (i
 
 	// Handle GROUP BY with aggregation
 	var (
-		groupCols  []string
-		windowSpec *ir.WindowSpec
+		groupCols      []string
+		windowSpec     *ir.WindowSpec
 		timeWindowSpec *ir.TimeWindowSpec
 	)
 

@@ -68,6 +68,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// If Parquet sink is selected, infer/load and cache output schema at SQL-analysis time.
+	var parquetSchema *ParquetSchema
+	if config.Pipeline.Sink.Type == "parquet" {
+		parquetSchema, err = inferOrLoadParquetSchema(query, config.Pipeline.Source, config.Pipeline.Sink.Config)
+		if err != nil {
+			fmt.Printf("Error inferring parquet schema: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	if config.Pipeline.Transform.Watermark.Enabled {
 		wmCfg, err := buildWatermarkConfig(config.Pipeline.Transform.Watermark)
 		if err != nil {
@@ -97,6 +107,8 @@ func main() {
 		sink, err = NewConsoleSink(config.Pipeline.Sink.Config)
 	case "file":
 		sink, err = NewFileSink(config.Pipeline.Sink.Config)
+	case "parquet":
+		sink, err = NewParquetSink(config.Pipeline.Sink.Config, parquetSchema)
 	default:
 		err = fmt.Errorf("unsupported sink type: %s", config.Pipeline.Sink.Type)
 	}
@@ -129,7 +141,7 @@ func main() {
 		return op.Execute(rootNode, batch)
 	}, writeAheadLog,
 		pipelineSnapshotterFunc{
-			snap: func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
+			snap:    func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
 			restore: func(b []byte) error { return op.RestoreGraph(rootNode, b) },
 		},
 		config.Pipeline.WAL.CheckpointEveryBatches,

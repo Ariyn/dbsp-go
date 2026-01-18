@@ -2,6 +2,7 @@ package op
 
 import (
 	"fmt"
+
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
@@ -10,7 +11,7 @@ import (
 // Events with timestamps >= watermark but < watermark + allowedLateness are "late"
 // Events with timestamps >= watermark + allowedLateness are "too late" and may be dropped
 type Watermark struct {
-	Timestamp      int64 // Current watermark timestamp
+	Timestamp       int64 // Current watermark timestamp
 	AllowedLateness int64 // How late events can arrive (in millis)
 }
 
@@ -50,16 +51,16 @@ func (w *BoundedOutOfOrdernessWatermark) GetWatermark() int64 {
 
 // LateEventBuffer buffers late events for reprocessing
 type LateEventBuffer struct {
-	buffer         []types.TupleDelta
-	maxBufferSize  int
+	buffer          []types.TupleDelta
+	maxBufferSize   int
 	allowedLateness int64
 }
 
 // NewLateEventBuffer creates a new late event buffer
 func NewLateEventBuffer(maxSize int, allowedLateness int64) *LateEventBuffer {
 	return &LateEventBuffer{
-		buffer:         make([]types.TupleDelta, 0, maxSize),
-		maxBufferSize:  maxSize,
+		buffer:          make([]types.TupleDelta, 0, maxSize),
+		maxBufferSize:   maxSize,
 		allowedLateness: allowedLateness,
 	}
 }
@@ -125,11 +126,11 @@ func DefaultWatermarkConfig() WatermarkConfig {
 // WatermarkAwareWindowOp extends WindowAggOp with watermark support
 type WatermarkAwareWindowOp struct {
 	*WindowAggOp
-	watermarkGen  WatermarkGenerator
-	lateBuffer    *LateEventBuffer
-	config        WatermarkConfig
-	onTimeBuffer  []types.TupleDelta // Buffer for on-time events
-	lateBuffer2   []types.TupleDelta // Buffer for late events
+	watermarkGen WatermarkGenerator
+	lateBuffer   *LateEventBuffer
+	config       WatermarkConfig
+	onTimeBuffer []types.TupleDelta // Buffer for on-time events
+	lateBuffer2  []types.TupleDelta // Buffer for late events
 }
 
 type watermarkAwareSnapshotV1 struct {
@@ -207,17 +208,17 @@ func NewWatermarkAwareWindowOp(
 	config WatermarkConfig,
 ) *WatermarkAwareWindowOp {
 	baseOp := NewWindowAggOp(spec, keyFn, groupKeys, aggInit, aggFn)
-	
+
 	var watermarkGen WatermarkGenerator
 	var lateBuffer *LateEventBuffer
-	
+
 	if config.Enabled {
 		watermarkGen = NewBoundedOutOfOrdernessWatermark(config.MaxOutOfOrderness)
 		if config.Policy == BufferLateEvents {
 			lateBuffer = NewLateEventBuffer(config.MaxBufferSize, config.AllowedLateness)
 		}
 	}
-	
+
 	return &WatermarkAwareWindowOp{
 		WindowAggOp:  baseOp,
 		watermarkGen: watermarkGen,
@@ -234,11 +235,11 @@ func (w *WatermarkAwareWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 		// No watermarking - use base implementation
 		return w.WindowAggOp.Apply(batch)
 	}
-	
+
 	// Classify events as on-time or late
 	w.onTimeBuffer = w.onTimeBuffer[:0]
 	w.lateBuffer2 = w.lateBuffer2[:0]
-	
+
 	for _, td := range batch {
 		// Extract event time
 		rawTs, ok := td.Tuple[w.Spec.TimeCol]
@@ -249,10 +250,10 @@ func (w *WatermarkAwareWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 		if !ok {
 			continue
 		}
-		
+
 		// Update watermark
 		w.watermarkGen.Update(eventTime)
-		
+
 		// Check if event is late
 		watermark := w.watermarkGen.GetWatermark()
 		tooLateCutoff := watermark - w.config.AllowedLateness
@@ -283,7 +284,7 @@ func (w *WatermarkAwareWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 			w.onTimeBuffer = append(w.onTimeBuffer, td)
 		}
 	}
-	
+
 	// Process on-time events
 	var result types.Batch
 	if len(w.onTimeBuffer) > 0 {
@@ -293,7 +294,7 @@ func (w *WatermarkAwareWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 		}
 		result = append(result, onTimeResult...)
 	}
-	
+
 	// Process late events if policy is EmitLateEvents
 	if w.config.Policy == EmitLateEvents && len(w.lateBuffer2) > 0 {
 		lateResult, err := w.WindowAggOp.Apply(w.lateBuffer2)
@@ -306,12 +307,12 @@ func (w *WatermarkAwareWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 		}
 		result = append(result, lateResult...)
 	}
-	
+
 	// Clean up old windows based on watermark
 	if w.watermarkGen != nil {
 		w.cleanupOldWindows(w.watermarkGen.GetWatermark())
 	}
-	
+
 	return result, nil
 }
 
@@ -320,10 +321,10 @@ func (w *WatermarkAwareWindowOp) cleanupOldWindows(watermark int64) {
 	if w.State.Data == nil {
 		return
 	}
-	
+
 	// Remove windows that have ended before watermark - allowedLateness
 	cutoff := watermark - w.config.AllowedLateness
-	
+
 	for wid := range w.State.Data {
 		if wid.End < cutoff {
 			delete(w.State.Data, wid)
@@ -336,7 +337,7 @@ func (w *WatermarkAwareWindowOp) ProcessBufferedLateEvents() (types.Batch, error
 	if w.lateBuffer == nil || w.lateBuffer.Len() == 0 {
 		return types.Batch{}, nil
 	}
-	
+
 	buffered := w.lateBuffer.GetAndClear()
 	return w.WindowAggOp.Apply(buffered)
 }

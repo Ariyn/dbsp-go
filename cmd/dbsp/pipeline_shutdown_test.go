@@ -44,7 +44,7 @@ func (s *blockingSource) CloseCalled() int {
 type noopSink struct{}
 
 func (n *noopSink) WriteBatch(types.Batch) error { return nil }
-func (n *noopSink) Close() error                { return nil }
+func (n *noopSink) Close() error                 { return nil }
 
 func TestRunPipeline_CancelUnblocksSource(t *testing.T) {
 	source := newBlockingSource()

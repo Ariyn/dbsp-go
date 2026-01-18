@@ -10,7 +10,8 @@ import (
 // DelayOp is a 1-tick register.
 //
 // Semantics:
-//   out[t] = in[t-1] (with out[0] = seed)
+//
+//	out[t] = in[t-1] (with out[0] = seed)
 //
 // DelayOp state updates are finalized by the cyclic executor via Commit().
 // When used outside ExecuteTickCyclic, its state will not advance.

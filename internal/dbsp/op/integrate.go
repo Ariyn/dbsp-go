@@ -18,7 +18,8 @@ func IntegrateApply(state map[any]any, delta types.Batch) (types.Batch, error) {
 // IntegrateOp accumulates a delta stream into a value stream (Z-set snapshot).
 //
 // Semantics (value stream):
-//   I[t] = I[t-1] + ΔS[t]
+//
+//	I[t] = I[t-1] + ΔS[t]
 //
 // Apply(delta) updates internal state and returns the current snapshot materialized
 // as a Batch (tuple,count pairs).

@@ -10,8 +10,8 @@ import (
 // parseGroupBy parses GROUP BY expressions, extracting grouping columns and time windows.
 // Supports both standard columns and time window functions like TUMBLE(), HOP(), SESSION()
 func parseGroupBy(groupBy ast.GroupBy) ([]string, *ir.WindowSpec, error) {
-    groupCols, windowSpec, _, err := parseGroupByWithTimeWindow(groupBy)
-    return groupCols, windowSpec, err
+	groupCols, windowSpec, _, err := parseGroupByWithTimeWindow(groupBy)
+	return groupCols, windowSpec, err
 }
 
 // parseGroupByWithTimeWindow parses GROUP BY expressions, extracting grouping columns and

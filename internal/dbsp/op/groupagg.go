@@ -32,9 +32,9 @@ type GroupAggOp struct {
 }
 
 type groupAggSnapshotV1 struct {
-	State           map[any]any
-	MultiState      map[any][]any
-	KeyColName      string
+	State            map[any]any
+	MultiState       map[any][]any
+	KeyColName       string
 	GroupKeyColNames []string
 }
 

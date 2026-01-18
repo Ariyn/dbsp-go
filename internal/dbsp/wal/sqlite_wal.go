@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	sqliteCodecGobV1 = "gob-v1"
+	sqliteCodecGobV1      = "gob-v1"
 	sqliteCodecGraphGobV1 = "graph-gob-v1"
 )
 

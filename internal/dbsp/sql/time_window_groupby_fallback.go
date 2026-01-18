@@ -14,8 +14,9 @@ import (
 // TUMBLE/HOP/SESSION syntax.
 //
 // Supported shape (minimal):
-//   SELECT <keys...>, <AGG>(<col>|*) [AS alias] FROM <table> [WHERE <pred>]
-//   GROUP BY <keys...>, TUMBLE/HOP/SESSION(...)
+//
+//	SELECT <keys...>, <AGG>(<col>|*) [AS alias] FROM <table> [WHERE <pred>]
+//	GROUP BY <keys...>, TUMBLE/HOP/SESSION(...)
 //
 // Returns (plan, true, nil) when it recognizes and parses a time-window GROUP BY.
 func parseTimeWindowGroupByFallback(query string) (ir.LogicalNode, bool, error) {

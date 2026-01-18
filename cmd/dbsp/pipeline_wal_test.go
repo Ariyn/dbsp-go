@@ -137,8 +137,8 @@ func TestRunPipeline_WAL_ReplayDoesNotWriteSink(t *testing.T) {
 }
 
 type testSnapshotter struct {
-	mu          sync.Mutex
-	snapshot    []byte
+	mu           sync.Mutex
+	snapshot     []byte
 	restoreCalls int
 }
 
