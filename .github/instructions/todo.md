@@ -24,7 +24,7 @@
   - 안정성 강화를 위해 처리시간 기반 TTL(만료 시 join 결과 리트랙션) 옵션 추가
   - 후보 파일: `internal/dbsp/op/binary.go`
 
-- [ ] **Integrate/Delay를 실제 operator로 정착(또는 설계 재정의)**
+- [x] **Integrate/Delay를 실제 operator로 정착(또는 설계 재정의)**
   - 현재 integrate는 placeholder, diff는 “대부분 동일 operator 반환” 가정
   - 목표: DBSP 규칙에 맞는 `IntegrateOp`, `DelayOp`를 구현하고, **Delay 포함 사이클만 허용**하는 tick 실행 모델로 확장
   - 설계 RFC: `docs/RFC_DELAY_INTEGRATE.md`
@@ -38,13 +38,14 @@
   - [x] tick/사이클 기본 테스트(Delay shift, cycle legality)
   - [x] 미분 정확성 테스트(delete/retraction 포함)
 
-- [ ] **증분 정확성 테스트 강화(특히 delete 포함)**
+- [x] **증분 정확성 테스트 강화(특히 delete 포함)**
   - Join + delete, Join+Agg + delete, Window + delete 같은 케이스가 핵심
   - DuckDB 대비 통합 테스트를 Join/Window로 확대
   - 후보 파일: `internal/dbsp/sql/duckdb_tpch_integration_test.go`, `internal/dbsp/op/*_test.go`
   - [x] SQL JOIN delete/retraction 테스트 추가
   - [x] SQL JOIN+GROUP BY delete/retraction 테스트 추가
   - [x] SQL JOIN+다중키 GROUP BY delete/retraction 테스트 추가
+  - [x] cmd/dbsp 파이프라인 delete 통합 테스트 추가
   - [x] Window(TUMBLING/SLIDING) delete 델타 assert 테스트 추가
   - [x] Window(TUMBLING) 다중키 그룹키/eviction 단위 테스트 추가
   - [x] Window(SLIDING) 다중키 그룹키/eviction 단위 테스트 추가
@@ -71,21 +72,21 @@
   - 목표: 다중 agg를 하나의 상태로 합치거나, 여러 GroupAgg를 병렬/체인으로 구성
   - 후보 파일: `internal/dbsp/sql/select_helper.go`, `internal/dbsp/ir/transform.go`
 
-- [ ] **`COUNT(*)` 의미 정합성 보장**
+- [x] **`COUNT(*)` 의미 정합성 보장**
   - 현재 파싱/변환 흐름상 `COUNT(*)`이 `ColName="*"` 같은 형태로 들어갈 위험
   - 목표: COUNT(*)는 NULL 무시 없이 모든 row count
   - 후보 파일: `internal/dbsp/sql/select_helper.go`, `internal/dbsp/op/groupagg.go`
 
-- [ ] **INTERVAL 파싱 확장 (HOUR/DAY 등)**
+- [x] **INTERVAL 파싱 확장 (HOUR/DAY 등)**
   - 현재 SECOND/MINUTE만 지원
   - 후보 파일: `internal/dbsp/sql/convert.go`
 
-- [ ] **SELECT 표현식 지원 확대**
-  - 현재 컬럼/집계/*만 허용
-  - 목표(최소): `CAST`, 산술(+ - * /), `CASE WHEN` 등 중 일부
+- [x] **SELECT 표현식 지원 확대**
+  - 최소 지원: `CAST`, 산술(+ - * /), `CASE WHEN`
+  - 제약: 표현식은 `AS <alias>` 필수(출력 컬럼명 안정화)
   - 후보 파일: `internal/dbsp/sql/select_helper.go`, `internal/dbsp/ir/transform.go`
 
-- [ ] **JOIN 조건 확장**
+- [x] **JOIN 조건 확장**
   - 현재 단일 equi-join 조건만 지원
   - 목표: 다중 조건(AND), composite key join
   - 후보 파일: `internal/dbsp/ir/transform.go`

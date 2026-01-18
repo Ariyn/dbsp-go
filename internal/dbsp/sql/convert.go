@@ -51,7 +51,7 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 	fromExpr := sel.From[0]
 	if joinExpr, ok := fromExpr.(*ast.JoinTableExpr); ok {
 		// Handle JOIN
-		return parseJoin(sel, joinExpr)
+		return parseJoin(sel, joinExpr, query)
 	}
 
 	// Start with scan - extract table name from FROM
@@ -73,7 +73,7 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		}
 	}
 
-	selectCols, err := extractSelectColumns(sel)
+	selectCols, selectExprs, err := extractProjectionSpecs(sel)
 	if err != nil {
 		return nil, err
 	}
@@ -81,10 +81,11 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 	// Check for GROUP BY
 	if len(sel.GroupBy) == 0 {
 		// No GROUP BY - check if we need projection
-		if len(selectCols) > 0 {
+		if len(selectCols) > 0 || len(selectExprs) > 0 {
 			// Add projection
 			currentNode = &ir.LogicalProject{
 				Columns: selectCols,
+				Exprs:   selectExprs,
 				Input:   currentNode,
 			}
 		}
@@ -202,8 +203,12 @@ func parseSimpleIntervalToMillis(intervalSQL string) (int64, error) {
 		return val * 1000, nil
 	case "MINUTE", "MINUTES":
 		return val * 60 * 1000, nil
+	case "HOUR", "HOURS":
+		return val * 60 * 60 * 1000, nil
+	case "DAY", "DAYS":
+		return val * 24 * 60 * 60 * 1000, nil
 	default:
-		return 0, errors.New("unsupported INTERVAL unit (only SECOND/MINUTE supported)")
+		return 0, errors.New("unsupported INTERVAL unit")
 	}
 }
 
@@ -342,10 +347,10 @@ func parseWindowAggregateFromSelect(sel *ast.Select) (*ir.LogicalWindowAgg, *ir.
 	// Parse frame specification (ROWS/RANGE/GROUPS BETWEEN ...)
 	var frameSpec *ir.FrameSpec
 	var timeWindowSpec *ir.TimeWindowSpec
-	
+
 	if aggFunc.Over.Frame != nil {
 		frameSpec = parseFrameSpec(aggFunc.Over.Frame)
-		
+
 		// Check if frame uses time-based RANGE with INTERVAL
 		// This indicates a time window (e.g., RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING AND CURRENT ROW)
 		if frameSpec != nil && strings.ToUpper(frameSpec.Type) == "RANGE" {
@@ -358,9 +363,9 @@ func parseWindowAggregateFromSelect(sel *ast.Select) (*ir.LogicalWindowAgg, *ir.
 					interval, err := parseIntervalArg(frameSpec.StartValue)
 					if err == nil && orderBy != "" {
 						timeWindowSpec = &ir.TimeWindowSpec{
-							WindowType: "SLIDING",
-							TimeCol:    orderBy,
-							SizeMillis: interval,
+							WindowType:  "SLIDING",
+							TimeCol:     orderBy,
+							SizeMillis:  interval,
 							SlideMillis: interval / 2, // Default: half of size
 						}
 					}
@@ -439,7 +444,7 @@ func ParseQueryToIncrementalDBSP(query string) (*op.Node, error) {
 }
 
 // parseJoin handles JOIN in the FROM clause
-func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr) (ir.LogicalNode, error) {
+func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string) (ir.LogicalNode, error) {
 	// Extract left and right table names
 	leftTable, ok := joinExpr.LeftExpr.(*ast.TableName)
 	if !ok {
@@ -451,8 +456,18 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr) (ir.LogicalNode, er
 		return nil, errors.New("JOIN right side must be a table")
 	}
 
-	// Parse ON conditions (only equi-join supported)
-	conditions, err := parseJoinConditions(joinExpr.On)
+	// Parse ON conditions.
+	// NOTE: tree-sitter may fail to populate joinExpr.On for compound predicates
+	// like: a.id=b.id AND a.k=b.k. In that case, fall back to string parsing.
+	var conditions []ir.JoinCondition
+	var err error
+	if joinExpr.On != nil {
+		conditions, err = parseJoinConditions(joinExpr.On)
+	} else {
+		// Some tree-sitter versions omit the ON segment from joinExpr/sel string
+		// for compound predicates. Fall back to the original SQL query string.
+		conditions, err = parseJoinConditionsFromSQL(rawQuery)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -482,7 +497,7 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr) (ir.LogicalNode, er
 	}
 
 	// Extract select columns
-	selectCols, err := extractSelectColumns(sel)
+	selectCols, selectExprs, err := extractProjectionSpecs(sel)
 	if err != nil {
 		return nil, err
 	}
@@ -490,9 +505,10 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr) (ir.LogicalNode, er
 	// Check for GROUP BY
 	if len(sel.GroupBy) == 0 {
 		// No GROUP BY - add projection if needed
-		if len(selectCols) > 0 {
+		if len(selectCols) > 0 || len(selectExprs) > 0 {
 			currentNode = &ir.LogicalProject{
 				Columns: selectCols,
+				Exprs:   selectExprs,
 				Input:   currentNode,
 			}
 		}
@@ -560,23 +576,154 @@ func parseJoinConditions(onExpr ast.Expr) ([]ir.JoinCondition, error) {
 		return nil, errors.New("JOIN requires ON clause")
 	}
 
-	// For now, only support simple equality: a.col = b.col
-	binExpr, ok := onExpr.(*ast.BinaryExpr)
-	if !ok || binExpr.Operator != "=" {
-		return nil, errors.New("JOIN only supports equi-join (=)")
+	// Support conjunctions: a.x=b.x AND a.y=b.y
+	if binExpr, ok := onExpr.(*ast.BinaryExpr); ok {
+		switch strings.ToUpper(strings.TrimSpace(binExpr.Operator)) {
+		case "AND":
+			left, err := parseJoinConditions(binExpr.Left)
+			if err != nil {
+				return nil, err
+			}
+			right, err := parseJoinConditions(binExpr.Right)
+			if err != nil {
+				return nil, err
+			}
+			return append(left, right...), nil
+		case "=":
+			leftCol := binExpr.Left.String()
+			rightCol := binExpr.Right.String()
+			// Remove quotes added by tree-sitter
+			leftCol = strings.Trim(leftCol, "'\"")
+			rightCol = strings.Trim(rightCol, "'\"")
+
+			condition := ir.JoinCondition{LeftCol: leftCol, RightCol: rightCol}
+			return []ir.JoinCondition{condition}, nil
+		default:
+			return nil, errors.New("JOIN only supports equi-join (=) and AND of equi-joins")
+		}
 	}
 
-	leftCol := binExpr.Left.String()
-	rightCol := binExpr.Right.String()
+	return nil, errors.New("JOIN only supports equi-join (=) and AND of equi-joins")
+}
 
-	// Remove quotes added by tree-sitter
-	leftCol = strings.Trim(leftCol, "'\"")
-	rightCol = strings.Trim(rightCol, "'\"")
+func parseJoinConditionsFromSQL(sql string) ([]ir.JoinCondition, error) {
+	upper := strings.ToUpper(sql)
 
-	condition := ir.JoinCondition{
-		LeftCol:  leftCol,
-		RightCol: rightCol,
+	// Find ON keyword at word boundary.
+	onIdx := -1
+	depth := 0
+	for i := 0; i < len(sql)-1; i++ {
+		switch sql[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth != 0 {
+			continue
+		}
+		if i+2 <= len(sql) && upper[i:i+2] == "ON" {
+			leftOK := i == 0 || !isWordChar(upper[i-1])
+			rightOK := i+2 == len(sql) || !isWordChar(upper[i+2])
+			if leftOK && rightOK {
+				onIdx = i
+				break
+			}
+		}
+	}
+	if onIdx == -1 {
+		return nil, errors.New("JOIN requires ON clause")
+	}
+	start := onIdx + len("ON")
+	end := len(sql)
+	// Stop at the next clause keyword (depth-insensitive; join ON is expected simple).
+	for _, kw := range []string{" WHERE ", " GROUP BY ", " ORDER BY ", " LIMIT ", " HAVING "} {
+		if idx := strings.Index(upper[start:], kw); idx != -1 {
+			abs := start + idx
+			if abs < end {
+				end = abs
+			}
+		}
+	}
+	condSQL := strings.TrimSpace(sql[start:end])
+	if condSQL == "" {
+		return nil, errors.New("JOIN requires ON clause")
 	}
 
-	return []ir.JoinCondition{condition}, nil
+	parts := splitByAndOutsideParens(condSQL)
+	conds := make([]ir.JoinCondition, 0, len(parts))
+	for _, p := range parts {
+		expr := strings.TrimSpace(p)
+		if expr == "" {
+			continue
+		}
+		left, right, ok := splitOnceOutsideParens(expr, '=')
+		if !ok {
+			return nil, errors.New("JOIN only supports equi-join (=) and AND of equi-joins")
+		}
+		left = strings.Trim(strings.TrimSpace(left), "'\"")
+		right = strings.Trim(strings.TrimSpace(right), "'\"")
+		conds = append(conds, ir.JoinCondition{LeftCol: left, RightCol: right})
+	}
+	if len(conds) == 0 {
+		return nil, errors.New("JOIN only supports equi-join (=) and AND of equi-joins")
+	}
+	return conds, nil
+}
+
+func splitByAndOutsideParens(s string) []string {
+	upper := strings.ToUpper(s)
+	var parts []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth != 0 {
+			continue
+		}
+		if i+3 <= len(s) && upper[i:i+3] == "AND" {
+			// Ensure word boundary
+			leftOK := i == 0 || !isWordChar(upper[i-1])
+			rightOK := i+3 == len(s) || !isWordChar(upper[i+3])
+			if leftOK && rightOK {
+				parts = append(parts, s[start:i])
+				start = i + 3
+				i += 2
+			}
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
+func splitOnceOutsideParens(s string, sep byte) (string, string, bool) {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && s[i] == sep {
+				return s[:i], s[i+1:], true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func isWordChar(c byte) bool {
+	return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Ariyn/tree-sitter-duckdb/bindings/go/ast"
+	"github.com/ariyn/dbsp/internal/dbsp/ir"
 )
 
 // extractSelectColumns collects plain column names from SELECT list for projection.
@@ -33,6 +34,38 @@ func extractSelectColumns(sel *ast.Select) ([]string, error) {
 		}
 	}
 	return cols, nil
+}
+
+// extractProjectionSpecs parses the SELECT list into plain column projections and
+// computed expressions (which require an alias).
+// Aggregates are ignored (handled separately).
+// If '*' is present, it returns (nil, nil, nil) meaning "no projection".
+func extractProjectionSpecs(sel *ast.Select) ([]string, []ir.ProjectExpr, error) {
+	var cols []string
+	var exprs []ir.ProjectExpr
+	for _, item := range sel.SelectList {
+		switch e := item.Expr.(type) {
+		case *ast.StarExpr:
+			return nil, nil, nil
+		case *ast.ColName:
+			colName := e.Name
+			if e.Table != "" {
+				colName = e.Table + "." + e.Name
+			}
+			cols = append(cols, colName)
+		case *ast.FuncExpr:
+			// aggregate or other function - handled elsewhere
+			continue
+		default:
+			// Computed expression: require alias so output column is stable.
+			if strings.TrimSpace(item.As) == "" {
+				return nil, nil, errors.New("unsupported SELECT expression without alias (use AS <name>)")
+			}
+			exprSQL := strings.TrimSpace(item.Expr.String())
+			exprs = append(exprs, ir.ProjectExpr{ExprSQL: exprSQL, As: item.As})
+		}
+	}
+	return cols, exprs, nil
 }
 
 // findSingleAggregate scans SELECT expressions and returns a single supported

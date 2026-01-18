@@ -345,7 +345,7 @@ func (g *GroupAggOp) State() map[any]any {
 
 // SumAgg is a simple AggFunc that sums a numeric field multiplied by Count.
 type SumAgg struct {
-	ColName string // Column to sum (defaults to "v" if empty)
+	ColName  string // Column to sum (defaults to "v" if empty)
 	DeltaCol string
 }
 
@@ -407,11 +407,19 @@ func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 
 // Convenience: simple CountAgg implementation
 type CountAgg struct {
-	ColName string // Column to count (empty string means COUNT(*))
+	ColName  string // Column to count (empty string means COUNT(*))
 	DeltaCol string
 }
 
 func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
+	// Defensive normalization: treat "*" the same as COUNT(*).
+	// If ColName accidentally becomes "*" (e.g., from SQL parsing), COUNT would
+	// incorrectly ignore all rows because "*" is not a real column.
+	colName := c.ColName
+	if colName == "*" {
+		colName = ""
+	}
+
 	var prevI int64
 	if prev != nil {
 		switch x := prev.(type) {
@@ -426,8 +434,8 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 
 	// If ColName is specified, check if the value is NULL
 	// COUNT(col) ignores NULL values
-	if c.ColName != "" {
-		val, ok := td.Tuple[c.ColName]
+	if colName != "" {
+		val, ok := td.Tuple[colName]
 		if !ok || val == nil {
 			// NULL value, don't count it
 			return prev, nil

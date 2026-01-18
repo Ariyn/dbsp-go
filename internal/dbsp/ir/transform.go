@@ -525,19 +525,28 @@ func compareLessOrEqual(tupleVal any, threshold float64) bool {
 func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 	switch n := l.(type) {
 	case *LogicalProject:
-		// Transform projection to MapOp that filters columns
-		columns := n.Columns
-		projectOp := &op.MapOp{
-			F: func(td types.TupleDelta) []types.TupleDelta {
-				// Create new tuple with only selected columns
-				projected := make(types.Tuple)
-				for _, col := range columns {
-					if val, ok := td.Tuple[col]; ok {
-						projected[col] = val
+		columns := append([]string(nil), n.Columns...)
+		var projectOp op.Operator
+		if len(n.Exprs) == 0 {
+			// Backward-compatible: keep simple projections as MapOp.
+			projectOp = &op.MapOp{
+				F: func(td types.TupleDelta) []types.TupleDelta {
+					projected := make(types.Tuple)
+					for _, col := range columns {
+						if val, ok := td.Tuple[col]; ok {
+							projected[col] = val
+						}
 					}
-				}
-				return []types.TupleDelta{{Tuple: projected, Count: td.Count}}
-			},
+					return []types.TupleDelta{{Tuple: projected, Count: td.Count}}
+				},
+			}
+		} else {
+			exprs := make([]op.ProjectExprFn, 0, len(n.Exprs))
+			for _, e := range n.Exprs {
+				fn := BuildExprFunc(e.ExprSQL)
+				exprs = append(exprs, op.ProjectExprFn{OutCol: e.As, Eval: fn})
+			}
+			projectOp = &op.ProjectOp{Columns: columns, Exprs: exprs}
 		}
 
 		// Check if input needs processing
@@ -1086,30 +1095,55 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 
 // logicalJoinToDBSP transforms LogicalJoin to BinaryOp (JoinOp)
 func logicalJoinToDBSP(join *LogicalJoin) (*op.Node, error) {
-	// For now, only support single equi-join condition
-	if len(join.Conditions) != 1 {
-		return nil, fmt.Errorf("only single join condition supported")
+	if len(join.Conditions) == 0 {
+		return nil, fmt.Errorf("JOIN requires at least one join condition")
 	}
 
-	cond := join.Conditions[0]
+	leftCols := make([]string, 0, len(join.Conditions))
+	rightCols := make([]string, 0, len(join.Conditions))
+	for _, c := range join.Conditions {
+		leftCols = append(leftCols, c.LeftCol)
+		rightCols = append(rightCols, c.RightCol)
+	}
 
-	// Create key extraction functions for left and right
-	leftKeyFn := func(t types.Tuple) any {
-		key := t[cond.LeftCol]
-		// NULL keys should not match
-		if key == nil {
-			return nil
+	encodeKey := func(values []any) any {
+		b, err := json.Marshal(values)
+		if err == nil {
+			return string(b)
 		}
-		return key
+		return fmt.Sprintf("%#v", values)
+	}
+
+	// Create key extraction functions for left and right.
+	// NULL keys should not match (if any component is NULL, skip match).
+	leftKeyFn := func(t types.Tuple) any {
+		vals := make([]any, 0, len(leftCols))
+		for _, col := range leftCols {
+			v := t[col]
+			if v == nil {
+				return nil
+			}
+			vals = append(vals, v)
+		}
+		if len(vals) == 1 {
+			return vals[0]
+		}
+		return encodeKey(vals)
 	}
 
 	rightKeyFn := func(t types.Tuple) any {
-		key := t[cond.RightCol]
-		// NULL keys should not match
-		if key == nil {
-			return nil
+		vals := make([]any, 0, len(rightCols))
+		for _, col := range rightCols {
+			v := t[col]
+			if v == nil {
+				return nil
+			}
+			vals = append(vals, v)
 		}
-		return key
+		if len(vals) == 1 {
+			return vals[0]
+		}
+		return encodeKey(vals)
 	}
 
 	// Combine function merges left and right tuples

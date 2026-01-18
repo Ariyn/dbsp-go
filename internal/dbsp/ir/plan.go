@@ -28,11 +28,21 @@ func (f *LogicalFilter) nodeName() string { return "LogicalFilter" }
 type LogicalProject struct {
 	// Columns to project (column names)
 	Columns []string
+	// Exprs are computed expressions in SELECT list (require alias)
+	Exprs []ProjectExpr
 	// Input is the child logical node
 	Input LogicalNode
 }
 
 func (p *LogicalProject) nodeName() string { return "LogicalProject" }
+
+// ProjectExpr represents a computed SELECT expression.
+// ExprSQL is a small SQL expression subset (e.g., CAST, arithmetic, CASE WHEN).
+// As is the output column name.
+type ProjectExpr struct {
+	ExprSQL string
+	As      string
+}
 
 // WindowSpec describes a simple tumbling window over a time column.
 // For now we keep it minimal: a time column name and fixed window size

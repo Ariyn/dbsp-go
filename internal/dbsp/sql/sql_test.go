@@ -155,6 +155,36 @@ func TestParseAndExecuteMultiAgg_SumAndCount_WithDelete(t *testing.T) {
 	}
 }
 
+func TestParseAndExecuteCountStarGroupBy_WithNulls(t *testing.T) {
+	q := "SELECT k, COUNT(*) FROM t GROUP BY k"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP failed: %v", err)
+	}
+
+	// Feed rows with NULLs in other columns; COUNT(*) must still count them.
+	_, err = op.Execute(node, types.Batch{
+		{Tuple: types.Tuple{"k": "A", "x": nil}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "x": int64(1)}, Count: 1},
+		{Tuple: types.Tuple{"k": "B"}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Execute(insert) failed: %v", err)
+	}
+
+	gop, ok := node.Op.(*op.GroupAggOp)
+	if !ok {
+		t.Fatalf("expected GroupAggOp, got %T", node.Op)
+	}
+	st := gop.State()
+	if st["A"] != int64(2) {
+		t.Fatalf("expected A=2 got %v", st["A"])
+	}
+	if st["B"] != int64(1) {
+		t.Fatalf("expected B=1 got %v", st["B"])
+	}
+}
+
 func TestParseQueryToIncrementalDBSP(t *testing.T) {
 	q := "SELECT k, SUM(v) FROM t GROUP BY k"
 	incNode, err := ParseQueryToIncrementalDBSP(q)
@@ -207,6 +237,30 @@ func TestParseQueryToIncrementalDBSP(t *testing.T) {
 	}
 }
 
+func TestParseAndExecuteSelectExpression_ArithmeticAndCase(t *testing.T) {
+	q := "SELECT a, a + 2 AS b, CASE WHEN a > 0 THEN 1 ELSE 0 END AS flag FROM t"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP failed: %v", err)
+	}
+	out, err := op.Execute(node, types.Batch{{Tuple: types.Tuple{"a": int64(3)}, Count: 1}})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 output, got %d (%v)", len(out), out)
+	}
+	if out[0].Tuple["a"] != int64(3) {
+		t.Fatalf("expected a=3, got %v", out[0].Tuple["a"])
+	}
+	if out[0].Tuple["b"] != float64(5) {
+		t.Fatalf("expected b=5, got %v", out[0].Tuple["b"])
+	}
+	if out[0].Tuple["flag"] != int64(1) {
+		t.Fatalf("expected flag=1, got %v", out[0].Tuple["flag"])
+	}
+}
+
 // ============================================================================
 // JOIN Tests
 // ============================================================================
@@ -243,6 +297,40 @@ func TestParseQueryJoinSimple(t *testing.T) {
 	// Only id=1 should join
 	if len(out) != 1 {
 		t.Errorf("expected 1 joined row, got %d", len(out))
+	}
+}
+
+func TestParseQueryJoinMultiConditionAnd(t *testing.T) {
+	q := "SELECT a.id, a.k, b.v FROM a JOIN b ON a.id = b.id AND a.k = b.k"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP with JOIN failed: %v", err)
+	}
+
+	// Left has two rows with same id but different k.
+	aBatch := types.Batch{
+		{Tuple: types.Tuple{"a.id": 1, "a.k": "A"}, Count: 1},
+		{Tuple: types.Tuple{"a.id": 1, "a.k": "B"}, Count: 1},
+	}
+	// Right has only k=A match.
+	bBatch := types.Batch{
+		{Tuple: types.Tuple{"b.id": 1, "b.k": "A", "b.v": 10}, Count: 1},
+	}
+
+	_, err = op.ExecuteTick(node, map[string]types.Batch{"a": aBatch})
+	if err != nil {
+		t.Fatalf("ExecuteTick(a) failed: %v", err)
+	}
+	out, err := op.ExecuteTick(node, map[string]types.Batch{"b": bBatch})
+	if err != nil {
+		t.Fatalf("ExecuteTick(b) failed: %v", err)
+	}
+
+	if len(out) != 1 {
+		t.Fatalf("expected 1 joined row, got %d (%v)", len(out), out)
+	}
+	if out[0].Tuple["a.k"] != "A" {
+		t.Fatalf("expected join on k=A, got %v", out[0].Tuple["a.k"])
 	}
 }
 
@@ -1984,6 +2072,27 @@ func TestParseTimeWindowSQL_Session(t *testing.T) {
 	}
 	if spec.GapMillis != 300000 {
 		t.Errorf("expected gap=300000ms, got %d", spec.GapMillis)
+	}
+}
+
+func TestParseTimeWindowSQL_Tumble_HourAndDay(t *testing.T) {
+	spec, err := ParseTimeWindowSQL("TUMBLE(ts, INTERVAL '1' HOUR)")
+	if err != nil {
+		t.Fatalf("failed to parse (HOUR): %v", err)
+	}
+	if spec.WindowType != "TUMBLING" {
+		t.Errorf("expected TUMBLING, got %s", spec.WindowType)
+	}
+	if spec.SizeMillis != 60*60*1000 {
+		t.Errorf("expected 1 hour in ms, got %d", spec.SizeMillis)
+	}
+
+	spec, err = ParseTimeWindowSQL("TUMBLE(ts, INTERVAL '2' DAYS)")
+	if err != nil {
+		t.Fatalf("failed to parse (DAYS): %v", err)
+	}
+	if spec.SizeMillis != 2*24*60*60*1000 {
+		t.Errorf("expected 2 days in ms, got %d", spec.SizeMillis)
 	}
 }
 

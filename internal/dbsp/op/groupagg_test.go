@@ -86,6 +86,27 @@ func TestCountAggBasic(t *testing.T) {
 	}
 }
 
+func TestCountAgg_ColNameStar_TreatedAsCountStar(t *testing.T) {
+	keyFn := func(tu types.Tuple) any { return tu["k"] }
+	aggInit := func() any { return int64(0) }
+	countAgg := &CountAgg{ColName: "*"}
+
+	g := NewGroupAggOp(keyFn, aggInit, countAgg)
+
+	// COUNT(*) must count rows regardless of NULLs / missing columns.
+	_, err := g.Apply(types.Batch{
+		{Tuple: types.Tuple{"k": "A", "x": nil}, Count: 1},
+		{Tuple: types.Tuple{"k": "A"}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+	st := g.State()
+	if st["A"] != int64(2) {
+		t.Fatalf("expected A=2 got %v", st["A"])
+	}
+}
+
 func TestGroupAggOp_MultiKey_OutputIncludesAllKeys(t *testing.T) {
 	// Simulate a composite-key grouping: the internal key can be an encoded string,
 	// but output should carry the original group key columns.
