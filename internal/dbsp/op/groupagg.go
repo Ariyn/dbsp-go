@@ -17,8 +17,10 @@ type GroupAggOp struct {
 	KeyFn   func(types.Tuple) any
 	AggInit func() any
 	AggFn   AggFunc
+	Aggs    []AggSlot
 
 	state      map[any]any
+	multiState map[any][]any
 	KeyColName string // Optional: name of the key column to include in output (legacy single-key mode)
 
 	// GroupKeyColNames, when set, injects the original GROUP BY key columns from
@@ -29,8 +31,19 @@ type GroupAggOp struct {
 	GroupKeyColNames []string
 }
 
+// AggSlot describes a single aggregate inside a multi-aggregate GroupAggOp.
+// Init returns the initial aggregate state; Fn applies TupleDelta updates.
+type AggSlot struct {
+	Init func() any
+	Fn   AggFunc
+}
+
 func NewGroupAggOp(keyFn func(types.Tuple) any, aggInit func() any, aggFn AggFunc) *GroupAggOp {
 	return &GroupAggOp{KeyFn: keyFn, AggInit: aggInit, AggFn: aggFn, state: make(map[any]any)}
+}
+
+func NewGroupAggMultiOp(keyFn func(types.Tuple) any, aggs []AggSlot) *GroupAggOp {
+	return &GroupAggOp{KeyFn: keyFn, Aggs: append([]AggSlot(nil), aggs...), multiState: make(map[any][]any)}
 }
 
 func (g *GroupAggOp) SetKeyColName(name string) {
@@ -47,6 +60,10 @@ func (g *GroupAggOp) SetGroupKeyColNames(names []string) {
 }
 
 func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
+	if len(g.Aggs) > 0 {
+		return g.applyMulti(batch)
+	}
+
 	var out types.Batch
 	// For delta-style aggregates (SUM/COUNT/AVG), compact per group key within
 	// the batch so that net-zero changes don't emit output.
@@ -130,6 +147,152 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	return out, nil
 }
 
+func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
+	var out types.Batch
+	// Compact additive deltas per group key within the batch so that net-zero
+	// changes don't emit output.
+	pending := make(map[any]*types.TupleDelta)
+
+	if g.multiState == nil {
+		g.multiState = make(map[any][]any)
+	}
+
+	skipCols := make(map[string]struct{})
+	if len(g.GroupKeyColNames) > 0 {
+		for _, c := range g.GroupKeyColNames {
+			skipCols[c] = struct{}{}
+		}
+	} else if g.KeyColName != "" {
+		skipCols[g.KeyColName] = struct{}{}
+	}
+
+	for _, td := range batch {
+		key := g.KeyFn(td.Tuple)
+		states, ok := g.multiState[key]
+		if !ok || len(states) != len(g.Aggs) {
+			states = make([]any, len(g.Aggs))
+			for i, a := range g.Aggs {
+				if a.Init != nil {
+					states[i] = a.Init()
+				}
+			}
+		}
+
+		for i, a := range g.Aggs {
+			newVal, outDelta := a.Fn.Apply(states[i], td)
+			states[i] = newVal
+			if outDelta == nil {
+				continue
+			}
+			if outDelta.Tuple == nil {
+				outDelta.Tuple = types.Tuple{}
+			}
+			if len(g.GroupKeyColNames) > 0 {
+				for _, col := range g.GroupKeyColNames {
+					outDelta.Tuple[col] = td.Tuple[col]
+				}
+			} else if g.KeyColName != "" {
+				outDelta.Tuple[g.KeyColName] = key
+			}
+
+			mergePendingTupleDeltaLocal(pending, key, outDelta, skipCols)
+		}
+
+		g.multiState[key] = states
+	}
+
+	for _, td := range pending {
+		out = append(out, *td)
+	}
+	return out, nil
+}
+
+func mergePendingTupleDeltaLocal(pending map[any]*types.TupleDelta, key any, delta *types.TupleDelta, skipCols map[string]struct{}) {
+	if delta == nil {
+		return
+	}
+	// Only compact additive deltas (Count==1). For other styles, just emit.
+	if delta.Count != 1 {
+		pending[key] = delta
+		return
+	}
+	if delta.Tuple == nil {
+		return
+	}
+
+	ex := pending[key]
+	if ex == nil {
+		pending[key] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+		ex = pending[key]
+	} else {
+		for k, v := range delta.Tuple {
+			if _, skip := skipCols[k]; skip {
+				continue
+			}
+			if prev, ok := ex.Tuple[k]; ok {
+				ex.Tuple[k] = addNumericLocal(prev, v)
+			} else {
+				ex.Tuple[k] = v
+			}
+		}
+	}
+
+	// If all numeric delta fields cancel to 0, drop the pending output.
+	if isAllNumericZeroLocal(ex.Tuple, skipCols) {
+		delete(pending, key)
+	}
+}
+
+func addNumericLocal(a, b any) any {
+	if isFloatyLocal(a) || isFloatyLocal(b) {
+		return toFloat64Local(a) + toFloat64Local(b)
+	}
+	return toInt64Local(a) + toInt64Local(b)
+}
+
+func isFloatyLocal(v any) bool {
+	switch v.(type) {
+	case float64, float32:
+		return true
+	default:
+		return false
+	}
+}
+
+func isAllNumericZeroLocal(t types.Tuple, skipCols map[string]struct{}) bool {
+	for k, v := range t {
+		if _, skip := skipCols[k]; skip {
+			continue
+		}
+		switch x := v.(type) {
+		case float64:
+			if x != 0 {
+				return false
+			}
+		case float32:
+			if x != 0 {
+				return false
+			}
+		case int64:
+			if x != 0 {
+				return false
+			}
+		case int:
+			if x != 0 {
+				return false
+			}
+		case uint64:
+			if x != 0 {
+				return false
+			}
+		default:
+			// Non-numeric fields are assumed to be group key columns.
+			continue
+		}
+	}
+	return true
+}
+
 func toFloat64Local(v any) float64 {
 	switch x := v.(type) {
 	case float64:
@@ -166,6 +329,13 @@ func toInt64Local(v any) int64 {
 
 // State returns a copy of the internal aggregate state (for testing/inspection).
 func (g *GroupAggOp) State() map[any]any {
+	if len(g.Aggs) > 0 {
+		copy := make(map[any]any, len(g.multiState))
+		for k, v := range g.multiState {
+			copy[k] = append([]any(nil), v...)
+		}
+		return copy
+	}
 	copy := make(map[any]any, len(g.state))
 	for k, v := range g.state {
 		copy[k] = v
@@ -176,6 +346,7 @@ func (g *GroupAggOp) State() map[any]any {
 // SumAgg is a simple AggFunc that sums a numeric field multiplied by Count.
 type SumAgg struct {
 	ColName string // Column to sum (defaults to "v" if empty)
+	DeltaCol string
 }
 
 func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
@@ -225,7 +396,11 @@ func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 		return newVal, nil
 	}
 
-	tup := types.Tuple{"agg_delta": diff}
+	deltaCol := s.DeltaCol
+	if deltaCol == "" {
+		deltaCol = "agg_delta"
+	}
+	tup := types.Tuple{deltaCol: diff}
 	out := &types.TupleDelta{Tuple: tup, Count: 1}
 	return newVal, out
 }
@@ -233,6 +408,7 @@ func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 // Convenience: simple CountAgg implementation
 type CountAgg struct {
 	ColName string // Column to count (empty string means COUNT(*))
+	DeltaCol string
 }
 
 func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
@@ -264,7 +440,11 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 	if diff == 0 {
 		return newI, nil
 	}
-	tup := types.Tuple{"count_delta": diff}
+	deltaCol := c.DeltaCol
+	if deltaCol == "" {
+		deltaCol = "count_delta"
+	}
+	tup := types.Tuple{deltaCol: diff}
 	out := &types.TupleDelta{Tuple: tup, Count: 1}
 	return newI, out
 }

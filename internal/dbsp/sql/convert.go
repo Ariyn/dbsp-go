@@ -102,19 +102,46 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		return nil, err
 	}
 
-	// Use original query string to find aggregate because parser has bugs
-	aggFunc, aggCol, err := findSingleAggregateFromQuery(query)
+	// Use original query string to find aggregates because parser has bugs
+	aggs, err := findAggregatesFromQuery(query)
 	if err != nil {
 		return nil, err
+	}
+	if len(aggs) > 1 {
+		for _, a := range aggs {
+			name := strings.ToUpper(a.Name)
+			if name != "SUM" && name != "COUNT" {
+				return nil, errors.New("multiple aggregate functions not supported yet")
+			}
+			if name == "COUNT" && strings.TrimSpace(a.Col) == "*" {
+				return nil, errors.New("COUNT(*) cannot be combined with other aggregates yet")
+			}
+		}
 	}
 
 	// Build GroupAgg with input from current node (which may include filter)
 	lg := &ir.LogicalGroupAgg{
 		Keys:       groupCols,
-		AggName:    aggFunc,
-		AggCol:     aggCol,
 		WindowSpec: windowSpec,
 		Input:      currentNode,
+	}
+	// Preserve legacy single-aggregate fields for backward-compatible output.
+	if len(aggs) == 1 {
+		lg.AggName = aggs[0].Name
+		if strings.ToUpper(aggs[0].Name) == "COUNT" && strings.TrimSpace(aggs[0].Col) == "*" {
+			lg.AggCol = ""
+		} else {
+			lg.AggCol = aggs[0].Col
+		}
+	} else {
+		lg.Aggs = make([]ir.AggSpec, 0, len(aggs))
+		for _, a := range aggs {
+			col := a.Col
+			if strings.ToUpper(a.Name) == "COUNT" && strings.TrimSpace(col) == "*" {
+				col = ""
+			}
+			lg.Aggs = append(lg.Aggs, ir.AggSpec{Name: a.Name, Col: col})
+		}
 	}
 	return lg, nil
 }
@@ -483,19 +510,45 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr) (ir.LogicalNode, er
 		return nil, err
 	}
 
-	// Find aggregate function from query string
-	aggFunc, aggCol, err := findSingleAggregateFromQuery(sel.String())
+	// Find aggregates from query string
+	aggs, err := findAggregatesFromQuery(sel.String())
 	if err != nil {
 		return nil, err
+	}
+	if len(aggs) > 1 {
+		for _, a := range aggs {
+			name := strings.ToUpper(a.Name)
+			if name != "SUM" && name != "COUNT" {
+				return nil, errors.New("multiple aggregate functions not supported yet")
+			}
+			if name == "COUNT" && strings.TrimSpace(a.Col) == "*" {
+				return nil, errors.New("COUNT(*) cannot be combined with other aggregates yet")
+			}
+		}
 	}
 
 	// Build GroupAgg with input from current node
 	lg := &ir.LogicalGroupAgg{
 		Keys:       groupCols,
-		AggName:    aggFunc,
-		AggCol:     aggCol,
 		WindowSpec: windowSpec,
 		Input:      currentNode,
+	}
+	if len(aggs) == 1 {
+		lg.AggName = aggs[0].Name
+		if strings.ToUpper(aggs[0].Name) == "COUNT" && strings.TrimSpace(aggs[0].Col) == "*" {
+			lg.AggCol = ""
+		} else {
+			lg.AggCol = aggs[0].Col
+		}
+	} else {
+		lg.Aggs = make([]ir.AggSpec, 0, len(aggs))
+		for _, a := range aggs {
+			col := a.Col
+			if strings.ToUpper(a.Name) == "COUNT" && strings.TrimSpace(col) == "*" {
+				col = ""
+			}
+			lg.Aggs = append(lg.Aggs, ir.AggSpec{Name: a.Name, Col: col})
+		}
 	}
 
 	return lg, nil

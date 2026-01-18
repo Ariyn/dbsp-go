@@ -48,6 +48,9 @@ type WindowSpec struct {
 type LogicalGroupAgg struct {
 	// Group keys (column names)
 	Keys []string
+	// Aggs is the preferred representation for one or more aggregate functions.
+	// When empty, the legacy AggName/AggCol fields may be used.
+	Aggs []AggSpec
 	// AggName: SUM, COUNT
 	AggName string
 	// AggCol: column to aggregate (for SUM); empty for COUNT(*)
@@ -61,6 +64,18 @@ type LogicalGroupAgg struct {
 }
 
 func (g *LogicalGroupAgg) nodeName() string { return "LogicalGroupAgg" }
+
+// AggSpec describes a single aggregate call in a GROUP BY.
+//
+// Example: SUM(v) -> {Name:"SUM", Col:"v"}
+// COUNT(id) -> {Name:"COUNT", Col:"id"}
+//
+// NOTE: COUNT(*) is represented as Col=="*" in some parsing paths, but
+// multi-aggregate support may restrict it depending on higher-level policy.
+type AggSpec struct {
+	Name string
+	Col  string
+}
 
 // WindowFuncSpec describes a window function specification
 type WindowFuncSpec struct {

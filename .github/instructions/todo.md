@@ -66,7 +66,7 @@
   - 목표: composite key(튜플/struct) 또는 안정적인 key encoding 도입
   - 후보 파일: `internal/dbsp/ir/transform.go`, `internal/dbsp/ir/plan.go`
 
-- [ ] **다중 집계 지원 (예: `SELECT k, SUM(v), COUNT(*) ...`)**
+- [x] **다중 집계 지원 (예: `SELECT k, SUM(v), COUNT(*) ...`)**
   - 현재 “multiple aggregate functions not supported yet”
   - 목표: 다중 agg를 하나의 상태로 합치거나, 여러 GroupAgg를 병렬/체인으로 구성
   - 후보 파일: `internal/dbsp/sql/select_helper.go`, `internal/dbsp/ir/transform.go`

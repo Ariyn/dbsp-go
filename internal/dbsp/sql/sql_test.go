@@ -115,6 +115,46 @@ func TestParseAndExecuteSumGroupBy_MultiKey(t *testing.T) {
 	}
 }
 
+func TestParseAndExecuteMultiAgg_SumAndCount_WithDelete(t *testing.T) {
+	q := "SELECT k, SUM(v), COUNT(id) FROM t GROUP BY k"
+	node, err := ParseQueryToDBSP(q)
+	if err != nil {
+		t.Fatalf("ParseQueryToDBSP failed: %v", err)
+	}
+
+	ins := types.Batch{
+		{Tuple: types.Tuple{"k": "A", "id": int64(1), "v": int64(10)}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "id": int64(2), "v": int64(5)}, Count: 1},
+		{Tuple: types.Tuple{"k": "B", "id": int64(3), "v": int64(7)}, Count: 1},
+	}
+	out1, err := op.Execute(node, ins)
+	if err != nil {
+		t.Fatalf("Execute(insert) failed: %v", err)
+	}
+	if len(out1) == 0 {
+		t.Fatalf("expected output deltas")
+	}
+
+	// Delete one row from A.
+	del := types.Batch{{Tuple: types.Tuple{"k": "A", "id": int64(1), "v": int64(10)}, Count: -1}}
+	out2, err := op.Execute(node, del)
+	if err != nil {
+		t.Fatalf("Execute(delete) failed: %v", err)
+	}
+	if len(out2) != 1 {
+		t.Fatalf("expected 1 compacted output delta, got %d (%v)", len(out2), out2)
+	}
+	if out2[0].Tuple["k"] != "A" {
+		t.Fatalf("expected k=A, got %v", out2[0].Tuple["k"])
+	}
+	if out2[0].Tuple["agg_delta"] != float64(-10) {
+		t.Fatalf("expected agg_delta=-10, got %v", out2[0].Tuple["agg_delta"])
+	}
+	if out2[0].Tuple["count_delta"] != int64(-1) {
+		t.Fatalf("expected count_delta=-1, got %v", out2[0].Tuple["count_delta"])
+	}
+}
+
 func TestParseQueryToIncrementalDBSP(t *testing.T) {
 	q := "SELECT k, SUM(v) FROM t GROUP BY k"
 	incNode, err := ParseQueryToIncrementalDBSP(q)

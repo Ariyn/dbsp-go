@@ -113,6 +113,59 @@ func TestGroupAggOp_MultiKey_OutputIncludesAllKeys(t *testing.T) {
 	}
 }
 
+func TestGroupAggOp_MultiAgg_SumAndCount_WithDelete(t *testing.T) {
+	keyFn := func(tu types.Tuple) any { return tu["k"] }
+	g := NewGroupAggMultiOp(keyFn, []AggSlot{
+		{Init: func() any { return float64(0) }, Fn: &SumAgg{ColName: "v", DeltaCol: "agg_delta"}},
+		{Init: func() any { return int64(0) }, Fn: &CountAgg{ColName: "id", DeltaCol: "count_delta"}},
+	})
+	g.SetGroupKeyColNames([]string{"k"})
+
+	// Insert two rows.
+	out1, err := g.Apply(types.Batch{
+		{Tuple: types.Tuple{"k": "A", "id": int64(1), "v": int64(10)}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "id": int64(2), "v": int64(5)}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	if len(out1) == 0 {
+		t.Fatalf("expected output deltas")
+	}
+
+	// Delete one row.
+	out2, err := g.Apply(types.Batch{
+		{Tuple: types.Tuple{"k": "A", "id": int64(1), "v": int64(10)}, Count: -1},
+	})
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	if len(out2) != 1 {
+		t.Fatalf("expected 1 compacted output delta, got %d (%v)", len(out2), out2)
+	}
+	if out2[0].Tuple["k"] != "A" {
+		t.Fatalf("expected k=A in output, got %v", out2[0].Tuple["k"])
+	}
+	if out2[0].Tuple["agg_delta"] != float64(-10) {
+		t.Fatalf("expected agg_delta=-10, got %v", out2[0].Tuple["agg_delta"])
+	}
+	if out2[0].Tuple["count_delta"] != int64(-1) {
+		t.Fatalf("expected count_delta=-1, got %v", out2[0].Tuple["count_delta"])
+	}
+
+	st := g.State()
+	states, ok := st["A"].([]any)
+	if !ok || len(states) != 2 {
+		t.Fatalf("expected state slice of len 2, got %T (%v)", st["A"], st["A"])
+	}
+	if states[0] != float64(5) {
+		t.Fatalf("expected sum state=5, got %v", states[0])
+	}
+	if states[1] != int64(1) {
+		t.Fatalf("expected count state=1, got %v", states[1])
+	}
+}
+
 // ============================================================================
 // AVG Aggregation Tests
 // ============================================================================
