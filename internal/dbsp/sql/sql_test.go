@@ -498,21 +498,23 @@ func TestParseQueryJoinGroupBy(t *testing.T) {
 		t.Fatalf("expected non-empty output")
 	}
 
-	// Find GroupAggOp in chain to verify state
-	chainedOp, ok := node.Op.(*op.ChainedOp)
-	if !ok {
-		t.Fatalf("expected ChainedOp, got %T", node.Op)
+	// Find GroupAggOp directly or in chain to verify state
+	var gop *op.GroupAggOp
+	if gg, ok := node.Op.(*op.GroupAggOp); ok {
+		gop = gg
+	} else if chainedOp, ok := node.Op.(*op.ChainedOp); ok {
+		for _, o := range chainedOp.Ops {
+			if gg, ok := o.(*op.GroupAggOp); ok {
+				gop = gg
+				break
+			}
+		}
+	} else {
+		t.Fatalf("expected GroupAggOp or ChainedOp, got %T", node.Op)
 	}
 
-	var gop *op.GroupAggOp
-	for _, o := range chainedOp.Ops {
-		if gg, ok := o.(*op.GroupAggOp); ok {
-			gop = gg
-			break
-		}
-	}
 	if gop == nil {
-		t.Fatalf("expected GroupAggOp in chain")
+		t.Fatalf("expected GroupAggOp in node")
 	}
 
 	state := gop.State()

@@ -26,6 +26,9 @@ type Node struct {
 	// Source identifies a leaf input in the operator graph.
 	// When non-empty, this node reads its batch from the per-tick input map.
 	Source string
+
+	// PartitionBy describes the columns to partition by for an output sink.
+	PartitionBy []string
 }
 
 // Execute runs the operator at root with the given delta batch and returns its output.

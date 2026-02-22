@@ -74,9 +74,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// If Parquet sink is selected, infer/load and cache output schema at SQL-analysis time.
+	// If Parquet/HTTPPull sink is selected, infer/load and cache output schema at SQL-analysis time.
 	var parquetSchema *config.ParquetSchema
-	if cfg.Pipeline.Sink.Type == "parquet" {
+	if cfg.Pipeline.Sink.Type == "parquet" || cfg.Pipeline.Sink.Type == "http_pull" {
 		parquetSchema, err = config.InferOrLoadParquetSchema(query, cfg.Pipeline.Source, cfg.Pipeline.Sink.Config)
 		if err != nil {
 			fmt.Printf("Error inferring parquet schema: %v\n", err)
@@ -115,6 +115,8 @@ func main() {
 		snk, err = sink.NewFileSink(cfg.Pipeline.Sink.Config)
 	case "parquet":
 		snk, err = sink.NewParquetSink(cfg.Pipeline.Sink.Config, parquetSchema)
+	case "http_pull":
+		snk, err = sink.NewHTTPPullSink(cfg.Pipeline.Sink.Config, rootNode.PartitionBy, parquetSchema)
 	default:
 		err = fmt.Errorf("unsupported sink type: %s", cfg.Pipeline.Sink.Type)
 	}

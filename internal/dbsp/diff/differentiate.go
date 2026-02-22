@@ -18,7 +18,11 @@ import (
 // - Map operators (including GroupAgg which acts like a stateful map)
 // - The derivative of integrate is the identity (already handled by GroupAgg state)
 func Differentiate(node *op.Node) (*op.Node, error) {
-	return DifferentiateGraphV2(node)
+	diffRoot, err := DifferentiateGraphV2(node)
+	if err == nil && node != nil && diffRoot != nil {
+		diffRoot.PartitionBy = append([]string(nil), node.PartitionBy...)
+	}
+	return diffRoot, err
 }
 
 // DifferentiateGraph recursively differentiates an entire operator graph.
@@ -84,11 +88,11 @@ func DifferentiateGraphLegacy(root *op.Node) (*op.Node, error) {
 // DifferentiateGraphV2 differentiates a graph using explicit DBSP-style rules.
 //
 // Key behavior:
-// - Join is expanded into an explicit 3-term graph:
+//   - Join is expanded into an explicit 3-term graph:
 //     (ΔR⋈S_old) + (R_old⋈ΔS) + (ΔR⋈ΔS)
-//   where R_old, S_old are computed as Delay(Integrate(ΔR)), Delay(Integrate(ΔS)).
-// - Union/Difference are treated as linear operators.
-// - Other operators are assumed delta-linear and are preserved.
+//     where R_old, S_old are computed as Delay(Integrate(ΔR)), Delay(Integrate(ΔS)).
+//   - Union/Difference are treated as linear operators.
+//   - Other operators are assumed delta-linear and are preserved.
 func DifferentiateGraphV2(root *op.Node) (*op.Node, error) {
 	if root == nil {
 		return nil, fmt.Errorf("cannot differentiate nil node")

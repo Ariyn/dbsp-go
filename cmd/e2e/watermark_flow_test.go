@@ -32,13 +32,13 @@ func TestWatermarkFlow(t *testing.T) {
 	watermark.ApplyWatermarkConfig(root, wmCfg)
 
 	sink := testutil.NewRecordingSink()
-	
+
 	// Batch 1: Events at T=1s, 5s. MaxTs=5s -> Watermark=3s
 	batch1 := types.Batch{
 		{Tuple: types.Tuple{"ts": int64(1000), "v": 10.0, "k": "A"}, Count: 1},
 		{Tuple: types.Tuple{"ts": int64(5000), "v": 20.0, "k": "A"}, Count: 1},
 	}
-	
+
 	// Batch 2: Event at T=12s. MaxTs=12s -> Watermark=10s
 	batch2 := types.Batch{
 		{Tuple: types.Tuple{"ts": int64(12000), "v": 5.0, "k": "A"}, Count: 1},
@@ -52,7 +52,7 @@ func TestWatermarkFlow(t *testing.T) {
 
 	ctx := context.Background()
 	execute := func(b types.Batch) (types.Batch, error) { return op.Execute(root, b) }
-	
+
 	pipeline.RunPipeline(ctx, testutil.NewSliceSource([]types.Batch{batch1, batch2, batch3}), sink, execute, nil, nil, 0)
 
 	totalCount := 0
@@ -64,7 +64,7 @@ func TestWatermarkFlow(t *testing.T) {
 		for _, td := range b {
 			// t.Logf("Got tuple: %+v", td.Tuple)
 			totalCount++
-			
+
 			// SUM(v) in WindowAggOp uses "agg_delta" (SumAgg default DeltaCol)
 			sd, ok := td.Tuple["agg_delta"].(float64)
 			if !ok {
@@ -73,11 +73,11 @@ func TestWatermarkFlow(t *testing.T) {
 					sd = float64(val)
 				}
 			}
-			
+
 			if td.Tuple["__late"] == true {
 				foundLate = true
 			}
-			
+
 			// W0 start=0, W10 start=10000
 			if start, ok := td.Tuple["__window_start"].(int64); ok {
 				if start == 0 {

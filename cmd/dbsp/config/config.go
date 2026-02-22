@@ -102,3 +102,11 @@ type ParquetSinkConfig struct {
 	// RotateEvery rotates files by time interval (e.g., "10s", "5 minutes"). Empty disables.
 	RotateEvery string `yaml:"rotate_every"`
 }
+
+type HTTPPullSinkConfig struct {
+	Port int    `yaml:"port"`
+	Path string `yaml:"path"`
+
+	// DiskSpillPath is the directory where partitioned snapshots are stored.
+	DiskSpillPath string `yaml:"disk_spill_path"`
+}

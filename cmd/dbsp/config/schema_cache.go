@@ -34,16 +34,22 @@ type ParquetColumn struct {
 }
 
 func InferOrLoadParquetSchema(query string, srcCfg SourceConfig, sinkCfg map[string]interface{}) (*ParquetSchema, error) {
-	cfg, err := ParseParquetSinkConfig(sinkCfg)
-	if err != nil {
-		return nil, err
-	}
-
 	queryHash := hashString(query)
-	cachePath := strings.TrimSpace(cfg.SchemaCachePath)
-	if cachePath == "" {
-		// Default: next to the Parquet path prefix.
-		cachePath = cfg.Path + ".schema.json"
+	var cachePath string
+
+	if pcfg, err := ParseParquetSinkConfig(sinkCfg); err == nil {
+		cachePath = strings.TrimSpace(pcfg.SchemaCachePath)
+		if cachePath == "" {
+			cachePath = pcfg.Path + ".schema.json"
+		}
+	} else if hcfg, err := ParseHTTPPullSinkConfig(sinkCfg); err == nil {
+		// For http_pull, optionally use a cache if configured, or default.
+		cachePath = "http_pull.schema.json"
+		if hcfg.DiskSpillPath != "" {
+			cachePath = filepath.Join(hcfg.DiskSpillPath, "schema.json")
+		}
+	} else {
+		return nil, fmt.Errorf("sink configuration must be either parquet or http_pull to use ParquetSchema")
 	}
 
 	if st, err := os.Stat(cachePath); err == nil && !st.IsDir() {
@@ -59,12 +65,10 @@ func InferOrLoadParquetSchema(query string, srcCfg SourceConfig, sinkCfg map[str
 			s.Version = 1
 		}
 		if s.QueryHash != "" && s.QueryHash != queryHash {
-			return nil, fmt.Errorf("schema cache query_hash mismatch (cache=%s current=%s)", s.QueryHash, queryHash)
+			// Query changed? We should re-infer.
+		} else if len(s.Columns) > 0 {
+			return &s, nil
 		}
-		if len(s.Columns) == 0 {
-			return nil, fmt.Errorf("schema cache has no columns")
-		}
-		return &s, nil
 	}
 
 	srcSchema, err := extractSourceSchemaHints(srcCfg)
@@ -109,6 +113,24 @@ func ParseParquetSinkConfig(cfg map[string]interface{}) (*ParquetSinkConfig, err
 	}
 	if strings.TrimSpace(out.Path) == "" {
 		return nil, fmt.Errorf("parquet sink path is required")
+	}
+	return &out, nil
+}
+
+func ParseHTTPPullSinkConfig(cfg map[string]interface{}) (*HTTPPullSinkConfig, error) {
+	yamlBytes, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal http_pull sink config: %w", err)
+	}
+	var out HTTPPullSinkConfig
+	if err := yaml.Unmarshal(yamlBytes, &out); err != nil {
+		return nil, fmt.Errorf("failed to parse http_pull sink config: %w", err)
+	}
+	if out.Port <= 0 {
+		out.Port = 8080 // Default port
+	}
+	if strings.TrimSpace(out.Path) == "" {
+		out.Path = "/snapshot" // Default path
 	}
 	return &out, nil
 }

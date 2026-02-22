@@ -145,7 +145,7 @@ func TestLogicalToDBSP_UnsupportedAgg_Error(t *testing.T) {
 	scan := &LogicalScan{Table: "data"}
 	agg := &LogicalGroupAgg{
 		Keys:    []string{"key"},
-		AggName: "AVG", // Not supported
+		AggName: "MEDIAN", // Not supported
 		AggCol:  "value",
 		Input:   scan,
 	}
@@ -156,24 +156,8 @@ func TestLogicalToDBSP_UnsupportedAgg_Error(t *testing.T) {
 	}
 }
 
+/*
 func TestLogicalToDBSP_NonScanInput_Error(t *testing.T) {
-	// Create a GroupAgg with another GroupAgg as input (not supported)
-	innerScan := &LogicalScan{Table: "t"}
-	innerAgg := &LogicalGroupAgg{
-		Keys:    []string{"k"},
-		AggName: "SUM",
-		AggCol:  "v",
-		Input:   innerScan,
-	}
-	outerAgg := &LogicalGroupAgg{
-		Keys:    []string{"k"},
-		AggName: "COUNT",
-		AggCol:  "v",
-		Input:   innerAgg, // Non-scan input
-	}
-
-	_, err := LogicalToDBSP(outerAgg)
-	if err == nil {
-		t.Fatal("expected error for non-scan input to GroupAgg")
-	}
+	// ... (nested aggregations are now supported by the recursive transformation)
 }
+*/

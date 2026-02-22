@@ -14,14 +14,27 @@ import (
 
 // ParseQueryToLogicalPlan parses a tiny subset of SQL into a LogicalNode.
 func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
+	// Pre-process: Extract global PARTITION BY at the end of query (sink config)
+	actualQuery, partitions, err := extractGlobalPartitionBy(query)
+	if err != nil {
+		return nil, err
+	}
+
 	p := parser.NewParser()
-	stmt, err := p.Parse(query)
+	stmt, err := p.Parse(actualQuery)
 	if err != nil {
 		// tree-sitter가 TUMBLE/HOP/SESSION 문법을 못 먹는 경우가 있어
 		// 문자열 기반 fallback으로 time-window GROUP BY만 구제한다.
-		if lp, ok, ferr := parseTimeWindowGroupByFallback(query); ferr != nil {
+		if lp, ok, ferr := parseTimeWindowGroupByFallback(actualQuery); ferr != nil {
 			return nil, ferr
 		} else if ok {
+			if len(partitions) > 0 {
+				return &ir.LogicalView{
+					Name:        "auto_view",
+					PartitionBy: partitions,
+					Input:       lp,
+				}, nil
+			}
 			return lp, nil
 		}
 		return nil, err
@@ -32,7 +45,76 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		return nil, errors.New("only SELECT supported")
 	}
 
-	return parseSelectToLogicalPlan(sel, query, make(map[string]ir.LogicalNode))
+	lp, err := parseSelectToLogicalPlan(sel, actualQuery, make(map[string]ir.LogicalNode))
+	if err != nil {
+		return nil, err
+	}
+
+	if len(partitions) > 0 {
+		return &ir.LogicalView{
+			Name:        "auto_view",
+			PartitionBy: partitions,
+			Input:       lp,
+		}, nil
+	}
+
+	return lp, err
+}
+
+func extractGlobalPartitionBy(query string) (string, []string, error) {
+	upper := strings.ToUpper(query)
+	search := "PARTITION BY"
+	curr := len(query)
+
+	for {
+		idx := strings.LastIndex(upper[:curr], search)
+		if idx == -1 {
+			break
+		}
+
+		// Check if it's at depth 0
+		depth := 0
+		for i := 0; i < idx; i++ {
+			if query[i] == '(' {
+				depth++
+			} else if query[i] == ')' {
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+
+		if depth == 0 {
+			// Check word boundaries
+			leftOK := idx == 0 || !isWordChar(upper[idx-1])
+			rightOK := idx+len(search) == len(query) || !isWordChar(upper[idx+len(search)])
+
+			if leftOK && rightOK {
+				// Avoid matching PARTITION BY in window functions even if depth is 0 (though unlikely in SELECT)
+				// Also avoid if it's right after "OVER" (if someone wrote OVER PARTITION BY without parens, though DuckDB doesn't support that)
+				pre := strings.TrimSpace(query[:idx])
+				upPre := strings.ToUpper(pre)
+				if !strings.HasSuffix(upPre, "OVER") {
+					actualQuery := strings.TrimSpace(query[:idx])
+					partitionStr := strings.TrimSpace(query[idx+len(search):])
+
+					// Parts can be comma separated
+					rawParts := strings.Split(partitionStr, ",")
+					partitions := make([]string, 0, len(rawParts))
+					for _, p := range rawParts {
+						col := strings.TrimSpace(p)
+						if col != "" {
+							partitions = append(partitions, col)
+						}
+					}
+					return actualQuery, partitions, nil
+				}
+			}
+		}
+		curr = idx
+	}
+
+	return query, nil, nil
 }
 
 func parseSelectToLogicalPlan(sel *ast.Select, query string, ctes map[string]ir.LogicalNode) (ir.LogicalNode, error) {

@@ -34,15 +34,15 @@ func TestLateIngest(t *testing.T) {
 	batch1 := types.Batch{
 		{Tuple: types.Tuple{"ts": int64(10000), "v": 10.0, "k": "A"}, Count: 1},
 	}
-	
-	// 2. Late event T=7s. Watermark=10s. 
+
+	// 2. Late event T=7s. Watermark=10s.
 	// 7s < 10s (Late) but 7s >= (10s - 5s) = 5s (Allowed).
 	// Should be processed and marked as __late.
 	batch2 := types.Batch{
 		{Tuple: types.Tuple{"ts": int64(7000), "v": 20.0, "k": "A"}, Count: 1},
 	}
 
-	// 3. Too late event T=4s. 
+	// 3. Too late event T=4s.
 	// 4s < 5s (Too late). Should be dropped completely.
 	batch3 := types.Batch{
 		{Tuple: types.Tuple{"ts": int64(4000), "v": 30.0, "k": "A"}, Count: 1},
@@ -66,7 +66,7 @@ func TestLateIngest(t *testing.T) {
 			if sd == 30.0 {
 				processedBatch3 = true
 			}
-			
+
 			if start, ok := td.Tuple["__window_start"].(int64); ok && start == 0 {
 				window0Sum += sd
 			}

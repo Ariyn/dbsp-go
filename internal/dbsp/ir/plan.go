@@ -199,6 +199,15 @@ type LogicalSort struct {
 
 func (s *LogicalSort) nodeName() string { return "LogicalSort" }
 
+// LogicalView represents a named view with optional partitioning for a sink.
+type LogicalView struct {
+	Name        string
+	PartitionBy []string
+	Input       LogicalNode
+}
+
+func (v *LogicalView) nodeName() string { return "LogicalView" }
+
 // LogicalLimit represents LIMIT and OFFSET clauses
 type LogicalLimit struct {
 	// Limit is the maximum number of rows to return

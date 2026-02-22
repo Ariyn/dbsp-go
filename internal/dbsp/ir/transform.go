@@ -573,6 +573,15 @@ func attachLogicalGroupAggInputWithContext(n *LogicalGroupAgg, aggOp op.Operator
 
 func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node, error) {
 	switch n := l.(type) {
+	case *LogicalView:
+		// View is the root for a sink. It carries PartitionBy metadata.
+		child, err := logicalToDBSPWithContext(n.Input, ctes)
+		if err != nil {
+			return nil, err
+		}
+		child.PartitionBy = append([]string(nil), n.PartitionBy...)
+		return child, nil
+
 	case *LogicalWith:
 		// Transform CTEs in order.
 		newCTEs := make(map[string]*op.Node)
