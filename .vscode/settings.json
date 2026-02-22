@@ -1,3 +1,12 @@
 {
-  "window.title": "dbsp-go"
+  "window.title": "dbsp-go",
+  "workbench.colorCustomizations": {
+    "titleBar.activeBackground": "#a2d7af",
+    "titleBar.activeForeground": "#000000",
+    "titleBar.inactiveBackground": "#a2d7af",
+    "statusBar.background": "#a2d7af",
+    "statusBar.foreground": "#000000",
+    "statusBar.noFolderBackground": "#a2d7af",
+    "activityBar.background": "#a2d7af"
+  }
 }
