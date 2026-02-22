@@ -210,3 +210,22 @@ type LogicalLimit struct {
 }
 
 func (l *LogicalLimit) nodeName() string { return "LogicalLimit" }
+
+// LogicalWith represents a WITH clause (CTE).
+type LogicalWith struct {
+	// CTENames preserves the order of CTE definitions
+	CTENames []string
+	// CTEs maps CTE name to its definition (subquery)
+	CTEs map[string]LogicalNode
+	// Body is the main query using those CTEs
+	Body LogicalNode
+}
+
+func (w *LogicalWith) nodeName() string { return "LogicalWith" }
+
+// LogicalCTERef represents a reference to a CTE in a logical plan.
+type LogicalCTERef struct {
+	CTEName string
+}
+
+func (c *LogicalCTERef) nodeName() string { return "LogicalCTERef" }

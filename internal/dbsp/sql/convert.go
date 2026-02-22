@@ -32,6 +32,62 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		return nil, errors.New("only SELECT supported")
 	}
 
+	return parseSelectToLogicalPlan(sel, query, make(map[string]ir.LogicalNode))
+}
+
+func parseSelectToLogicalPlan(sel *ast.Select, query string, ctes map[string]ir.LogicalNode) (ir.LogicalNode, error) {
+	// 1. Handle WITH clause (CTE)
+	if len(sel.With) > 0 {
+		// As per planning: recursive CTEs are not supported yet.
+		// NOTE: Some AST bindings might have a sel.Recursive or similar field.
+		// If you see a Recursive keyword, we check it.
+
+		// Create a copy of the parent CTE context for this scope.
+		// Duplicate names in this WITH clause will overwrite parent definitions (inner shadowing).
+		newCTEs := make(map[string]ir.LogicalNode)
+		for k, v := range ctes {
+			newCTEs[k] = v
+		}
+
+		var cteNames []string
+		for _, cte := range sel.With {
+			// A CTE can refer to previously defined CTEs in the same WITH clause.
+			cteLp, err := parseSelectToLogicalPlan(cte.Select, cte.Select.String(), newCTEs)
+			if err != nil {
+				return nil, err
+			}
+
+			// If column aliases are provided, wrap in a LogicalProject for renaming.
+			if len(cte.Columns) > 0 {
+				proj := &ir.LogicalProject{
+					Input:   cteLp,
+					Columns: cte.Columns, // Assuming we want these names exactly
+				}
+				cteLp = proj
+			}
+
+			newCTEs[cte.Name] = cteLp
+			cteNames = append(cteNames, cte.Name)
+		}
+
+		// Now transform the main part of the SELECT
+		body, err := parseSelectToLogicalPlanCore(sel, query, newCTEs)
+		if err != nil {
+			return nil, err
+		}
+
+		// Wrap in LogicalWith so shared subgraphs can be identified later.
+		return &ir.LogicalWith{
+			CTENames: cteNames,
+			CTEs:     newCTEs,
+			Body:     body,
+		}, nil
+	}
+
+	return parseSelectToLogicalPlanCore(sel, query, ctes)
+}
+
+func parseSelectToLogicalPlanCore(sel *ast.Select, query string, ctes map[string]ir.LogicalNode) (ir.LogicalNode, error) {
 	// Check for window functions (LAG ... OVER ...)
 	if wf, scan, err := parseWindowFunctionFromSelect(sel); wf != nil || err != nil {
 		if err != nil {
@@ -58,7 +114,7 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 	fromExpr := sel.From[0]
 	if joinExpr, ok := fromExpr.(*ast.JoinTableExpr); ok {
 		// Handle JOIN
-		return parseJoin(sel, joinExpr, query)
+		return parseJoin(sel, joinExpr, query, ctes)
 	}
 
 	// Start with scan - extract table name from FROM
@@ -66,8 +122,12 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 	if tableExpr, ok := sel.From[0].(*ast.TableName); ok {
 		tableName = tableExpr.Name
 	}
-	scan := &ir.LogicalScan{Table: tableName}
-	var currentNode ir.LogicalNode = scan
+	var currentNode ir.LogicalNode
+	if _, ok := ctes[tableName]; ok {
+		currentNode = &ir.LogicalCTERef{CTEName: tableName}
+	} else {
+		currentNode = &ir.LogicalScan{Table: tableName}
+	}
 
 	// Add filter if WHERE clause exists
 	if sel.Where != nil {
@@ -481,7 +541,7 @@ func ParseQueryToIncrementalDBSP(query string) (*op.Node, error) {
 }
 
 // parseJoin handles JOIN in the FROM clause
-func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string) (ir.LogicalNode, error) {
+func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string, ctes map[string]ir.LogicalNode) (ir.LogicalNode, error) {
 	// Extract left and right table names
 	leftTable, ok := joinExpr.LeftExpr.(*ast.TableName)
 	if !ok {
@@ -509,16 +569,27 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string) (i
 		return nil, err
 	}
 
-	// Create LogicalJoin
-	leftScan := &ir.LogicalScan{Table: leftTable.Name}
-	rightScan := &ir.LogicalScan{Table: rightTable.Name}
+	// Create LogicalJoin inputs, checking for CTE references
+	var leftLp, rightLp ir.LogicalNode
+
+	if _, ok := ctes[leftTable.Name]; ok {
+		leftLp = &ir.LogicalCTERef{CTEName: leftTable.Name}
+	} else {
+		leftLp = &ir.LogicalScan{Table: leftTable.Name}
+	}
+
+	if _, ok := ctes[rightTable.Name]; ok {
+		rightLp = &ir.LogicalCTERef{CTEName: rightTable.Name}
+	} else {
+		rightLp = &ir.LogicalScan{Table: rightTable.Name}
+	}
 
 	join := &ir.LogicalJoin{
 		LeftTable:  leftTable.Name,
 		RightTable: rightTable.Name,
 		Conditions: conditions,
-		Left:       leftScan,
-		Right:      rightScan,
+		Left:       leftLp,
+		Right:      rightLp,
 	}
 
 	var currentNode ir.LogicalNode = join

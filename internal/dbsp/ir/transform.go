@@ -533,7 +533,74 @@ func compareLessOrEqual(tupleVal any, threshold float64) bool {
 // LogicalToDBSP transforms a LogicalNode into a runtime DBSP operator Node.
 // For Phase1 it supports LogicalScan -> LogicalFilter -> LogicalProject -> LogicalGroupAgg pattern.
 func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
+	return logicalToDBSPWithContext(l, make(map[string]*op.Node))
+}
+
+// attachLogicalGroupAggInputWithContext handles input attachment for GroupAgg, supporting chaining and recursive transformation.
+func attachLogicalGroupAggInputWithContext(n *LogicalGroupAgg, aggOp op.Operator, ctes map[string]*op.Node) (*op.Node, error) {
+	if n == nil || n.Input == nil {
+		return &op.Node{Op: aggOp}, nil
+	}
+
+	// Filter before GroupAgg: chain filter MapOp then the group agg op.
+	if f, ok := n.Input.(*LogicalFilter); ok {
+		predicateFn := BuildPredicateFunc(f.PredicateSQL)
+		filterOp := &op.MapOp{
+			F: func(td types.TupleDelta) []types.TupleDelta {
+				if predicateFn(td.Tuple) {
+					return []types.TupleDelta{td}
+				}
+				return nil
+			},
+		}
+
+		inNode, err := logicalToDBSPWithContext(f.Input, ctes)
+		if err != nil {
+			return nil, err
+		}
+		chained := &op.ChainedOp{Ops: []op.Operator{filterOp, aggOp}}
+		return &op.Node{Op: chained, Inputs: []*op.Node{inNode}}, nil
+	}
+
+	// Normal recursive transform for input.
+	inNode, err := logicalToDBSPWithContext(n.Input, ctes)
+	if err != nil {
+		return nil, err
+	}
+
+	return &op.Node{Op: aggOp, Inputs: []*op.Node{inNode}}, nil
+}
+
+func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node, error) {
 	switch n := l.(type) {
+	case *LogicalWith:
+		// Transform CTEs in order.
+		newCTEs := make(map[string]*op.Node)
+		for k, v := range ctes {
+			newCTEs[k] = v
+		}
+
+		for _, name := range n.CTENames {
+			subLp := n.CTEs[name]
+			node, err := logicalToDBSPWithContext(subLp, newCTEs)
+			if err != nil {
+				return nil, err
+			}
+			newCTEs[name] = node
+		}
+
+		return logicalToDBSPWithContext(n.Body, newCTEs)
+
+	case *LogicalCTERef:
+		node, ok := ctes[n.CTEName]
+		if !ok {
+			return nil, fmt.Errorf("undefined CTE: %s", n.CTEName)
+		}
+		return node, nil
+
+	case *LogicalScan:
+		return &op.Node{Source: n.Table}, nil
+
 	case *LogicalProject:
 		columns := append([]string(nil), n.Columns...)
 		var projectOp op.Operator
@@ -561,44 +628,11 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 
 		// Check if input needs processing
 		if n.Input != nil {
-			// Recursively transform input first
-			switch in := n.Input.(type) {
-			case *LogicalFilter:
-				// Build filter predicate
-				predicateFn := BuildPredicateFunc(in.PredicateSQL)
-				filterOp := &op.MapOp{
-					F: func(td types.TupleDelta) []types.TupleDelta {
-						if predicateFn(td.Tuple) {
-							return []types.TupleDelta{td}
-						}
-						return nil
-					},
-				}
-
-				// Check if filter has JOIN as input
-				if join, ok := in.Input.(*LogicalJoin); ok {
-					// Transform JOIN
-					joinNode, err := logicalJoinToDBSP(join)
-					if err != nil {
-						return nil, err
-					}
-					// Unary pipeline applied on top of JOIN output
-					chainedOp := &op.ChainedOp{Ops: []op.Operator{filterOp, projectOp}}
-					return &op.Node{Op: chainedOp, Inputs: []*op.Node{joinNode}}, nil
-				}
-
-				// Chain: filter first, then project
-				return &op.Node{Op: &op.ChainedOp{Ops: []op.Operator{filterOp, projectOp}}}, nil
-
-			case *LogicalJoin:
-				// Transform JOIN and chain with project
-				joinNode, err := logicalJoinToDBSP(in)
-				if err != nil {
-					return nil, err
-				}
-				chainedOp := &op.ChainedOp{Ops: []op.Operator{projectOp}}
-				return &op.Node{Op: chainedOp, Inputs: []*op.Node{joinNode}}, nil
+			inNode, err := logicalToDBSPWithContext(n.Input, ctes)
+			if err != nil {
+				return nil, err
 			}
+			return &op.Node{Op: projectOp, Inputs: []*op.Node{inNode}}, nil
 		}
 
 		return &op.Node{Op: projectOp}, nil
@@ -614,348 +648,104 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 				return nil
 			},
 		}
-		// For now, we don't chain inputs (single-op nodes)
-		return &op.Node{Op: mapOp}, nil
-
-	case *LogicalGroupAgg:
-		// Expect input to be scan or filter
-		switch in := n.Input.(type) {
-		case *LogicalScan:
-			// Direct scan input
-			if n.WindowSpec == nil {
-				// Non-windowed grouping: support composite keys.
-				keyFn := buildGroupKeyFn(n.Keys)
-
-				// Multi-aggregate path (Phase A): SUM(col) + COUNT(col)
-				if len(n.Aggs) > 0 {
-					aggSlots := make([]op.AggSlot, 0, len(n.Aggs))
-					for _, a := range n.Aggs {
-						name := strings.ToUpper(a.Name)
-						switch name {
-						case "SUM":
-							aggSlots = append(aggSlots, op.AggSlot{
-								Init: func() any { return float64(0) },
-								Fn:   &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"},
-							})
-						case "COUNT":
-							aggSlots = append(aggSlots, op.AggSlot{
-								Init: func() any { return int64(0) },
-								Fn:   &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"},
-							})
-						default:
-							return nil, fmt.Errorf("unsupported agg %s in multi-aggregate", a.Name)
-						}
-					}
-					g := op.NewGroupAggMultiOp(keyFn, aggSlots)
-					g.SetGroupKeyColNames(n.Keys)
-					return &op.Node{Op: g}, nil
-				}
-
-				var agg op.AggFunc
-				var aggInit func() any
-				switch n.AggName {
-				case "SUM", "sum":
-					agg = &op.SumAgg{ColName: n.AggCol}
-					aggInit = func() any { return float64(0) }
-				case "COUNT", "count":
-					agg = &op.CountAgg{ColName: n.AggCol}
-					aggInit = func() any { return int64(0) }
-				case "MIN", "min":
-					agg = &op.MinAgg{ColName: n.AggCol}
-					aggInit = func() any { return op.NewSortedMultiset() }
-				case "MAX", "max":
-					agg = &op.MaxAgg{ColName: n.AggCol}
-					aggInit = func() any { return op.NewSortedMultiset() }
-				default:
-					return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-				}
-
-				g := op.NewGroupAggOp(keyFn, aggInit, agg)
-				g.SetGroupKeyColNames(n.Keys)
-				return &op.Node{Op: g}, nil
-			} // Windowed aggregation: use WindowAggOp so that each input delta
-			// Multi-aggregate windowed grouping is not supported yet.
-			if len(n.Aggs) > 0 {
-				return nil, fmt.Errorf("multi-aggregate windowed GROUP BY not supported yet")
-			}
-			// only affects its corresponding window(s) and group key.
-			ws := n.WindowSpec
-			if ws == nil {
-				return nil, fmt.Errorf("windowSpec must not be nil in windowed branch")
-			}
-
-			// If there are group keys, we currently support a single key column
-			// in addition to the window.
-			groupKeyFn := buildGroupKeyFn(n.Keys)
-
-			var agg op.AggFunc
-			var aggInit func() any
-			switch n.AggName {
-			case "SUM", "sum":
-				agg = &op.SumAgg{ColName: n.AggCol}
-				aggInit = func() any { return float64(0) }
-			case "COUNT", "count":
-				agg = &op.CountAgg{ColName: n.AggCol}
-				aggInit = func() any { return int64(0) }
-			case "AVG", "avg":
-				agg = &op.AvgAgg{ColName: n.AggCol}
-				aggInit = func() any { return nil }
-			case "MIN", "min":
-				agg = &op.MinAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			case "MAX", "max":
-				agg = &op.MaxAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			default:
-				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-			}
-
-			waSpec := op.WindowSpecLite{
-				TimeCol:    ws.TimeCol,
-				SizeMillis: ws.SizeMillis,
-			}
-			g := op.NewWindowAggOp(waSpec, groupKeyFn, n.Keys, aggInit, agg)
-			return &op.Node{Op: g}, nil
-
-		case *LogicalFilter:
-			// Filter before GroupAgg - create chained MapOp
-			if n.WindowSpec == nil {
-				// Non-windowed grouping: support composite keys.
-				keyFn := buildGroupKeyFn(n.Keys)
-
-				// Multi-aggregate path (Phase A): SUM(col) + COUNT(col)
-				if len(n.Aggs) > 0 {
-					aggSlots := make([]op.AggSlot, 0, len(n.Aggs))
-					for _, a := range n.Aggs {
-						name := strings.ToUpper(a.Name)
-						switch name {
-						case "SUM":
-							aggSlots = append(aggSlots, op.AggSlot{Init: func() any { return float64(0) }, Fn: &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"}})
-						case "COUNT":
-							aggSlots = append(aggSlots, op.AggSlot{Init: func() any { return int64(0) }, Fn: &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"}})
-						default:
-							return nil, fmt.Errorf("unsupported agg %s in multi-aggregate", a.Name)
-						}
-					}
-
-					predicateFn := BuildPredicateFunc(in.PredicateSQL)
-					g := op.NewGroupAggMultiOp(keyFn, aggSlots)
-					g.SetGroupKeyColNames(n.Keys)
-					filterOp := &op.MapOp{
-						F: func(td types.TupleDelta) []types.TupleDelta {
-							if predicateFn(td.Tuple) {
-								return []types.TupleDelta{td}
-							}
-							return nil
-						},
-					}
-
-					if join, ok := in.Input.(*LogicalJoin); ok {
-						joinNode, err := logicalJoinToDBSP(join)
-						if err != nil {
-							return nil, err
-						}
-						chainedOp := &op.ChainedOp{Ops: []op.Operator{filterOp, g}}
-						return &op.Node{Op: chainedOp, Inputs: []*op.Node{joinNode}}, nil
-					}
-
-					chainedOp := &op.ChainedOp{Ops: []op.Operator{filterOp, g}}
-					return &op.Node{Op: chainedOp}, nil
-				}
-
-				var agg op.AggFunc
-				var aggInit func() any
-				switch n.AggName {
-				case "SUM", "sum":
-					agg = &op.SumAgg{ColName: n.AggCol}
-					aggInit = func() any { return float64(0) }
-				case "COUNT", "count":
-					agg = &op.CountAgg{ColName: n.AggCol}
-					aggInit = func() any { return int64(0) }
-				case "AVG", "avg":
-					agg = &op.AvgAgg{ColName: n.AggCol}
-					aggInit = func() any { return nil }
-				case "MIN", "min":
-					agg = &op.MinAgg{ColName: n.AggCol}
-					aggInit = func() any { return op.NewSortedMultiset() }
-				case "MAX", "max":
-					agg = &op.MaxAgg{ColName: n.AggCol}
-					aggInit = func() any { return op.NewSortedMultiset() }
-				default:
-					return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-				}
-
-				// Create filter function
-				predicateFn := BuildPredicateFunc(in.PredicateSQL)
-				g := op.NewGroupAggOp(keyFn, aggInit, agg)
-				g.SetGroupKeyColNames(n.Keys)
-
-				filterOp := &op.MapOp{
-					F: func(td types.TupleDelta) []types.TupleDelta {
-						if predicateFn(td.Tuple) {
-							return []types.TupleDelta{td}
-						}
-						return nil
-					},
-				}
-
-				// If filter is applied on top of a JOIN, JOIN must be a real 2-input node.
-				// Wire it as: joinNode -> (filter then aggregate)
-				if join, ok := in.Input.(*LogicalJoin); ok {
-					joinNode, err := logicalJoinToDBSP(join)
-					if err != nil {
-						return nil, err
-					}
-					chainedOp := &op.ChainedOp{Ops: []op.Operator{filterOp, g}}
-					return &op.Node{Op: chainedOp, Inputs: []*op.Node{joinNode}}, nil
-				}
-
-				// Default: filter then aggregate
-				chainedOp := &op.ChainedOp{Ops: []op.Operator{filterOp, g}}
-				return &op.Node{Op: chainedOp}, nil
-			}
-
-			// Windowed aggregation with a filter.
-			ws := n.WindowSpec
-			if ws == nil {
-				return nil, fmt.Errorf("windowSpec must not be nil in windowed filter branch")
-			}
-			groupKeyFn := buildGroupKeyFn(n.Keys)
-
-			var agg op.AggFunc
-			var aggInit func() any
-			switch n.AggName {
-			case "SUM", "sum":
-				agg = &op.SumAgg{ColName: n.AggCol}
-				aggInit = func() any { return float64(0) }
-			case "COUNT", "count":
-				agg = &op.CountAgg{ColName: n.AggCol}
-				aggInit = func() any { return int64(0) }
-			case "AVG", "avg":
-				agg = &op.AvgAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.AvgMonoid{} }
-			case "MIN", "min":
-				agg = &op.MinAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			case "MAX", "max":
-				agg = &op.MaxAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			default:
-				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-			}
-
-			// Create filter function
-			predicateFn := BuildPredicateFunc(in.PredicateSQL)
-
-			waSpec := op.WindowSpecLite{TimeCol: ws.TimeCol, SizeMillis: ws.SizeMillis}
-			wa := op.NewWindowAggOp(waSpec, groupKeyFn, n.Keys, aggInit, agg)
-			filterOp := &op.MapOp{
-				F: func(td types.TupleDelta) []types.TupleDelta {
-					if predicateFn(td.Tuple) {
-						return []types.TupleDelta{td}
-					}
-					return nil
-				},
-			}
-
-			// Create a ChainedOp that applies filter then window aggregate
-			chainedOp := &op.ChainedOp{
-				Ops: []op.Operator{filterOp, wa},
-			}
-
-			return &op.Node{Op: chainedOp}, nil
-
-		case *LogicalJoin:
-			// JOIN followed by GroupAgg
-			keyFn := buildGroupKeyFn(n.Keys)
-
-			// Multi-aggregate: support SUM/COUNT on top of JOIN output.
-			if len(n.Aggs) > 0 {
-				aggSlots := make([]op.AggSlot, 0, len(n.Aggs))
-				for _, a := range n.Aggs {
-					name := strings.ToUpper(a.Name)
-					switch name {
-					case "SUM":
-						aggSlots = append(aggSlots, op.AggSlot{
-							Init: func() any { return float64(0) },
-							Fn:   &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"},
-						})
-					case "COUNT":
-						aggSlots = append(aggSlots, op.AggSlot{
-							Init: func() any { return int64(0) },
-							Fn:   &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"},
-						})
-					default:
-						return nil, fmt.Errorf("unsupported agg %s in multi-aggregate", a.Name)
-					}
-				}
-
-				g := op.NewGroupAggMultiOp(keyFn, aggSlots)
-				g.SetGroupKeyColNames(n.Keys)
-
-				joinNode, err := logicalJoinToDBSP(in)
-				if err != nil {
-					return nil, err
-				}
-				return &op.Node{Op: g, Inputs: []*op.Node{joinNode}}, nil
-			}
-
-			var agg op.AggFunc
-			var aggInit func() any
-			switch n.AggName {
-			case "SUM", "sum":
-				agg = &op.SumAgg{ColName: n.AggCol}
-				aggInit = func() any { return float64(0) }
-			case "COUNT", "count":
-				agg = &op.CountAgg{ColName: n.AggCol}
-				aggInit = func() any { return int64(0) }
-			case "AVG", "avg":
-				agg = &op.AvgAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.AvgMonoid{} }
-			case "MIN", "min":
-				agg = &op.MinAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			case "MAX", "max":
-				agg = &op.MaxAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			default:
-				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-			}
-
-			g := op.NewGroupAggOp(keyFn, aggInit, agg)
-			g.SetGroupKeyColNames(n.Keys)
-
-			joinNode, err := logicalJoinToDBSP(in)
+		if n.Input != nil {
+			inNode, err := logicalToDBSPWithContext(n.Input, ctes)
 			if err != nil {
 				return nil, err
 			}
-			// Unary aggregate applied on top of JOIN output
-			chainedOp := &op.ChainedOp{Ops: []op.Operator{g}}
-			return &op.Node{Op: chainedOp, Inputs: []*op.Node{joinNode}}, nil
-
-		default:
-			return nil, fmt.Errorf("unsupported input node to GroupAgg: %T", in)
+			return &op.Node{Op: mapOp, Inputs: []*op.Node{inNode}}, nil
 		}
+		return &op.Node{Op: mapOp}, nil
+
+	case *LogicalGroupAgg:
+		// 1. Prepare key function
+		keyFn := buildGroupKeyFn(n.Keys)
+
+		// 2. Determine aggregate operator type and initialize it
+		var aggOp op.Operator
+		if len(n.Aggs) > 0 {
+			// Multi-aggregate configuration
+			aggSlots := make([]op.AggSlot, 0, len(n.Aggs))
+			for _, a := range n.Aggs {
+				name := strings.ToUpper(a.Name)
+				switch name {
+				case "SUM":
+					aggSlots = append(aggSlots, op.AggSlot{
+						Init: func() any { return float64(0) },
+						Fn:   &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"},
+					})
+				case "COUNT":
+					aggSlots = append(aggSlots, op.AggSlot{
+						Init: func() any { return int64(0) },
+						Fn:   &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"},
+					})
+				default:
+					return nil, fmt.Errorf("unsupported agg %s in multi-aggregate", a.Name)
+				}
+			}
+			g := op.NewGroupAggMultiOp(keyFn, aggSlots)
+			g.SetGroupKeyColNames(n.Keys)
+			aggOp = g
+		} else {
+			// Single aggregate configuration
+			var agg op.AggFunc
+			var aggInit func() any
+			switch strings.ToUpper(n.AggName) {
+			case "SUM":
+				agg = &op.SumAgg{ColName: n.AggCol}
+				aggInit = func() any { return float64(0) }
+			case "COUNT":
+				agg = &op.CountAgg{ColName: n.AggCol}
+				aggInit = func() any { return int64(0) }
+			case "AVG":
+				agg = &op.AvgAgg{ColName: n.AggCol}
+				aggInit = func() any { return nil } // Note: AVG support varies between window/plain
+			case "MIN":
+				agg = &op.MinAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
+			case "MAX":
+				agg = &op.MaxAgg{ColName: n.AggCol}
+				aggInit = func() any { return op.NewSortedMultiset() }
+			default:
+				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
+			}
+
+			if n.WindowSpec != nil {
+				ws := n.WindowSpec
+				waSpec := op.WindowSpecLite{
+					TimeCol:    ws.TimeCol,
+					SizeMillis: ws.SizeMillis,
+				}
+				aggOp = op.NewWindowAggOp(waSpec, keyFn, n.Keys, aggInit, agg)
+			} else {
+				g := op.NewGroupAggOp(keyFn, aggInit, agg)
+				g.SetGroupKeyColNames(n.Keys)
+				aggOp = g
+			}
+		}
+
+		// 3. Transform and attach input recursively
+		return attachLogicalGroupAggInputWithContext(n, aggOp, ctes)
 
 	case *LogicalWindowFunc:
 		// Transform window function to appropriate operator
-		return logicalWindowFuncToDBSP(n)
+		return logicalWindowFuncToDBSPWithContext(n, ctes)
 
 	case *LogicalWindowAgg:
 		// Transform window aggregate function to appropriate operator
-		return logicalWindowAggToDBSP(n)
+		return logicalWindowAggToDBSPWithContext(n, ctes)
 
 	case *LogicalJoin:
 		// Transform JOIN to BinaryOp
-		return logicalJoinToDBSP(n)
+		return logicalJoinToDBSPWithContext(n, ctes)
 
 	case *LogicalSort:
 		// Transform ORDER BY to SortOp
-		return logicalSortToDBSP(n)
+		return logicalSortToDBSPWithContext(n, ctes)
 
 	case *LogicalLimit:
 		// Transform LIMIT to LimitOp
-		return logicalLimitToDBSP(n)
+		return logicalLimitToDBSPWithContext(n, ctes)
 
 	default:
 		return nil, fmt.Errorf("unsupported logical node: %T", n)
@@ -963,7 +753,7 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 }
 
 // logicalWindowFuncToDBSP transforms LogicalWindowFunc to DBSP operators
-func logicalWindowFuncToDBSP(wf *LogicalWindowFunc) (*op.Node, error) {
+func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*op.Node) (*op.Node, error) {
 	if wf.Spec.FuncName != "LAG" {
 		return nil, fmt.Errorf("only LAG window function is currently supported, got %s", wf.Spec.FuncName)
 	}
@@ -1024,7 +814,7 @@ func logicalWindowFuncToDBSP(wf *LogicalWindowFunc) (*op.Node, error) {
 }
 
 // logicalWindowAggToDBSP transforms LogicalWindowAgg (DuckDB standard window aggregate) to DBSP operators
-func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
+func logicalWindowAggToDBSPWithContext(wa *LogicalWindowAgg, ctes map[string]*op.Node) (*op.Node, error) {
 	// Determine partition key function
 	var keyFn func(types.Tuple) any
 	if len(wa.PartitionBy) == 0 {
@@ -1097,7 +887,7 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 		}
 
 		windowOp := op.NewWindowAggOp(windowSpec, keyFn, wa.PartitionBy, aggInit, agg)
-		return attachLogicalWindowAggInput(wa, windowOp)
+		return attachLogicalWindowAggInputWithContext(wa, windowOp, ctes)
 	}
 
 	// For DuckDB window aggregates with ORDER BY and frame specification,
@@ -1116,7 +906,7 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 		windowOp.OrderByCol = wa.OrderBy
 		windowOp.FrameSpec = frameSpec
 
-		return attachLogicalWindowAggInput(wa, windowOp)
+		return attachLogicalWindowAggInputWithContext(wa, windowOp, ctes)
 	}
 
 	// Fallback to GroupAggOp for simple aggregations without frame
@@ -1125,20 +915,11 @@ func logicalWindowAggToDBSP(wa *LogicalWindowAgg) (*op.Node, error) {
 		g.SetKeyColName(wa.PartitionBy[0])
 	}
 
-	return attachLogicalWindowAggInput(wa, g)
+	return attachLogicalWindowAggInputWithContext(wa, g, ctes)
 }
 
-func attachLogicalWindowAggInput(wa *LogicalWindowAgg, aggOp op.Operator) (*op.Node, error) {
-	if wa == nil {
-		return &op.Node{Op: aggOp}, nil
-	}
-
-	// If there is no logical input, or it's a plain scan (not modeled as a node yet),
-	// return as a single-op node.
-	if wa.Input == nil {
-		return &op.Node{Op: aggOp}, nil
-	}
-	if _, ok := wa.Input.(*LogicalScan); ok {
+func attachLogicalWindowAggInputWithContext(wa *LogicalWindowAgg, aggOp op.Operator, ctes map[string]*op.Node) (*op.Node, error) {
+	if wa == nil || wa.Input == nil {
 		return &op.Node{Op: aggOp}, nil
 	}
 
@@ -1152,34 +933,25 @@ func attachLogicalWindowAggInput(wa *LogicalWindowAgg, aggOp op.Operator) (*op.N
 			return nil
 		}}
 
-		// Filter input may be a JOIN; preserve it as a true 2-input node.
-		if join, ok := f.Input.(*LogicalJoin); ok {
-			joinNode, err := logicalJoinToDBSP(join)
-			if err != nil {
-				return nil, err
-			}
-			chained := &op.ChainedOp{Ops: []op.Operator{filterOp, aggOp}}
-			return &op.Node{Op: chained, Inputs: []*op.Node{joinNode}}, nil
-		}
-
-		chained := &op.ChainedOp{Ops: []op.Operator{filterOp, aggOp}}
-		return &op.Node{Op: chained}, nil
-	}
-
-	// Window agg over JOIN output.
-	if join, ok := wa.Input.(*LogicalJoin); ok {
-		joinNode, err := logicalJoinToDBSP(join)
+		inNode, err := logicalToDBSPWithContext(f.Input, ctes)
 		if err != nil {
 			return nil, err
 		}
-		return &op.Node{Op: aggOp, Inputs: []*op.Node{joinNode}}, nil
+		chained := &op.ChainedOp{Ops: []op.Operator{filterOp, aggOp}}
+		return &op.Node{Op: chained, Inputs: []*op.Node{inNode}}, nil
 	}
 
-	return &op.Node{Op: aggOp}, nil
+	// Normal recursive transform for input.
+	inNode, err := logicalToDBSPWithContext(wa.Input, ctes)
+	if err != nil {
+		return nil, err
+	}
+
+	return &op.Node{Op: aggOp, Inputs: []*op.Node{inNode}}, nil
 }
 
 // logicalJoinToDBSP transforms LogicalJoin to BinaryOp (JoinOp)
-func logicalJoinToDBSP(join *LogicalJoin) (*op.Node, error) {
+func logicalJoinToDBSPWithContext(join *LogicalJoin, ctes map[string]*op.Node) (*op.Node, error) {
 	if len(join.Conditions) == 0 {
 		return nil, fmt.Errorf("JOIN requires at least one join condition")
 	}
@@ -1248,29 +1020,41 @@ func logicalJoinToDBSP(join *LogicalJoin) (*op.Node, error) {
 	// Create JoinOp
 	joinOp := op.NewJoinOp(leftKeyFn, rightKeyFn, combineFn)
 
-	// For now JOIN inputs are scans (2-way join); model them as true 2-input DAG sources.
-	leftScan, ok := join.Left.(*LogicalScan)
-	if !ok {
-		return nil, fmt.Errorf("JOIN left input must be LogicalScan (got %T)", join.Left)
+	// Transform left and right inputs
+	leftNode, err := logicalToDBSPWithContext(join.Left, ctes)
+	if err != nil {
+		return nil, err
 	}
-	rightScan, ok := join.Right.(*LogicalScan)
-	if !ok {
-		return nil, fmt.Errorf("JOIN right input must be LogicalScan (got %T)", join.Right)
+	rightNode, err := logicalToDBSPWithContext(join.Right, ctes)
+	if err != nil {
+		return nil, err
 	}
 
-	leftNode := &op.Node{Source: leftScan.Table}
-	rightNode := &op.Node{Source: rightScan.Table}
 	return &op.Node{Op: joinOp, Inputs: []*op.Node{leftNode, rightNode}}, nil
 }
 
 // logicalSortToDBSP transforms LogicalSort to SortOp
-func logicalSortToDBSP(sort *LogicalSort) (*op.Node, error) {
+func logicalSortToDBSPWithContext(sort *LogicalSort, ctes map[string]*op.Node) (*op.Node, error) {
 	sortOp := op.NewSortOp(sort.OrderColumns, sort.Descending)
-	return &op.Node{Op: sortOp}, nil
+	if sort.Input == nil {
+		return &op.Node{Op: sortOp}, nil
+	}
+	inNode, err := logicalToDBSPWithContext(sort.Input, ctes)
+	if err != nil {
+		return nil, err
+	}
+	return &op.Node{Op: sortOp, Inputs: []*op.Node{inNode}}, nil
 }
 
 // logicalLimitToDBSP transforms LogicalLimit to LimitOp
-func logicalLimitToDBSP(limit *LogicalLimit) (*op.Node, error) {
+func logicalLimitToDBSPWithContext(limit *LogicalLimit, ctes map[string]*op.Node) (*op.Node, error) {
 	limitOp := op.NewLimitOp(limit.Limit, limit.Offset)
-	return &op.Node{Op: limitOp}, nil
+	if limit.Input == nil {
+		return &op.Node{Op: limitOp}, nil
+	}
+	inNode, err := logicalToDBSPWithContext(limit.Input, ctes)
+	if err != nil {
+		return nil, err
+	}
+	return &op.Node{Op: limitOp, Inputs: []*op.Node{inNode}}, nil
 }

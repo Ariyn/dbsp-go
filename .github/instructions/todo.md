@@ -11,6 +11,24 @@
 
 ## 현재 단계: Phase 4 — 최적화/운영성
 
+### Phase 5 완료 — Non-Recursive CTE (단일 쿼리, 임시 노드) [완료: 2026-02-22]
+
+- [x] **CTE 파싱/바인딩 컨텍스트 도입**
+  - `WITH` 정의 순서대로 등록
+  - 동일 이름 재정의 시 후속 정의로 덮어쓰기
+
+- [x] **Logical Plan CTE 임시 노드/참조 반영**
+  - CTE 참조를 실테이블 Scan과 구분
+  - 미정의 CTE 참조 시 에러 처리
+
+- [x] **DBSP 변환 시 CTE 공유 서브그래프 보장**
+  - 동일 CTE 다중 참조 시 변환 노드 재사용
+  - 기존 Join/GroupAgg 규칙 회귀 없음
+
+- [x] **CTE 테스트(단위 + E2E) 추가**
+  - 정상: 단일/다중 CTE, 재정의, Join+GroupAgg
+  - 오류: 미정의 CTE, `WITH RECURSIVE` 미지원
+
 ### Phase 4 작업 목록(우선순위)
 
 - [x] **타입/NULL 처리 정책을 테스트로 고정**
