@@ -8,7 +8,7 @@ import (
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 	"github.com/ariyn/dbsp/internal/dbsp/wal"
-	"github.com/ariyn/dbsp/cmd/dbsp/internal/testutil"
+	"github.com/ariyn/dbsp/internal/dbsp/testutil"
 )
 
 type countingSink struct {

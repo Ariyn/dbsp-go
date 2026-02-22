@@ -6,7 +6,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/ariyn/dbsp/cmd/dbsp/internal/testutil"
+	"github.com/ariyn/dbsp/internal/dbsp/testutil"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 	"github.com/ariyn/dbsp/internal/dbsp/types"

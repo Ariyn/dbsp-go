@@ -40,6 +40,11 @@
   - Join/GroupAgg state가 커지는 조건 명시
   - watermark/TTL 기반 compaction/GC 트리거 중 하나를 코드+테스트로 고정
 
+- [x] **E2E 테스트 강화 (cmd/e2e 패키지)**
+  - [x] **Task 01: WAL 복구 및 정합성 검증**
+  - [x] **Task 02: Watermark 진행 및 윈도우 집계**
+  - [x] **Task 03: Late Ingest(지연 데이터) 처리**
+
 - [x] **벤치마크 기준선 추가(대표 1~2개)**
   - 단일 GroupAgg
   - Join + GroupAgg

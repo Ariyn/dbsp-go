@@ -1,7 +1,7 @@
 package sink
 
 import (
-	"github.com/ariyn/dbsp/cmd/dbsp/internal/testutil"
+	"github.com/ariyn/dbsp/internal/dbsp/testutil"
 	"github.com/ariyn/dbsp/cmd/dbsp/provider"
 	"testing"
 	"time"

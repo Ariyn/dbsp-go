@@ -18,7 +18,7 @@ import (
 	"github.com/apache/arrow/go/v15/parquet/pqarrow"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
-	"github.com/ariyn/dbsp/cmd/dbsp/internal/testutil"
+	"github.com/ariyn/dbsp/internal/dbsp/testutil"
 	"github.com/ariyn/dbsp/cmd/dbsp/pipeline"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
