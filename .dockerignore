@@ -1,0 +1,14 @@
+.git
+.github
+.vscode
+
+benchmarks/data
+docs
+k8s
+
+**/*_test.go
+**/*.md
+
+*.log
+*.tmp
+.DS_Store
