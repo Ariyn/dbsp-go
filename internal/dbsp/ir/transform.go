@@ -707,6 +707,15 @@ func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node
 						Init: func() any { return float64(0) },
 						Fn:   s,
 					})
+				case "AVG":
+					avg := &op.AvgAgg{ColName: a.Col}
+					if strings.ContainsAny(a.Col, "()->:") {
+						avg.Expr = BuildExprFunc(a.Col)
+					}
+					aggSlots = append(aggSlots, op.AggSlot{
+						Init: func() any { return op.AvgMonoid{} },
+						Fn:   avg,
+					})
 				case "COUNT":
 					c := &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"}
 					if a.Col != "" && strings.ContainsAny(a.Col, "()->:") {
@@ -859,9 +868,11 @@ func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*
 
 	// Check if there's an input node
 	if wf.Input != nil {
-		// For now, we return the operator directly
-		// In a full implementation, we'd chain with the input
-		return &op.Node{Op: g}, nil
+		inNode, err := logicalToDBSPWithContext(wf.Input, ctes)
+		if err != nil {
+			return nil, err
+		}
+		return &op.Node{Op: g, Inputs: []*op.Node{inNode}}, nil
 	}
 
 	return &op.Node{Op: g}, nil

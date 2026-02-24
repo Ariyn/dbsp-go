@@ -7,7 +7,24 @@ type PipelineConfig struct {
 		Transform TransformConfig `yaml:"transform"`
 		Sink      SinkConfig      `yaml:"sink"`
 		WAL       WALConfig       `yaml:"wal"`
+		Partition PartitionConfig `yaml:"partition"`
 	} `yaml:"pipeline"`
+}
+
+// PartitionConfig controls partition fan-out execution mode.
+//
+// When Enabled is true, each Job is executed as an independent pipeline run,
+// and sink/WAL paths are derived using Hive-style partition directories.
+type PartitionConfig struct {
+	Enabled bool `yaml:"enabled"`
+
+	// Keys defines partition key order for hive directory layout.
+	// Example: ["plant_id", "local_date"].
+	Keys []string `yaml:"keys"`
+
+	// Jobs is no longer supported.
+	// When present in config, validation fails to enforce dynamic partitioning.
+	Jobs []map[string]interface{} `yaml:"jobs"`
 }
 
 // WALConfig defines write-ahead log (WAL) settings.

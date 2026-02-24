@@ -14,6 +14,7 @@ go build -o dbsp ./cmd/dbsp
 ```
 
 CLI 플래그:
+
 - `-config` : 설정 파일 경로 (기본값 `config.yaml`)
 
 ## 설정 파일 스키마
@@ -32,10 +33,15 @@ pipeline:
   sink:
     type: console | file
     config: {}
+  partition:
+    enabled: false
+    keys: [plant_id, local_date]
 ```
 
 - `wal.enabled`(선택, 기본 false): 입력 배치를 SQLite에 append-only로 기록(WAL)
 - `wal.path`(선택): SQLite DB 파일 경로
+- `partition.enabled`(선택, 기본 false): 파티션 fan-out 실행 모드
+- `partition.keys`(필수 when enabled): Hive 경로 키 순서 (예: `[plant_id, local_date]`)
 
 주의: WAL replay는 **엔진 state 복구 목적**이며, 기본 구현은 replay 구간의 결과를 sink로 재출력하지 않습니다(중복 방지).
 추가로, 이 정책에서는 프로세스가 “WAL에는 기록했지만 sink에 쓰기 전에” 크래시되면 해당 구간의 출력이 유실될 수 있습니다(재시작 시 replay가 출력 복구를 하지 않기 때문).
@@ -140,6 +146,29 @@ pipeline:
 - `join_ttl`(선택): 조인 상태를 처리시간 기준으로 만료시키는 TTL(예: `"10s"`, `"5 minutes"`).
   - `0` 또는 미설정이면 TTL을 적용하지 않습니다.
 
+## Partition fan-out (Hive-style)
+
+`partition.enabled: true`면 **`transform.query`는 공통으로 1개만 사용**하고,
+런타임에서 입력 배치를 `partition.keys` 기준으로 분할(demux)해 파티션별로 독립 state로 계산합니다.
+
+```yaml
+pipeline:
+  transform:
+    type: sql
+    query: "SELECT panel_position, SUM(v_out*i_out) AS p FROM telemetry GROUP BY panel_position"
+  partition:
+    enabled: true
+    keys: [plant_id, local_date]
+```
+
+동작:
+
+- `transform.query`는 파티션 조건 없이 공통 집계/변환 로직만 작성합니다.
+- 레코드는 `partition.keys` 값으로 분할되어 해당 파티션 런타임에만 반영됩니다.
+- `file`/`parquet` sink의 `path`, WAL `path`, `http_pull.disk_spill_path`에 Hive 경로를 추가합니다.
+  - 예: `/tmp/out.parquet` + `plant_id=P-1, local_date=2026-02-24`
+  - 결과: `/tmp/plant_id=P-1/local_date=2026-02-24/out.parquet`
+
 ## Sink 타입
 
 ### 1) Console Sink (`type: console`)
@@ -208,3 +237,4 @@ pipeline:
 
 - `examples/config.yaml`: `chain`(CSV → HTTP) + `console` sink
 - `examples/config_http.yaml`: HTTP source + console sink
+- `examples/config_partition.yaml`: `partition.enabled=true` + Hive-style path fan-out 예제

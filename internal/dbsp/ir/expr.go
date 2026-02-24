@@ -528,6 +528,14 @@ func (n *binOpNode) eval(t types.Tuple) (any, error) {
 		return nil, err
 	}
 
+	// SQL-like NULL propagation for arithmetic operators.
+	if lv == nil || rv == nil {
+		switch n.op {
+		case tokPlus, tokMinus, tokStar, tokSlash:
+			return nil, nil
+		}
+	}
+
 	// Handle special cases like timestamp + interval
 	if isTimestamp(lv) || isTimestamp(rv) {
 		return evalTimeArithmetic(n.op, lv, rv)
