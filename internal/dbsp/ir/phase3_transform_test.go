@@ -314,3 +314,70 @@ func TestLogicalToDBSP_ProjectOverJoin_StructureAndExecute(t *testing.T) {
 		}
 	}
 }
+
+func TestLogicalToDBSP_GroupByExprKey_Execute(t *testing.T) {
+	g := &LogicalGroupAgg{
+		Keys:  []string{"a + b"},
+		Aggs:  []AggSpec{{Name: "SUM", Col: "c"}},
+		Input: &LogicalScan{Table: "t"},
+	}
+
+	root, err := LogicalToDBSP(g)
+	if err != nil {
+		t.Fatalf("LogicalToDBSP: %v", err)
+	}
+
+	out, err := op.Execute(root, types.Batch{
+		{Tuple: types.Tuple{"a": 1.0, "b": 2.0, "c": 10.0}, Count: 1},
+		{Tuple: types.Tuple{"a": 0.0, "b": 3.0, "c": 20.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	found := false
+	for _, td := range out {
+		if td.Tuple["agg_delta"] == 30.0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected agg_delta=30.0 in output, got %v", out)
+	}
+}
+
+func TestLogicalToDBSP_LagExpr_Execute(t *testing.T) {
+	w := &LogicalWindowFunc{
+		Spec: WindowFuncSpec{
+			FuncName: "LAG",
+			Args:     []string{"a + b"},
+			OrderBy:  "ts",
+			Offset:   1,
+		},
+		OutputCol: "prev_sum",
+		Input:     &LogicalScan{Table: "t"},
+	}
+
+	root, err := LogicalToDBSP(w)
+	if err != nil {
+		t.Fatalf("LogicalToDBSP: %v", err)
+	}
+
+	out, err := op.Execute(root, types.Batch{
+		{Tuple: types.Tuple{"ts": int64(1), "a": 1.0, "b": 10.0}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(2), "a": 2.0, "b": 20.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	found := false
+	for _, td := range out {
+		if td.Tuple["ts"] == int64(2) && td.Tuple["prev_sum"] == 11.0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected ts=2 with prev_sum=11.0, got %v", out)
+	}
+}

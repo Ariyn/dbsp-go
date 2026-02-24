@@ -14,15 +14,31 @@ func buildGroupKeyFn(keys []string) func(types.Tuple) any {
 	if len(keys) == 0 {
 		return func(types.Tuple) any { return nil }
 	}
-	if len(keys) == 1 {
-		key := keys[0]
-		return func(t types.Tuple) any { return t[key] }
+
+	exprFns := make([]func(types.Tuple) (any, error), len(keys))
+	for i, key := range keys {
+		if strings.ContainsAny(key, "()->:+-*/ ") {
+			exprFns[i] = BuildExprFunc(key)
+		} else {
+			k := key
+			exprFns[i] = func(t types.Tuple) (any, error) { return t[k], nil }
+		}
 	}
+
+	if len(keys) == 1 {
+		fn := exprFns[0]
+		return func(t types.Tuple) any {
+			v, _ := fn(t)
+			return v
+		}
+	}
+
 	keyCols := append([]string(nil), keys...)
 	return func(t types.Tuple) any {
 		kt := make(types.Tuple, len(keyCols))
-		for _, col := range keyCols {
-			kt[col] = t[col]
+		for i, col := range keyCols {
+			v, _ := exprFns[i](t)
+			kt[col] = v
 		}
 		b, err := json.Marshal(kt)
 		if err == nil {
@@ -284,33 +300,31 @@ func buildComparisonFunc(predicateSQL string) func(types.Tuple) bool {
 
 // buildIsNullFunc handles "column IS NULL"
 func buildIsNullFunc(predicateSQL string) func(types.Tuple) bool {
-	parts := strings.Split(strings.ToUpper(predicateSQL), " IS NULL")
-	if len(parts) < 1 {
+	idx := strings.Index(strings.ToUpper(predicateSQL), " IS NULL")
+	if idx == -1 {
 		return func(t types.Tuple) bool { return false }
 	}
-	// Extract original column name (preserve case)
-	idx := strings.Index(strings.ToUpper(predicateSQL), " IS NULL")
-	col := strings.TrimSpace(predicateSQL[:idx])
+	colExpr := strings.TrimSpace(predicateSQL[:idx])
+	exprFn := BuildExprFunc(colExpr)
 
 	return func(t types.Tuple) bool {
-		val, exists := t[col]
-		return !exists || val == nil
+		val, err := exprFn(t)
+		return err != nil || val == nil
 	}
 }
 
 // buildIsNotNullFunc handles "column IS NOT NULL"
 func buildIsNotNullFunc(predicateSQL string) func(types.Tuple) bool {
-	parts := strings.Split(strings.ToUpper(predicateSQL), " IS NOT NULL")
-	if len(parts) < 1 {
+	idx := strings.Index(strings.ToUpper(predicateSQL), " IS NOT NULL")
+	if idx == -1 {
 		return func(t types.Tuple) bool { return false }
 	}
-	// Extract original column name (preserve case)
-	idx := strings.Index(strings.ToUpper(predicateSQL), " IS NOT NULL")
-	col := strings.TrimSpace(predicateSQL[:idx])
+	colExpr := strings.TrimSpace(predicateSQL[:idx])
+	exprFn := BuildExprFunc(colExpr)
 
 	return func(t types.Tuple) bool {
-		val, exists := t[col]
-		return exists && val != nil
+		val, err := exprFn(t)
+		return err == nil && val != nil
 	}
 }
 
@@ -321,14 +335,15 @@ func buildEqualFunc(predicateSQL string) func(types.Tuple) bool {
 		return func(t types.Tuple) bool { return true }
 	}
 
-	col := strings.TrimSpace(parts[0])
+	leftExpr := strings.TrimSpace(parts[0])
 	val := strings.TrimSpace(parts[1])
 	val = strings.Trim(val, "'\"")
+	exprFn := BuildExprFunc(leftExpr)
 
 	return func(t types.Tuple) bool {
-		tupleVal, ok := t[col]
+		tupleVal, err := exprFn(t)
 		// NULL values should not match in equality comparisons
-		if !ok || tupleVal == nil {
+		if err != nil || tupleVal == nil {
 			return false
 		}
 		return compareEqual(tupleVal, val)
@@ -342,14 +357,15 @@ func buildNotEqualFunc(predicateSQL string) func(types.Tuple) bool {
 		return func(t types.Tuple) bool { return true }
 	}
 
-	col := strings.TrimSpace(parts[0])
+	leftExpr := strings.TrimSpace(parts[0])
 	val := strings.TrimSpace(parts[1])
 	val = strings.Trim(val, "'\"")
+	exprFn := BuildExprFunc(leftExpr)
 
 	return func(t types.Tuple) bool {
-		tupleVal, ok := t[col]
+		tupleVal, err := exprFn(t)
 		// NULL values should not match in inequality comparisons
-		if !ok || tupleVal == nil {
+		if err != nil || tupleVal == nil {
 			return false
 		}
 		return !compareEqual(tupleVal, val)
@@ -363,17 +379,18 @@ func buildGreaterFunc(predicateSQL string) func(types.Tuple) bool {
 		return func(t types.Tuple) bool { return true }
 	}
 
-	col := strings.TrimSpace(parts[0])
+	leftExpr := strings.TrimSpace(parts[0])
 	valStr := strings.TrimSpace(parts[1])
 	threshold, err := strconv.ParseFloat(valStr, 64)
 	if err != nil {
 		return func(t types.Tuple) bool { return false }
 	}
+	exprFn := BuildExprFunc(leftExpr)
 
 	return func(t types.Tuple) bool {
-		tupleVal, ok := t[col]
+		tupleVal, err := exprFn(t)
 		// NULL values should not match in comparisons
-		if !ok || tupleVal == nil {
+		if err != nil || tupleVal == nil {
 			return false
 		}
 		return compareGreater(tupleVal, threshold)
@@ -387,17 +404,18 @@ func buildGreaterEqualFunc(predicateSQL string) func(types.Tuple) bool {
 		return func(t types.Tuple) bool { return true }
 	}
 
-	col := strings.TrimSpace(parts[0])
+	leftExpr := strings.TrimSpace(parts[0])
 	valStr := strings.TrimSpace(parts[1])
 	threshold, err := strconv.ParseFloat(valStr, 64)
 	if err != nil {
 		return func(t types.Tuple) bool { return false }
 	}
+	exprFn := BuildExprFunc(leftExpr)
 
 	return func(t types.Tuple) bool {
-		tupleVal, ok := t[col]
+		tupleVal, err := exprFn(t)
 		// NULL values should not match in comparisons
-		if !ok || tupleVal == nil {
+		if err != nil || tupleVal == nil {
 			return false
 		}
 		return compareGreaterOrEqual(tupleVal, threshold)
@@ -411,17 +429,18 @@ func buildLessFunc(predicateSQL string) func(types.Tuple) bool {
 		return func(t types.Tuple) bool { return true }
 	}
 
-	col := strings.TrimSpace(parts[0])
+	leftExpr := strings.TrimSpace(parts[0])
 	valStr := strings.TrimSpace(parts[1])
 	threshold, err := strconv.ParseFloat(valStr, 64)
 	if err != nil {
 		return func(t types.Tuple) bool { return false }
 	}
+	exprFn := BuildExprFunc(leftExpr)
 
 	return func(t types.Tuple) bool {
-		tupleVal, ok := t[col]
+		tupleVal, err := exprFn(t)
 		// NULL values should not match in comparisons
-		if !ok || tupleVal == nil {
+		if err != nil || tupleVal == nil {
 			return false
 		}
 		return compareLess(tupleVal, threshold)
@@ -435,17 +454,18 @@ func buildLessEqualFunc(predicateSQL string) func(types.Tuple) bool {
 		return func(t types.Tuple) bool { return true }
 	}
 
-	col := strings.TrimSpace(parts[0])
+	leftExpr := strings.TrimSpace(parts[0])
 	valStr := strings.TrimSpace(parts[1])
 	threshold, err := strconv.ParseFloat(valStr, 64)
 	if err != nil {
 		return func(t types.Tuple) bool { return false }
 	}
+	exprFn := BuildExprFunc(leftExpr)
 
 	return func(t types.Tuple) bool {
-		tupleVal, ok := t[col]
+		tupleVal, err := exprFn(t)
 		// NULL values should not match in comparisons
-		if !ok || tupleVal == nil {
+		if err != nil || tupleVal == nil {
 			return false
 		}
 		return compareLessOrEqual(tupleVal, threshold)
@@ -679,14 +699,22 @@ func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node
 				name := strings.ToUpper(a.Name)
 				switch name {
 				case "SUM":
+					s := &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"}
+					if strings.ContainsAny(a.Col, "()->:") {
+						s.Expr = BuildExprFunc(a.Col)
+					}
 					aggSlots = append(aggSlots, op.AggSlot{
 						Init: func() any { return float64(0) },
-						Fn:   &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"},
+						Fn:   s,
 					})
 				case "COUNT":
+					c := &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"}
+					if a.Col != "" && strings.ContainsAny(a.Col, "()->:") {
+						c.Expr = BuildExprFunc(a.Col)
+					}
 					aggSlots = append(aggSlots, op.AggSlot{
 						Init: func() any { return int64(0) },
-						Fn:   &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"},
+						Fn:   c,
 					})
 				default:
 					return nil, fmt.Errorf("unsupported agg %s in multi-aggregate", a.Name)
@@ -701,14 +729,26 @@ func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node
 			var aggInit func() any
 			switch strings.ToUpper(n.AggName) {
 			case "SUM":
-				agg = &op.SumAgg{ColName: n.AggCol}
+				s := &op.SumAgg{ColName: n.AggCol}
+				if strings.ContainsAny(n.AggCol, "()->:") {
+					s.Expr = BuildExprFunc(n.AggCol)
+				}
+				agg = s
 				aggInit = func() any { return float64(0) }
 			case "COUNT":
-				agg = &op.CountAgg{ColName: n.AggCol}
+				c := &op.CountAgg{ColName: n.AggCol}
+				if n.AggCol != "" && strings.ContainsAny(n.AggCol, "()->:") {
+					c.Expr = BuildExprFunc(n.AggCol)
+				}
+				agg = c
 				aggInit = func() any { return int64(0) }
 			case "AVG":
-				agg = &op.AvgAgg{ColName: n.AggCol}
-				aggInit = func() any { return nil } // Note: AVG support varies between window/plain
+				av := &op.AvgAgg{ColName: n.AggCol}
+				if strings.ContainsAny(n.AggCol, "()->:") {
+					av.Expr = BuildExprFunc(n.AggCol)
+				}
+				agg = av
+				aggInit = func() any { return nil }
 			case "MIN":
 				agg = &op.MinAgg{ColName: n.AggCol}
 				aggInit = func() any { return op.NewSortedMultiset() }
@@ -802,6 +842,11 @@ func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*
 		OutputCol:  wf.OutputCol,
 	}
 
+	// If lagCol is an expression (contains -> or :: or operators or space), build an expression function
+	if strings.ContainsAny(lagCol, "()->:+-*/ ") {
+		lagAgg.LagExpr = BuildExprFunc(lagCol)
+	}
+
 	// Initialize function for LagMonoid
 	aggInit := func() any {
 		return op.LagMonoid{
@@ -851,13 +896,25 @@ func logicalWindowAggToDBSPWithContext(wa *LogicalWindowAgg, ctes map[string]*op
 
 	switch wa.AggName {
 	case "SUM":
-		agg = &op.SumAgg{ColName: wa.AggCol}
+		s := &op.SumAgg{ColName: wa.AggCol}
+		if strings.ContainsAny(wa.AggCol, "()->:") {
+			s.Expr = BuildExprFunc(wa.AggCol)
+		}
+		agg = s
 		aggInit = func() any { return float64(0) }
 	case "AVG":
-		agg = &op.AvgAgg{ColName: wa.AggCol}
+		av := &op.AvgAgg{ColName: wa.AggCol}
+		if strings.ContainsAny(wa.AggCol, "()->:") {
+			av.Expr = BuildExprFunc(wa.AggCol)
+		}
+		agg = av
 		aggInit = func() any { return op.AvgMonoid{} }
 	case "COUNT":
-		agg = &op.CountAgg{ColName: wa.AggCol}
+		c := &op.CountAgg{ColName: wa.AggCol}
+		if wa.AggCol != "" && strings.ContainsAny(wa.AggCol, "()->:") {
+			c.Expr = BuildExprFunc(wa.AggCol)
+		}
+		agg = c
 		aggInit = func() any { return int64(0) }
 	case "MIN":
 		agg = &op.MinAgg{ColName: wa.AggCol}

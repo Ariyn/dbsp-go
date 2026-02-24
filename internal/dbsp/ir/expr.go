@@ -1,9 +1,11 @@
 package ir
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
@@ -197,6 +199,9 @@ const (
 	tokSlash
 	tokLParen
 	tokRParen
+	tokArrow       // ->
+	tokDoubleColon // ::
+	tokComma
 )
 
 type token struct {
@@ -205,10 +210,9 @@ type token struct {
 }
 
 type exprParser struct {
-	src   string
-	pos   int
-	cur   token
-	peeks bool
+	src string
+	pos int
+	cur token
 }
 
 func newExprParser(src string) *exprParser {
@@ -280,15 +284,87 @@ func (p *exprParser) parseUnary() (exprNode, error) {
 		}
 		return &unaryNode{inner: inner}, nil
 	}
-	return p.parsePrimary()
+	return p.parseCast()
+}
+
+func (p *exprParser) parseCast() (exprNode, error) {
+	left, err := p.parseJSON()
+	if err != nil {
+		return nil, err
+	}
+	for p.cur.kind == tokDoubleColon {
+		p.cur = p.nextToken()
+		if p.cur.kind != tokIdent {
+			return nil, fmt.Errorf("expected type after ::")
+		}
+		typeName := p.cur.text
+		p.cur = p.nextToken()
+		left = &castNode{inner: left, targetType: strings.ToUpper(typeName)}
+	}
+	return left, nil
+}
+
+func (p *exprParser) parseJSON() (exprNode, error) {
+	left, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for p.cur.kind == tokArrow {
+		p.cur = p.nextToken()
+		if p.cur.kind != tokString && p.cur.kind != tokIdent {
+			return nil, fmt.Errorf("expected key after ->")
+		}
+		key := p.cur.text
+		p.cur = p.nextToken()
+		left = &jsonAccessNode{inner: left, key: key}
+	}
+	return left, nil
 }
 
 func (p *exprParser) parsePrimary() (exprNode, error) {
 	switch p.cur.kind {
 	case tokIdent:
-		id := p.cur.text
+		ident := p.cur.text
 		p.cur = p.nextToken()
-		return &identNode{name: id}, nil
+		// Check for function call
+		if p.cur.kind == tokLParen {
+			p.cur = p.nextToken()
+			var args []exprNode
+			if p.cur.kind != tokRParen {
+				for {
+					arg, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					args = append(args, arg)
+					if p.cur.kind == tokComma {
+						p.cur = p.nextToken()
+						continue
+					}
+					break
+				}
+			}
+			if p.cur.kind != tokRParen {
+				return nil, fmt.Errorf("expected ) after function args")
+			}
+			p.cur = p.nextToken()
+			return &funcCallNode{name: strings.ToUpper(ident), args: args}, nil
+		}
+		if strings.ToUpper(ident) == "INTERVAL" {
+			// Handle INTERVAL '5' MINUTE
+			if p.cur.kind != tokString && p.cur.kind != tokNumber {
+				return nil, fmt.Errorf("expected value after INTERVAL")
+			}
+			val := p.cur.text
+			p.cur = p.nextToken()
+			unit := ""
+			if p.cur.kind == tokIdent {
+				unit = p.cur.text
+				p.cur = p.nextToken()
+			}
+			return &intervalNode{val: val, unit: unit}, nil
+		}
+		return &identNode{name: ident}, nil
 	case tokNumber:
 		text := p.cur.text
 		p.cur = p.nextToken()
@@ -344,6 +420,10 @@ func (p *exprParser) nextToken() token {
 		p.pos++
 		return token{kind: tokPlus, text: "+"}
 	case '-':
+		if p.pos+1 < len(p.src) && p.src[p.pos+1] == '>' {
+			p.pos += 2
+			return token{kind: tokArrow, text: "->"}
+		}
 		p.pos++
 		return token{kind: tokMinus, text: "-"}
 	case '*':
@@ -358,6 +438,16 @@ func (p *exprParser) nextToken() token {
 	case ')':
 		p.pos++
 		return token{kind: tokRParen, text: ")"}
+	case ':':
+		if p.pos+1 < len(p.src) && p.src[p.pos+1] == ':' {
+			p.pos += 2
+			return token{kind: tokDoubleColon, text: "::"}
+		}
+		p.pos++
+		return token{kind: tokIdent, text: ":"}
+	case ',':
+		p.pos++
+		return token{kind: tokComma, text: ","}
 	case '\'':
 		// single-quoted string
 		p.pos++
@@ -437,6 +527,12 @@ func (n *binOpNode) eval(t types.Tuple) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Handle special cases like timestamp + interval
+	if isTimestamp(lv) || isTimestamp(rv) {
+		return evalTimeArithmetic(n.op, lv, rv)
+	}
+
 	lf := toFloat64(lv)
 	rf := toFloat64(rv)
 	switch n.op {
@@ -453,5 +549,253 @@ func (n *binOpNode) eval(t types.Tuple) (any, error) {
 		return lf / rf, nil
 	default:
 		return nil, fmt.Errorf("unsupported operator")
+	}
+}
+
+func isTimestamp(v any) bool {
+	switch v.(type) {
+	case time.Time:
+		return true
+	case string:
+		// Simple heuristic: if it looks like a date
+		s := v.(string)
+		return len(s) >= 10 && (s[4] == '-' || s[4] == '/')
+	}
+	return false
+}
+
+func evalTimeArithmetic(op tokenKind, lv, rv any) (any, error) {
+	lt, le := toTime(lv)
+	rt, re := toTime(rv)
+
+	// timestamp + interval
+	if le == nil && re != nil {
+		dur, err := parseInterval(rv)
+		if err != nil {
+			return nil, err
+		}
+		if op == tokPlus {
+			return lt.Add(dur), nil
+		}
+		if op == tokMinus {
+			return lt.Add(-dur), nil
+		}
+	}
+	// interval + timestamp
+	if le != nil && re == nil {
+		dur, err := parseInterval(lv)
+		if err != nil {
+			return nil, err
+		}
+		if op == tokPlus {
+			return rt.Add(dur), nil
+		}
+	}
+	// timestamp - timestamp = interval
+	if le == nil && re == nil {
+		if op == tokMinus {
+			return lt.Sub(rt).Seconds(), nil
+		}
+	}
+
+	return lv, nil
+}
+
+type jsonAccessNode struct {
+	inner exprNode
+	key   string
+}
+
+func (n *jsonAccessNode) eval(t types.Tuple) (any, error) {
+	v, err := n.inner.eval(t)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+
+	var m map[string]any
+	switch x := v.(type) {
+	case map[string]any:
+		m = x
+	case string:
+		if err := json.Unmarshal([]byte(x), &m); err != nil {
+			return nil, nil // or return error
+		}
+	case []byte:
+		if err := json.Unmarshal(x, &m); err != nil {
+			return nil, nil
+		}
+	default:
+		return nil, nil
+	}
+
+	// strip quotes from key if present
+	key := strings.Trim(n.key, "'\"")
+	return m[key], nil
+}
+
+type castNode struct {
+	inner      exprNode
+	targetType string
+}
+
+func (n *castNode) eval(t types.Tuple) (any, error) {
+	v, err := n.inner.eval(t)
+	if err != nil {
+		return nil, err
+	}
+	switch n.targetType {
+	case "BIGINT", "INT", "INTEGER":
+		return toInt64(v), nil
+	case "DOUBLE", "FLOAT":
+		return toFloat64(v), nil
+	case "VARCHAR", "TEXT", "STRING":
+		return fmt.Sprintf("%v", v), nil
+	case "TIMESTAMP", "TIME", "DATE":
+		return toTime(v)
+	default:
+		return v, nil
+	}
+}
+
+type funcCallNode struct {
+	name string
+	args []exprNode
+}
+
+func (n *funcCallNode) eval(t types.Tuple) (any, error) {
+	var evaluatedArgs []any
+	for _, arg := range n.args {
+		v, err := arg.eval(t)
+		if err != nil {
+			return nil, err
+		}
+		evaluatedArgs = append(evaluatedArgs, v)
+	}
+
+	switch n.name {
+	case "TIME_BUCKET":
+		if len(evaluatedArgs) < 2 {
+			return nil, fmt.Errorf("TIME_BUCKET requires 2 arguments")
+		}
+		return evalTimeBucket(evaluatedArgs[0], evaluatedArgs[1])
+	case "EPOCH":
+		if len(evaluatedArgs) < 1 {
+			return nil, fmt.Errorf("EPOCH requires 1 argument")
+		}
+		return evalEpoch(evaluatedArgs[0])
+	case "STRFTIME":
+		if len(evaluatedArgs) < 2 {
+			return nil, fmt.Errorf("STRFTIME requires 2 arguments")
+		}
+		return evalStrftime(evaluatedArgs[0], evaluatedArgs[1])
+	default:
+		return nil, fmt.Errorf("unsupported function: %s", n.name)
+	}
+}
+
+type intervalNode struct {
+	val  string
+	unit string
+}
+
+func (n *intervalNode) eval(t types.Tuple) (any, error) {
+	return n.val + " " + n.unit, nil
+}
+
+func evalTimeBucket(interval any, ts any) (any, error) {
+	dur, err := parseInterval(interval)
+	if err != nil {
+		return nil, err
+	}
+	t, err := toTime(ts)
+	if err != nil {
+		return nil, err
+	}
+	// Go's Truncate works on Durations since Epoch, effectively bucketizing.
+	return t.Truncate(dur), nil
+}
+
+func evalEpoch(ts any) (any, error) {
+	t, err := toTime(ts)
+	if err != nil {
+		// try literal
+		if f, err := strconv.ParseFloat(fmt.Sprintf("%v", ts), 64); err == nil {
+			return int64(f), nil
+		}
+		return nil, err
+	}
+	return t.Unix(), nil
+}
+
+func evalStrftime(ts any, format any) (any, error) {
+	t, err := toTime(ts)
+	if err != nil {
+		return nil, err
+	}
+	fmtStr := fmt.Sprintf("%v", format)
+	// Minimal duckdb-like format conversion
+	fmtStr = strings.ReplaceAll(fmtStr, "%Y", "2006")
+	fmtStr = strings.ReplaceAll(fmtStr, "%m", "01")
+	fmtStr = strings.ReplaceAll(fmtStr, "%d", "02")
+	fmtStr = strings.ReplaceAll(fmtStr, "%H", "15")
+	fmtStr = strings.ReplaceAll(fmtStr, "%M", "04")
+	fmtStr = strings.ReplaceAll(fmtStr, "%S", "05")
+	return t.Format(fmtStr), nil
+}
+
+func toTime(v any) (time.Time, error) {
+	switch x := v.(type) {
+	case time.Time:
+		return x, nil
+	case string:
+		layouts := []string{
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05Z07:00",
+			"2006-01-02",
+			time.RFC3339,
+		}
+		for _, l := range layouts {
+			if t, err := time.Parse(l, x); err == nil {
+				return t, nil
+			}
+		}
+		return time.Time{}, fmt.Errorf("cannot parse time: %s", x)
+	case int64:
+		return time.Unix(x, 0), nil
+	case float64:
+		return time.Unix(int64(x), 0), nil
+	default:
+		return time.Time{}, fmt.Errorf("unsupported time conversion: %T", v)
+	}
+}
+
+func parseInterval(s any) (time.Duration, error) {
+	str := strings.ToUpper(fmt.Sprintf("%v", s))
+	parts := strings.Fields(str)
+	if len(parts) < 1 {
+		return 0, fmt.Errorf("invalid interval")
+	}
+	val, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid interval value: %s", parts[0])
+	}
+	unit := "SECOND"
+	if len(parts) > 1 {
+		unit = parts[1]
+	}
+	switch unit {
+	case "SECOND", "SECONDS":
+		return time.Duration(val) * time.Second, nil
+	case "MINUTE", "MINUTES":
+		return time.Duration(val) * time.Minute, nil
+	case "HOUR", "HOURS":
+		return time.Duration(val) * time.Hour, nil
+	case "DAY", "DAYS":
+		return time.Duration(val) * 24 * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("unsupported interval unit: %s", unit)
 	}
 }

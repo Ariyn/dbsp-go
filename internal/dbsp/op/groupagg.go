@@ -424,6 +424,7 @@ func (g *GroupAggOp) State() map[any]any {
 type SumAgg struct {
 	ColName  string // Column to sum (defaults to "v" if empty)
 	DeltaCol string
+	Expr     func(types.Tuple) (any, error)
 }
 
 func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
@@ -442,14 +443,23 @@ func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	}
 
 	// extract value from tuple
-	colName := s.ColName
-	if colName == "" {
-		colName = "v"
+	var raw any
+	if s.Expr != nil {
+		var err error
+		raw, err = s.Expr(td.Tuple)
+		if err != nil {
+			return prev, nil
+		}
+	} else {
+		colName := s.ColName
+		if colName == "" {
+			colName = "v"
+		}
+		raw = td.Tuple[colName]
 	}
 
-	raw, ok := td.Tuple[colName]
 	// Ignore NULL values (standard SQL behavior)
-	if !ok || raw == nil {
+	if raw == nil {
 		return prev, nil
 	}
 
@@ -510,6 +520,7 @@ func (s *SumAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 type CountAgg struct {
 	ColName  string // Column to count (empty string means COUNT(*))
 	DeltaCol string
+	Expr     func(types.Tuple) (any, error)
 }
 
 func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
@@ -533,9 +544,14 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 		}
 	}
 
-	// If ColName is specified, check if the value is NULL
+	// If ColName/Expr is specified, check if the value is NULL
 	// COUNT(col) ignores NULL values
-	if colName != "" {
+	if c.Expr != nil {
+		val, err := c.Expr(td.Tuple)
+		if err != nil || val == nil {
+			return prev, nil
+		}
+	} else if colName != "" {
 		val, ok := td.Tuple[colName]
 		if !ok || val == nil {
 			// NULL value, don't count it
@@ -570,6 +586,7 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 // changes in the "avg_delta" column.
 type AvgAgg struct {
 	ColName string
+	Expr    func(types.Tuple) (any, error)
 }
 
 // AvgMonoid is the monoid structure for AVG aggregation.
@@ -621,14 +638,23 @@ func (a *AvgAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	oldAvg := monoid.Value()
 
 	// Extract value from tuple
-	col := a.ColName
-	if col == "" {
-		col = "v"
+	var raw any
+	if a.Expr != nil {
+		var err error
+		raw, err = a.Expr(td.Tuple)
+		if err != nil {
+			return monoid, nil
+		}
+	} else {
+		col := a.ColName
+		if col == "" {
+			col = "v"
+		}
+		raw = td.Tuple[col]
 	}
 
-	raw, ok := td.Tuple[col]
 	// Ignore NULL values (standard SQL behavior)
-	if !ok || raw == nil {
+	if raw == nil {
 		return monoid, nil
 	}
 

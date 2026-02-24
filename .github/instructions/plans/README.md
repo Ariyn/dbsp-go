@@ -12,3 +12,4 @@
 - [Phase 3 — Relational IR → DBSP IR 변환기](phase-3.md)
 - [Phase 4 — 최적화/운영성](phase-4.md)
 - [Phase 5 — Non-Recursive CTE (Single Query Scope, Temporary Node)](phase-5-cte.md)
+- [Phase 6 — SQL Window/Expression 확장 (논문 범위 유지)](phase-6-sql-window-expression.md)

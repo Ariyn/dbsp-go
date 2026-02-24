@@ -41,6 +41,25 @@ go build -o dbsp ./cmd/dbsp
 go test ./...
 ```
 
+## 컨테이너 이미지 (GHCR)
+
+GitHub Actions 워크플로우로 `ghcr.io`에 이미지를 빌드/푸시합니다.
+
+- 워크플로우 파일: [.github/workflows/ghcr-build.yml](.github/workflows/ghcr-build.yml)
+- 기본 이미지 경로: `ghcr.io/ariyn/dbsp-go`
+- 기본 브랜치(`main`) 푸시 시 `latest` 태그가 생성됩니다.
+
+```bash
+# 이미지 가져오기
+docker pull ghcr.io/ariyn/dbsp-go:latest
+
+# 설정 파일을 마운트해서 실행
+docker run --rm \
+  -v "$PWD/examples/config.yaml:/app/config.yaml:ro" \
+  ghcr.io/ariyn/dbsp-go:latest \
+  -config /app/config.yaml
+```
+
 ## 구조
 
 - `cmd/dbsp`: YAML 기반 파이프라인 CLI

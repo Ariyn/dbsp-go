@@ -54,7 +54,21 @@ func extractProjectionSpecs(sel *ast.Select) ([]string, []ir.ProjectExpr, error)
 			}
 			cols = append(cols, colName)
 		case *ast.FuncExpr:
-			// aggregate or other function - handled elsewhere
+			// If it's a window function or window aggregate, its output column should be projected.
+			// (Assuming the alias is provided or generated)
+			if e.Over != nil {
+				colName := item.As
+				if colName == "" {
+					// Fallback to name generation similar to findAllWindowFunctionsFromSelect
+					funcName := strings.ToUpper(e.Name)
+					argStr := ""
+					if len(e.Args) > 0 {
+						argStr = e.Args[0].String()
+					}
+					colName = strings.ToLower(funcName) + "_" + argStr
+				}
+				cols = append(cols, colName)
+			}
 			continue
 		default:
 			// Computed expression: require alias so output column is stable.

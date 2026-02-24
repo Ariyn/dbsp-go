@@ -11,6 +11,26 @@
 
 ## 현재 단계: Phase 4 — 최적화/운영성
 
+### Phase 6 진행 — SQL Window/Expression 확장 (논문 범위 유지) [진행 중]
+
+- [ ] **범위/제약 문서 고정**
+  - 신규 기능은 Map/Binary/Delay/Integrate로만 하향 변환
+
+- [ ] **SQL 파서 조합성 개선**
+  - LAG/윈도우 집계가 있어도 WITH/WHERE/PROJECT/GROUP BY/ORDER BY와 조합
+
+- [ ] **표현식 확장(Map 기반)**
+  - time_bucket, epoch, interval, strftime, JSON state->, :: 캐스트
+
+- [ ] **ORDER BY 경로 추가**
+  - LogicalSort 파싱 및 SortOp 변환
+
+- [ ] **윈도우 체이닝 정리**
+  - LAG/윈도우 집계 결과가 Project/GroupAgg와 체이닝
+
+- [ ] **E2E 정합성 검증**
+  - 목표 쿼리 동일 출력 테스트 추가
+
 ### Phase 5 완료 — Non-Recursive CTE (단일 쿼리, 임시 노드) [완료: 2026-02-22]
 
 - [x] **CTE 파싱/바인딩 컨텍스트 도입**
@@ -96,7 +116,6 @@
 
 - [x] **운영성(선택): WAL 체크포인트/복구 E2E 1개 추가**
   - 체크포인트 저장 → 재시작(replay) → 동일 결과 확인
-
 
 ---
 

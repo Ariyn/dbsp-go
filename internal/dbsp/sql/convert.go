@@ -170,51 +170,37 @@ func parseSelectToLogicalPlan(sel *ast.Select, query string, ctes map[string]ir.
 }
 
 func parseSelectToLogicalPlanCore(sel *ast.Select, query string, ctes map[string]ir.LogicalNode) (ir.LogicalNode, error) {
-	// Check for window functions (LAG ... OVER ...)
-	if wf, scan, err := parseWindowFunctionFromSelect(sel); wf != nil || err != nil {
-		if err != nil {
-			return nil, err
-		}
-		wf.Input = scan
-		return wf, nil
+	// 1. FROM clause
+	if len(sel.From) == 0 {
+		return nil, errors.New("SELECT requires FROM clause")
 	}
 
-	// Check for window aggregate functions (SUM(...) OVER ...)
-	if waf, scan, err := parseWindowAggregateFromSelect(sel); waf != nil || err != nil {
-		if err != nil {
-			return nil, err
-		}
-		waf.Input = scan
-		return waf, nil
-	}
-
-	if len(sel.From) != 1 {
-		return nil, errors.New("only single FROM table supported")
-	}
-
-	// Check if we have a JOIN in the FROM clause
+	var currentNode ir.LogicalNode
 	fromExpr := sel.From[0]
+
 	if joinExpr, ok := fromExpr.(*ast.JoinTableExpr); ok {
 		// Handle JOIN
-		return parseJoin(sel, joinExpr, query, ctes)
-	}
-
-	// Start with scan - extract table name from FROM
-	tableName := "t"
-	if tableExpr, ok := sel.From[0].(*ast.TableName); ok {
-		tableName = tableExpr.Name
-	}
-	var currentNode ir.LogicalNode
-	if _, ok := ctes[tableName]; ok {
-		currentNode = &ir.LogicalCTERef{CTEName: tableName}
+		var err error
+		currentNode, err = parseJoinCore(sel, joinExpr, query, ctes)
+		if err != nil {
+			return nil, err
+		}
 	} else {
-		currentNode = &ir.LogicalScan{Table: tableName}
+		// Start with scan - extract table name from FROM
+		tableName := "t"
+		if tableExpr, ok := sel.From[0].(*ast.TableName); ok {
+			tableName = tableExpr.Name
+		}
+		if _, ok := ctes[tableName]; ok {
+			currentNode = &ir.LogicalCTERef{CTEName: tableName}
+		} else {
+			currentNode = &ir.LogicalScan{Table: tableName}
+		}
 	}
 
-	// Add filter if WHERE clause exists
+	// 2. WHERE clause
 	if sel.Where != nil {
 		whereSQL := sel.Where.String()
-		// Remove surrounding quotes that tree-sitter adds
 		whereSQL = strings.Trim(whereSQL, "'\"")
 		currentNode = &ir.LogicalFilter{
 			PredicateSQL: whereSQL,
@@ -222,108 +208,142 @@ func parseSelectToLogicalPlanCore(sel *ast.Select, query string, ctes map[string
 		}
 	}
 
+	// 3. Window functions (LAG, LEAD, etc.)
+	// Find ALL window functions in SELECT list and chain them
+	windowFuncs, err := findAllWindowFunctionsFromSelect(sel)
+	if err != nil {
+		return nil, err
+	}
+	for _, wf := range windowFuncs {
+		wf.Input = currentNode
+		currentNode = wf
+	}
+
+	// 4. Window aggregate functions (SUM(...) OVER ...)
+	windowAggs, err := findAllWindowAggregatesFromSelect(sel)
+	if err != nil {
+		return nil, err
+	}
+	for _, waf := range windowAggs {
+		waf.Input = currentNode
+		currentNode = waf
+	}
+
+	// 5. GROUP BY clause
+	if len(sel.GroupBy) > 0 {
+		var (
+			groupCols      []string
+			windowSpec     *ir.WindowSpec
+			timeWindowSpec *ir.TimeWindowSpec
+		)
+
+		groupCols, windowSpec, timeWindowSpec, err = parseGroupByWithTimeWindow(sel.GroupBy)
+		if err != nil {
+			return nil, err
+		}
+
+		if timeWindowSpec != nil {
+			aggs, err := findAggregatesFromQuery(query)
+			if err != nil {
+				return nil, err
+			}
+			if len(aggs) != 1 {
+				return nil, errors.New("time-window GROUP BY supports exactly one aggregate")
+			}
+			aggName := strings.ToUpper(strings.TrimSpace(aggs[0].Name))
+			aggCol := strings.TrimSpace(aggs[0].Col)
+			if aggName == "COUNT" && aggCol == "*" {
+				aggCol = ""
+			}
+			outputCol := extractAggAliasFromQuery(query, aggs[0])
+			if strings.TrimSpace(outputCol) == "" {
+				outputCol = strings.ToLower(aggName) + "_" + strings.ReplaceAll(aggs[0].Col, " ", "")
+			}
+
+			currentNode = &ir.LogicalWindowAgg{
+				AggName:        aggName,
+				AggCol:         aggCol,
+				PartitionBy:    groupCols,
+				TimeWindowSpec: timeWindowSpec,
+				OutputCol:      outputCol,
+				Input:          currentNode,
+			}
+		} else {
+			aggs, err := findAggregatesFromQuery(query)
+			if err != nil {
+				return nil, err
+			}
+			lg := &ir.LogicalGroupAgg{
+				Keys:       groupCols,
+				WindowSpec: windowSpec,
+				Input:      currentNode,
+			}
+			if len(aggs) == 1 {
+				lg.AggName = aggs[0].Name
+				if strings.ToUpper(aggs[0].Name) == "COUNT" && strings.TrimSpace(aggs[0].Col) == "*" {
+					lg.AggCol = ""
+				} else {
+					lg.AggCol = aggs[0].Col
+				}
+			} else {
+				lg.Aggs = make([]ir.AggSpec, 0, len(aggs))
+				for _, a := range aggs {
+					col := a.Col
+					if strings.ToUpper(a.Name) == "COUNT" && strings.TrimSpace(col) == "*" {
+						col = ""
+					}
+					lg.Aggs = append(lg.Aggs, ir.AggSpec{Name: a.Name, Col: col})
+				}
+			}
+			currentNode = lg
+		}
+	}
+
+	// 6. Projection (SELECT list)
 	selectCols, selectExprs, err := extractProjectionSpecs(sel)
 	if err != nil {
 		return nil, err
 	}
+	if len(selectCols) > 0 || len(selectExprs) > 0 {
+		currentNode = &ir.LogicalProject{
+			Columns: selectCols,
+			Exprs:   selectExprs,
+			Input:   currentNode,
+		}
+	}
 
-	// Check for GROUP BY
-	if len(sel.GroupBy) == 0 {
-		// No GROUP BY - check if we need projection
-		if len(selectCols) > 0 || len(selectExprs) > 0 {
-			// Add projection
-			currentNode = &ir.LogicalProject{
-				Columns: selectCols,
-				Exprs:   selectExprs,
-				Input:   currentNode,
+	// 7. ORDER BY
+	if len(sel.OrderBy) > 0 {
+		var orderCols []string
+		var descending []bool
+		for _, o := range sel.OrderBy {
+			orderCols = append(orderCols, o.Expr.String())
+			descending = append(descending, o.Direction == "DESC")
+		}
+		currentNode = &ir.LogicalSort{
+			OrderColumns: orderCols,
+			Descending:   descending,
+			Input:        currentNode,
+		}
+	}
+
+	// 8. LIMIT
+	if sel.Limit != nil {
+		limitVal := int64(-1)
+		offsetVal := int64(0)
+		if lit, ok := sel.Limit.(*ast.Literal); ok && lit.Type == "INTEGER" {
+			if v, err := strconv.ParseInt(lit.Value, 10, 64); err == nil {
+				limitVal = v
 			}
 		}
-		return currentNode, nil
-	}
-
-	// Handle GROUP BY with aggregation
-	var (
-		groupCols      []string
-		windowSpec     *ir.WindowSpec
-		timeWindowSpec *ir.TimeWindowSpec
-	)
-
-	groupCols, windowSpec, timeWindowSpec, err = parseGroupByWithTimeWindow(sel.GroupBy)
-	if err != nil {
-		return nil, err
-	}
-
-	// If this GROUP BY has an event-time window function (TUMBLE/HOP/SESSION),
-	// model it as a LogicalWindowAgg rather than a normal LogicalGroupAgg.
-	if timeWindowSpec != nil {
-		aggs, err := findAggregatesFromQuery(query)
-		if err != nil {
-			return nil, err
-		}
-		if len(aggs) != 1 {
-			return nil, errors.New("time-window GROUP BY supports exactly one aggregate")
-		}
-		aggName := strings.ToUpper(strings.TrimSpace(aggs[0].Name))
-		aggCol := strings.TrimSpace(aggs[0].Col)
-		if aggName == "COUNT" && aggCol == "*" {
-			aggCol = ""
-		}
-
-		outputCol := extractAggAliasFromQuery(query, aggs[0])
-		if strings.TrimSpace(outputCol) == "" {
-			outputCol = strings.ToLower(aggName) + "_" + strings.ReplaceAll(aggs[0].Col, " ", "")
-		}
-
-		wa := &ir.LogicalWindowAgg{
-			AggName:        aggName,
-			AggCol:         aggCol,
-			PartitionBy:    groupCols,
-			TimeWindowSpec: timeWindowSpec,
-			OutputCol:      outputCol,
-			Input:          currentNode,
-		}
-		return wa, nil
-	}
-
-	// Use original query string to find aggregates because parser has bugs
-	aggs, err := findAggregatesFromQuery(query)
-	if err != nil {
-		return nil, err
-	}
-	if len(aggs) > 1 {
-		for _, a := range aggs {
-			name := strings.ToUpper(a.Name)
-			if name != "SUM" && name != "COUNT" {
-				return nil, errors.New("multiple aggregate functions not supported yet")
-			}
+		currentNode = &ir.LogicalLimit{
+			Limit:  limitVal,
+			Offset: offsetVal,
+			Input:  currentNode,
 		}
 	}
 
-	// Build GroupAgg with input from current node (which may include filter)
-	lg := &ir.LogicalGroupAgg{
-		Keys:       groupCols,
-		WindowSpec: windowSpec,
-		Input:      currentNode,
-	}
-	// Preserve legacy single-aggregate fields for backward-compatible output.
-	if len(aggs) == 1 {
-		lg.AggName = aggs[0].Name
-		if strings.ToUpper(aggs[0].Name) == "COUNT" && strings.TrimSpace(aggs[0].Col) == "*" {
-			lg.AggCol = ""
-		} else {
-			lg.AggCol = aggs[0].Col
-		}
-	} else {
-		lg.Aggs = make([]ir.AggSpec, 0, len(aggs))
-		for _, a := range aggs {
-			col := a.Col
-			if strings.ToUpper(a.Name) == "COUNT" && strings.TrimSpace(col) == "*" {
-				col = ""
-			}
-			lg.Aggs = append(lg.Aggs, ir.AggSpec{Name: a.Name, Col: col})
-		}
-	}
-	return lg, nil
+	return currentNode, nil
 }
 
 // parseSimpleIntervalToMillis parses a very small subset of SQL interval
@@ -400,183 +420,184 @@ func ParseQueryToDBSP(query string) (*op.Node, error) {
 	return ir.LogicalToDBSP(lp)
 }
 
-// parseWindowFunctionFromSelect parses window function from AST Select
-func parseWindowFunctionFromSelect(sel *ast.Select) (*ir.LogicalWindowFunc, *ir.LogicalScan, error) {
-	// Find LAG function with OVER clause in SELECT list
-	var lagFunc *ast.FuncExpr
-	var outputCol string
+// parseJoinCore handles JOIN in the FROM clause without early return
+func parseJoinCore(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string, ctes map[string]ir.LogicalNode) (ir.LogicalNode, error) {
+	// Extract left and right table names
+	leftTable, ok := joinExpr.LeftExpr.(*ast.TableName)
+	if !ok {
+		return nil, errors.New("JOIN left side must be a table")
+	}
+
+	rightTable, ok := joinExpr.RightExpr.(*ast.TableName)
+	if !ok {
+		return nil, errors.New("JOIN right side must be a table")
+	}
+
+	// Parse ON conditions
+	var conditions []ir.JoinCondition
+	var err error
+	if joinExpr.On != nil {
+		conditions, err = parseJoinConditions(joinExpr.On)
+	} else {
+		conditions, err = parseJoinConditionsFromSQL(rawQuery)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Create LogicalJoin inputs, checking for CTE references
+	var leftLp, rightLp ir.LogicalNode
+
+	if _, ok := ctes[leftTable.Name]; ok {
+		leftLp = &ir.LogicalCTERef{CTEName: leftTable.Name}
+	} else {
+		leftLp = &ir.LogicalScan{Table: leftTable.Name}
+	}
+
+	if _, ok := ctes[rightTable.Name]; ok {
+		rightLp = &ir.LogicalCTERef{CTEName: rightTable.Name}
+	} else {
+		rightLp = &ir.LogicalScan{Table: rightTable.Name}
+	}
+
+	return &ir.LogicalJoin{
+		LeftTable:  leftTable.Name,
+		RightTable: rightTable.Name,
+		Conditions: conditions,
+		Left:       leftLp,
+		Right:      rightLp,
+	}, nil
+}
+
+// findAllWindowFunctionsFromSelect finds all window functions (like LAG) in SELECT list
+func findAllWindowFunctionsFromSelect(sel *ast.Select) ([]*ir.LogicalWindowFunc, error) {
+	var out []*ir.LogicalWindowFunc
 
 	for _, item := range sel.SelectList {
 		if funcExpr, ok := item.Expr.(*ast.FuncExpr); ok {
-			if strings.ToUpper(funcExpr.Name) == "LAG" && funcExpr.Over != nil {
-				lagFunc = funcExpr
-				if item.As != "" {
-					outputCol = item.As
+			funcName := strings.ToUpper(funcExpr.Name)
+			if (funcName == "LAG" || funcName == "LEAD") && funcExpr.Over != nil {
+				// Extract arguments
+				if len(funcExpr.Args) < 1 {
+					return nil, errors.New(funcName + " requires at least one argument")
 				}
-				break
+
+				argExpr := funcExpr.Args[0]
+				lagCol := argExpr.String()
+				offset := 1
+
+				if len(funcExpr.Args) > 1 {
+					if lit, ok := funcExpr.Args[1].(*ast.Literal); ok && lit.Type == "INTEGER" {
+						if val, err := strconv.Atoi(lit.Value); err == nil {
+							offset = val
+						}
+					}
+				}
+
+				// Parse PARTITION BY
+				var partitionBy []string
+				for _, expr := range funcExpr.Over.PartitionBy {
+					partitionBy = append(partitionBy, expr.String())
+				}
+
+				// Parse ORDER BY
+				if len(funcExpr.Over.OrderBy) == 0 {
+					return nil, errors.New(funcName + " requires ORDER BY in OVER clause")
+				}
+				orderBy := funcExpr.Over.OrderBy[0].Expr.String()
+
+				outputCol := item.As
+				if outputCol == "" {
+					outputCol = strings.ToLower(funcName) + "_" + lagCol
+				}
+
+				out = append(out, &ir.LogicalWindowFunc{
+					Spec: ir.WindowFuncSpec{
+						FuncName:    funcName,
+						Args:        []string{lagCol},
+						PartitionBy: partitionBy,
+						OrderBy:     orderBy,
+						Offset:      offset,
+					},
+					OutputCol: outputCol,
+				})
 			}
 		}
 	}
 
-	if lagFunc == nil {
-		return nil, nil, nil // No LAG function
-	}
-
-	// Extract LAG arguments
-	if len(lagFunc.Args) < 1 {
-		return nil, nil, errors.New("LAG requires at least one argument")
-	}
-
-	lagCol := lagFunc.Args[0].String()
-	offset := 1
-
-	if len(lagFunc.Args) > 1 {
-		if lit, ok := lagFunc.Args[1].(*ast.Literal); ok && lit.Type == "INTEGER" {
-			if val, err := strconv.Atoi(lit.Value); err == nil {
-				offset = val
-			}
-		}
-	}
-
-	// Parse PARTITION BY from OVER clause
-	var partitionBy []string
-	for _, expr := range lagFunc.Over.PartitionBy {
-		partitionBy = append(partitionBy, expr.String())
-	}
-
-	// Parse ORDER BY from OVER clause
-	var orderBy string
-	if len(lagFunc.Over.OrderBy) == 0 {
-		return nil, nil, errors.New("LAG requires ORDER BY in OVER clause")
-	}
-	orderBy = lagFunc.Over.OrderBy[0].Expr.String()
-
-	// Determine output column name
-	if outputCol == "" {
-		outputCol = "lag_" + lagCol
-	}
-
-	// Extract table name from FROM clause
-	tableName := "t"
-	if len(sel.From) > 0 {
-		if tableExpr, ok := sel.From[0].(*ast.TableName); ok {
-			tableName = tableExpr.Name
-		}
-	}
-
-	wf := &ir.LogicalWindowFunc{
-		Spec: ir.WindowFuncSpec{
-			FuncName:    "LAG",
-			Args:        []string{lagCol},
-			PartitionBy: partitionBy,
-			OrderBy:     orderBy,
-			Offset:      offset,
-		},
-		OutputCol: outputCol,
-	}
-
-	scan := &ir.LogicalScan{Table: tableName}
-	return wf, scan, nil
+	return out, nil
 }
 
-// parseWindowAggregateFromSelect parses window aggregate function from SELECT clause.
-// Supports: SUM(col) OVER (PARTITION BY ... ORDER BY ... RANGE BETWEEN ...)
-func parseWindowAggregateFromSelect(sel *ast.Select) (*ir.LogicalWindowAgg, *ir.LogicalScan, error) {
-	var aggFunc *ast.FuncExpr
-	var outputCol string
+// findAllWindowAggregatesFromSelect finds all window aggregates in SELECT list
+func findAllWindowAggregatesFromSelect(sel *ast.Select) ([]*ir.LogicalWindowAgg, error) {
+	var out []*ir.LogicalWindowAgg
 
 	for _, item := range sel.SelectList {
 		if funcExpr, ok := item.Expr.(*ast.FuncExpr); ok {
 			if funcExpr.Over != nil {
-				// This is a window aggregate function
 				funcName := strings.ToUpper(funcExpr.Name)
 				if funcName == "SUM" || funcName == "AVG" || funcName == "COUNT" || funcName == "MIN" || funcName == "MAX" {
-					aggFunc = funcExpr
-					if item.As != "" {
-						outputCol = item.As
+					// Extract aggregate column
+					aggCol := ""
+					if len(funcExpr.Args) > 0 {
+						aggCol = funcExpr.Args[0].String()
 					}
-					break
-				}
-			}
-		}
-	}
 
-	if aggFunc == nil {
-		return nil, nil, nil // No window aggregate function
-	}
+					// Parse PARTITION BY
+					var partitionBy []string
+					for _, expr := range funcExpr.Over.PartitionBy {
+						partitionBy = append(partitionBy, expr.String())
+					}
 
-	// Extract aggregate column
-	aggCol := ""
-	if len(aggFunc.Args) > 0 {
-		aggCol = aggFunc.Args[0].String()
-	}
+					// Parse ORDER BY
+					var orderBy string
+					if len(funcExpr.Over.OrderBy) > 0 {
+						orderBy = funcExpr.Over.OrderBy[0].Expr.String()
+					}
 
-	// Parse PARTITION BY from OVER clause
-	var partitionBy []string
-	for _, expr := range aggFunc.Over.PartitionBy {
-		partitionBy = append(partitionBy, expr.String())
-	}
+					var frameSpec *ir.FrameSpec
+					var timeWindowSpec *ir.TimeWindowSpec
 
-	// Parse ORDER BY from OVER clause
-	var orderBy string
-	if len(aggFunc.Over.OrderBy) > 0 {
-		orderBy = aggFunc.Over.OrderBy[0].Expr.String()
-	}
-
-	// Parse frame specification (ROWS/RANGE/GROUPS BETWEEN ...)
-	var frameSpec *ir.FrameSpec
-	var timeWindowSpec *ir.TimeWindowSpec
-
-	if aggFunc.Over.Frame != nil {
-		frameSpec = parseFrameSpec(aggFunc.Over.Frame)
-
-		// Check if frame uses time-based RANGE with INTERVAL
-		// This indicates a time window (e.g., RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING AND CURRENT ROW)
-		if frameSpec != nil && strings.ToUpper(frameSpec.Type) == "RANGE" {
-			if strings.Contains(strings.ToUpper(frameSpec.StartValue), "INTERVAL") ||
-				strings.Contains(strings.ToUpper(frameSpec.EndValue), "INTERVAL") {
-				// This is a time-based window
-				// For now, we'll treat RANGE with INTERVAL as a sliding window
-				// Extract the interval from StartValue
-				if frameSpec.StartValue != "" {
-					interval, err := parseIntervalArg(frameSpec.StartValue)
-					if err == nil && orderBy != "" {
-						timeWindowSpec = &ir.TimeWindowSpec{
-							WindowType:  "SLIDING",
-							TimeCol:     orderBy,
-							SizeMillis:  interval,
-							SlideMillis: interval / 2, // Default: half of size
+					if funcExpr.Over.Frame != nil {
+						frameSpec = parseFrameSpec(funcExpr.Over.Frame)
+						if frameSpec != nil && strings.ToUpper(frameSpec.Type) == "RANGE" {
+							if strings.Contains(strings.ToUpper(frameSpec.StartValue), "INTERVAL") ||
+								strings.Contains(strings.ToUpper(frameSpec.EndValue), "INTERVAL") {
+								if frameSpec.StartValue != "" {
+									interval, err := parseIntervalArg(frameSpec.StartValue)
+									if err == nil && orderBy != "" {
+										timeWindowSpec = &ir.TimeWindowSpec{
+											WindowType:  "SLIDING",
+											TimeCol:     orderBy,
+											SizeMillis:  interval,
+											SlideMillis: interval / 2,
+										}
+									}
+								}
+							}
 						}
 					}
+
+					outputCol := item.As
+					if outputCol == "" {
+						outputCol = strings.ToLower(funcExpr.Name) + "_" + aggCol
+					}
+
+					out = append(out, &ir.LogicalWindowAgg{
+						AggName:        funcName,
+						AggCol:         aggCol,
+						PartitionBy:    partitionBy,
+						OrderBy:        orderBy,
+						FrameSpec:      frameSpec,
+						TimeWindowSpec: timeWindowSpec,
+						OutputCol:      outputCol,
+					})
 				}
 			}
 		}
 	}
 
-	if outputCol == "" {
-		outputCol = strings.ToLower(aggFunc.Name) + "_" + aggCol
-	}
-
-	// Extract table name from FROM clause
-	tableName := "t"
-	if len(sel.From) > 0 {
-		if tableExpr, ok := sel.From[0].(*ast.TableName); ok {
-			tableName = tableExpr.Name
-		}
-	}
-
-	waf := &ir.LogicalWindowAgg{
-		AggName:        strings.ToUpper(aggFunc.Name),
-		AggCol:         aggCol,
-		PartitionBy:    partitionBy,
-		OrderBy:        orderBy,
-		FrameSpec:      frameSpec,
-		TimeWindowSpec: timeWindowSpec,
-		OutputCol:      outputCol,
-	}
-
-	scan := &ir.LogicalScan{Table: tableName}
-	return waf, scan, nil
+	return out, nil
 }
 
 // parseFrameSpec parses frame specification from AST WindowFrame

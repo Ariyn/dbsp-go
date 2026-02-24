@@ -120,13 +120,17 @@ func (o *OrderedBuffer) isSameTuple(t1, t2 types.Tuple) bool {
 }
 
 // GetLagValue returns the LAG value for the row at the given position
-func (o *OrderedBuffer) GetLagValue(pos int, offset int, lagCol string) any {
+func (o *OrderedBuffer) GetLagValue(pos int, offset int, lagCol string, lagExpr ...func(types.Tuple) (any, error)) any {
 	if pos < offset || pos >= len(o.entries) {
 		return nil
 	}
 	lagPos := pos - offset
 	if lagPos < 0 {
 		return nil
+	}
+	if len(lagExpr) > 0 && lagExpr[0] != nil {
+		raw, _ := lagExpr[0](o.entries[lagPos].Tuple)
+		return raw
 	}
 	return o.entries[lagPos].Tuple[lagCol]
 }
@@ -259,10 +263,11 @@ func compareTuples(t1, t2 types.Tuple) int {
 //
 // LAG(col, offset) OVER (PARTITION BY ... ORDER BY orderCol)
 type LagAgg struct {
-	OrderByCol string // Column to order by
-	LagCol     string // Column to get LAG value from
-	Offset     int    // LAG offset (default 1)
-	OutputCol  string // Output column name for LAG result
+	OrderByCol string                         // Column to order by
+	LagCol     string                         // Column to get LAG value from
+	LagExpr    func(types.Tuple) (any, error) // Optional: Expression to get LAG value from
+	Offset     int                            // LAG offset (default 1)
+	OutputCol  string                         // Output column name for LAG result
 }
 
 // LagMonoid is the monoid state for LAG aggregation
@@ -311,7 +316,7 @@ func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	// The inserted/updated row itself
 	entry := monoid.Buffer.GetEntry(insertPos)
 	if entry != nil && td.Count > 0 {
-		lagValue := monoid.Buffer.GetLagValue(insertPos, offset, lagCol)
+		lagValue := monoid.Buffer.GetLagValue(insertPos, offset, lagCol, l.LagExpr)
 		outTuple := copyTuple(entry.Tuple)
 		outTuple[l.getOutputCol()] = lagValue
 		outDeltas = append(outDeltas, types.TupleDelta{
@@ -327,8 +332,13 @@ func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 			continue
 		}
 
-		oldLagValue := td.Tuple[lagCol] // Previous LAG was from deleted/inserted row
-		newLagValue := monoid.Buffer.GetLagValue(pos, offset, lagCol)
+		var oldLagValue any
+		if l.LagExpr != nil {
+			oldLagValue, _ = l.LagExpr(td.Tuple)
+		} else {
+			oldLagValue = td.Tuple[lagCol]
+		}
+		newLagValue := monoid.Buffer.GetLagValue(pos, offset, lagCol, l.LagExpr)
 
 		if oldLagValue != newLagValue {
 			// Emit delta: cancel old value, add new value

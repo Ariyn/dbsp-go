@@ -325,9 +325,9 @@ func TestLagEndToEnd_Sequential(t *testing.T) {
 		}
 
 		// Check LAG values at each position
-		lag0 := monoidK1.Buffer.GetLagValue(0, 1, "a")
-		lag1 := monoidK1.Buffer.GetLagValue(1, 1, "a")
-		lag2 := monoidK1.Buffer.GetLagValue(2, 1, "a")
+		lag0 := monoidK1.Buffer.GetLagValue(0, 1, "a", nil)
+		lag1 := monoidK1.Buffer.GetLagValue(1, 1, "a", nil)
+		lag2 := monoidK1.Buffer.GetLagValue(2, 1, "a", nil)
 
 		if lag0 != nil {
 			t.Errorf("final state: LAG(0)=nil expected, got %v", lag0)

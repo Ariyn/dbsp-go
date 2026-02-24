@@ -68,6 +68,40 @@ func TestSumAgg_ToleratesNumericStringAndNull(t *testing.T) {
 	}
 }
 
+func TestSumAgg_Expr_WithDelete(t *testing.T) {
+	keyFn := func(tu types.Tuple) any { return tu["k"] }
+	aggInit := func() any { return float64(0) }
+	sumAgg := &SumAgg{
+		ColName: "a-b",
+		Expr: func(tu types.Tuple) (any, error) {
+			return tu["a"].(float64) - tu["b"].(float64), nil
+		},
+	}
+
+	g := NewGroupAggOp(keyFn, aggInit, sumAgg)
+
+	_, err := g.Apply(types.Batch{
+		{Tuple: types.Tuple{"k": "A", "a": 10.0, "b": 2.0}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "a": 20.0, "b": 5.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	st := g.State()
+	if st["A"] != 23.0 {
+		t.Fatalf("expected A=23 after inserts, got %v", st["A"])
+	}
+
+	_, err = g.Apply(types.Batch{{Tuple: types.Tuple{"k": "A", "a": 10.0, "b": 2.0}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	st2 := g.State()
+	if st2["A"] != 15.0 {
+		t.Fatalf("expected A=15 after delete, got %v", st2["A"])
+	}
+}
+
 // ============================================================================
 // COUNT Aggregation Tests
 // ============================================================================
@@ -157,6 +191,43 @@ func TestCountAgg_ColNameStar_TreatedAsCountStar(t *testing.T) {
 	st := g.State()
 	if st["A"] != int64(2) {
 		t.Fatalf("expected A=2 got %v", st["A"])
+	}
+}
+
+func TestCountAgg_Expr_IgnoresNilResult(t *testing.T) {
+	keyFn := func(tu types.Tuple) any { return tu["k"] }
+	aggInit := func() any { return int64(0) }
+	countAgg := &CountAgg{
+		ColName: "expr",
+		Expr: func(tu types.Tuple) (any, error) {
+			if tu["flag"] == nil {
+				return nil, nil
+			}
+			return tu["flag"], nil
+		},
+	}
+
+	g := NewGroupAggOp(keyFn, aggInit, countAgg)
+
+	_, err := g.Apply(types.Batch{
+		{Tuple: types.Tuple{"k": "A", "flag": nil}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "flag": 1}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	st := g.State()
+	if st["A"] != int64(1) {
+		t.Fatalf("expected A=1, got %v", st["A"])
+	}
+
+	_, err = g.Apply(types.Batch{{Tuple: types.Tuple{"k": "A", "flag": 1}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	st2 := g.State()
+	if st2["A"] != int64(0) {
+		t.Fatalf("expected A=0 after delete, got %v", st2["A"])
 	}
 }
 
@@ -312,6 +383,48 @@ func TestAvgAggMonoid(t *testing.T) {
 	avgDelta := out2[0].Tuple["avg_delta"]
 	if avgDelta != 5.0 { // 25 - 20 = 5
 		t.Errorf("expected avg_delta=5, got %v", avgDelta)
+	}
+}
+
+func TestAvgAgg_Expr_WithDelete(t *testing.T) {
+	keyFn := func(tu types.Tuple) any { return tu["k"] }
+	aggInit := func() any { return AvgMonoid{} }
+	avgAgg := &AvgAgg{
+		ColName: "a-b",
+		Expr: func(tu types.Tuple) (any, error) {
+			return tu["a"].(float64) - tu["b"].(float64), nil
+		},
+	}
+
+	g := NewGroupAggOp(keyFn, aggInit, avgAgg)
+
+	_, err := g.Apply(types.Batch{
+		{Tuple: types.Tuple{"k": "A", "a": 10.0, "b": 2.0}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "a": 20.0, "b": 5.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("Apply(insert) failed: %v", err)
+	}
+	st := g.State()
+	monoidA, ok := st["A"].(AvgMonoid)
+	if !ok {
+		t.Fatalf("expected AvgMonoid state, got %T", st["A"])
+	}
+	if monoidA.Value() != 11.5 {
+		t.Fatalf("expected avg=11.5, got %v", monoidA.Value())
+	}
+
+	_, err = g.Apply(types.Batch{{Tuple: types.Tuple{"k": "A", "a": 20.0, "b": 5.0}, Count: -1}})
+	if err != nil {
+		t.Fatalf("Apply(delete) failed: %v", err)
+	}
+	st2 := g.State()
+	monoidA2, ok := st2["A"].(AvgMonoid)
+	if !ok {
+		t.Fatalf("expected AvgMonoid state after delete, got %T", st2["A"])
+	}
+	if monoidA2.Value() != 8.0 {
+		t.Fatalf("expected avg=8.0 after delete, got %v", monoidA2.Value())
 	}
 }
 
