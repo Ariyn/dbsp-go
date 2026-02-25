@@ -33,6 +33,8 @@ type partitionRuntime struct {
 	batchCount  int
 }
 
+var compileIncrementalQuery = sqlconv.ParseQueryToIncrementalDBSP
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -61,6 +63,10 @@ func main() {
 	}
 
 	if cfg.Pipeline.Partition.Enabled {
+		if err := preflightPartitionQueryBuild(&cfg); err != nil {
+			fmt.Printf("Partition startup preflight failed: %v\n", err)
+			os.Exit(1)
+		}
 		if err := runPartitionFanout(ctx, &cfg); err != nil {
 			fmt.Printf("Partition fan-out failed: %v\n", err)
 			os.Exit(1)
@@ -76,6 +82,28 @@ func main() {
 		fmt.Printf("Pipeline error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func preflightPartitionQueryBuild(cfg *config.PipelineConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("pipeline config is nil")
+	}
+	if !cfg.Pipeline.Partition.Enabled {
+		return nil
+	}
+	if cfg.Pipeline.Transform.Type != "sql" {
+		return fmt.Errorf("unsupported transform type: %s", cfg.Pipeline.Transform.Type)
+	}
+	query := strings.TrimSpace(cfg.Pipeline.Transform.Query)
+	if query == "" {
+		return fmt.Errorf("transform query is empty")
+	}
+
+	if _, err := compileIncrementalQuery(query); err != nil {
+		return fmt.Errorf("compiling SQL query during startup preflight: %w", err)
+	}
+
+	return nil
 }
 
 func runPartitionFanout(ctx context.Context, cfg *config.PipelineConfig) error {
@@ -158,7 +186,7 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig, partitio
 
 	fmt.Printf("Compiling Query: %s\n", query)
 
-	rootNode, err := sqlconv.ParseQueryToIncrementalDBSP(query)
+	rootNode, err := compileIncrementalQuery(query)
 	if err != nil {
 		return fmt.Errorf("compiling SQL query: %w", err)
 	}
@@ -271,7 +299,7 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 		return nil, fmt.Errorf("unsupported transform type: %s", cfg.Pipeline.Transform.Type)
 	}
 	query := strings.TrimSpace(cfg.Pipeline.Transform.Query)
-	rootNode, err := sqlconv.ParseQueryToIncrementalDBSP(query)
+	rootNode, err := compileIncrementalQuery(query)
 	if err != nil {
 		return nil, fmt.Errorf("compiling SQL query: %w", err)
 	}

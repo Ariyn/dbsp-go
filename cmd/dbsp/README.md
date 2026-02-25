@@ -164,6 +164,7 @@ pipeline:
 동작:
 
 - `transform.query`는 파티션 조건 없이 공통 집계/변환 로직만 작성합니다.
+- 시작 시점에 `transform.query`를 1회 컴파일 preflight 하며, 실패하면 ingest 시작 전 즉시 종료됩니다.
 - 레코드는 `partition.keys` 값으로 분할되어 해당 파티션 런타임에만 반영됩니다.
 - `file`/`parquet` sink의 `path`, WAL `path`, `http_pull.disk_spill_path`에 Hive 경로를 추가합니다.
   - 예: `/tmp/out.parquet` + `plant_id=P-1, local_date=2026-02-24`

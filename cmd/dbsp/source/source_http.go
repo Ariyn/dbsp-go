@@ -16,10 +16,10 @@ import (
 )
 
 type HTTPSource struct {
-	server *http.Server
-	buffer chan types.TupleDelta
-	schema map[string]string
-	done   chan struct{}
+	server   *http.Server
+	buffer   chan types.TupleDelta
+	schema   map[string]string
+	done     chan struct{}
 	doneOnce sync.Once
 
 	maxBatchSize  int
@@ -61,9 +61,9 @@ func NewHTTPSource(cfg map[string]interface{}) (*HTTPSource, error) {
 	}
 
 	s := &HTTPSource{
-		buffer: make(chan types.TupleDelta, httpConfig.BufferSize),
-		schema: httpConfig.Schema,
-		done:   make(chan struct{}),
+		buffer:        make(chan types.TupleDelta, httpConfig.BufferSize),
+		schema:        httpConfig.Schema,
+		done:          make(chan struct{}),
 		maxBatchSize:  httpConfig.MaxBatchSize,
 		maxBatchDelay: time.Duration(httpConfig.MaxBatchDelayMS) * time.Millisecond,
 		autoConvert:   httpConfig.AutoConvert,
