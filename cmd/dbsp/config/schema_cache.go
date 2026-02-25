@@ -214,6 +214,12 @@ func inferParquetSchemaFromLogicalPlan(node any, sourceSchema map[string]string)
 			return "float64"
 		case "string":
 			return "string"
+		case "bool":
+			return "string" // ParquetSchema version 1 uses string/int64/float64
+		case "timestamp":
+			return "int64"
+		case "json":
+			return "string"
 		default:
 			return "string"
 		}

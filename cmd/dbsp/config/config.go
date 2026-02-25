@@ -81,6 +81,14 @@ type HTTPSourceConfig struct {
 	Path   string            `yaml:"path"`
 	Schema map[string]string `yaml:"schema"`
 
+	// AutoConvert enables automatic type conversion for fields defined in Schema.
+	// When true, fields not in schema are passed through as raw JSON values.
+	AutoConvert bool `yaml:"auto_convert"`
+
+	// TimestampUnit defines specify timestamp resolution for numeric values.
+	// Options: "auto" (default), "s", "ms", "us", "ns".
+	TimestampUnit string `yaml:"timestamp_unit"`
+
 	BufferSize      int `yaml:"buffer_size"`
 	MaxBatchSize    int `yaml:"max_batch_size"`
 	MaxBatchDelayMS int `yaml:"max_batch_delay_ms"`

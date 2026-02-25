@@ -24,6 +24,9 @@ type HTTPSource struct {
 
 	maxBatchSize  int
 	maxBatchDelay time.Duration
+
+	autoConvert   bool
+	timestampUnit string
 }
 
 func NewHTTPSource(cfg map[string]interface{}) (*HTTPSource, error) {
@@ -53,6 +56,9 @@ func NewHTTPSource(cfg map[string]interface{}) (*HTTPSource, error) {
 	if httpConfig.MaxBatchDelayMS < 0 {
 		httpConfig.MaxBatchDelayMS = 0
 	}
+	if httpConfig.TimestampUnit == "" {
+		httpConfig.TimestampUnit = "auto"
+	}
 
 	s := &HTTPSource{
 		buffer: make(chan types.TupleDelta, httpConfig.BufferSize),
@@ -60,6 +66,8 @@ func NewHTTPSource(cfg map[string]interface{}) (*HTTPSource, error) {
 		done:   make(chan struct{}),
 		maxBatchSize:  httpConfig.MaxBatchSize,
 		maxBatchDelay: time.Duration(httpConfig.MaxBatchDelayMS) * time.Millisecond,
+		autoConvert:   httpConfig.AutoConvert,
+		timestampUnit: httpConfig.TimestampUnit,
 	}
 
 	mux := http.NewServeMux()
@@ -106,12 +114,13 @@ func (s *HTTPSource) handleIngest(w http.ResponseWriter, r *http.Request) {
 		records = []map[string]interface{}{record}
 	}
 
+	var deltas []types.TupleDelta
 	for _, record := range records {
 		tuple := make(types.Tuple)
 		for k, v := range record {
 			// Type conversion based on schema
 			if typeName, ok := s.schema[k]; ok {
-				val, err := parseValueFromInterface(v, typeName)
+				val, err := s.parseValue(v, typeName)
 				if err != nil {
 					http.Error(w, fmt.Sprintf("Invalid value for field %s: %v", k, err), http.StatusBadRequest)
 					return
@@ -122,11 +131,14 @@ func (s *HTTPSource) handleIngest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Default to insert (+1)
-		s.buffer <- types.TupleDelta{
+		deltas = append(deltas, types.TupleDelta{
 			Tuple: tuple,
 			Count: 1,
-		}
+		})
+	}
+
+	for _, delta := range deltas {
+		s.buffer <- delta
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -198,7 +210,7 @@ func (s *HTTPSource) signalDone() {
 	})
 }
 
-func parseValueFromInterface(v interface{}, colType string) (any, error) {
+func (s *HTTPSource) parseValue(v interface{}, colType string) (any, error) {
 	switch colType {
 	case "int":
 		switch val := v.(type) {
@@ -218,9 +230,70 @@ func parseValueFromInterface(v interface{}, colType string) (any, error) {
 		default:
 			return nil, fmt.Errorf("expected float, got %T", v)
 		}
+	case "bool":
+		switch val := v.(type) {
+		case bool:
+			return val, nil
+		case float64:
+			if val == 1 {
+				return true, nil
+			} else if val == 0 {
+				return false, nil
+			}
+			return nil, fmt.Errorf("expected bool (0/1), got %v", val)
+		case string:
+			return strconv.ParseBool(val)
+		default:
+			return nil, fmt.Errorf("expected bool, got %T", v)
+		}
+	case "json":
+		return v, nil // passthrough
+	case "timestamp":
+		switch val := v.(type) {
+		case string:
+			t, err := time.Parse(time.RFC3339, val)
+			if err != nil {
+				return nil, fmt.Errorf("invalid RFC3339 timestamp: %w", err)
+			}
+			return t, nil
+		case float64:
+			return s.parseTimestamp(int64(val))
+		default:
+			return nil, fmt.Errorf("expected timestamp (string or number), got %T", v)
+		}
 	case "string":
 		return fmt.Sprintf("%v", v), nil
 	default:
 		return v, nil
+	}
+}
+
+func (s *HTTPSource) parseTimestamp(val int64) (time.Time, error) {
+	unit := s.timestampUnit
+	if unit == "" || unit == "auto" {
+		// Auto detection
+		switch {
+		case val > 1e16: // ns
+			unit = "ns"
+		case val > 1e14: // us
+			unit = "us"
+		case val > 1e11: // ms
+			unit = "ms"
+		default: // s
+			unit = "s"
+		}
+	}
+
+	switch unit {
+	case "s":
+		return time.Unix(val, 0), nil
+	case "ms":
+		return time.Unix(0, val*1e6), nil
+	case "us":
+		return time.Unix(0, val*1e3), nil
+	case "ns":
+		return time.Unix(0, val), nil
+	default:
+		return time.Unix(val, 0), nil
 	}
 }
