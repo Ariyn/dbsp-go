@@ -1,7 +1,11 @@
 package types
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
+	"math/big"
+	"reflect"
 	"strconv"
 	"strings"
 )
@@ -85,4 +89,197 @@ func (i Interval) String() string {
 		return fmt.Sprintf("%d second(s)", ms/second)
 	}
 	return fmt.Sprintf("%d millisecond(s)", ms)
+}
+
+// EqualAny compares two values safely.
+//
+// It avoids panics on uncomparable values, compares maps/slices structurally,
+// and treats numeric values as equal across types (e.g. 1 == 1.0), including
+// int/uint/float and json.Number.
+func EqualAny(a, b any) bool {
+	return equalValue(reflect.ValueOf(a), reflect.ValueOf(b))
+}
+
+// TuplesEqual compares two tuples using EqualAny for values.
+func TuplesEqual(a, b Tuple) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok || !EqualAny(av, bv) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalValue(a, b reflect.Value) bool {
+	a = unwrapInterface(a)
+	b = unwrapInterface(b)
+
+	if !a.IsValid() || !b.IsValid() {
+		return !a.IsValid() && !b.IsValid()
+	}
+
+	if a.CanInterface() && b.CanInterface() {
+		if ar, ok := toRational(a.Interface()); ok {
+			if br, ok := toRational(b.Interface()); ok {
+				return ar.Cmp(br) == 0
+			}
+		}
+	}
+
+	if a.Kind() != b.Kind() {
+		if a.CanInterface() && b.CanInterface() {
+			return reflect.DeepEqual(a.Interface(), b.Interface())
+		}
+		return false
+	}
+
+	switch a.Kind() {
+	case reflect.Bool:
+		return a.Bool() == b.Bool()
+	case reflect.String:
+		return a.String() == b.String()
+	case reflect.Slice, reflect.Array:
+		if a.Kind() == reflect.Slice && (a.IsNil() != b.IsNil()) {
+			return false
+		}
+		if a.Len() != b.Len() {
+			return false
+		}
+		for i := 0; i < a.Len(); i++ {
+			if !equalValue(a.Index(i), b.Index(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Map:
+		if a.IsNil() != b.IsNil() {
+			return false
+		}
+		if a.Len() != b.Len() {
+			return false
+		}
+		keysA := a.MapKeys()
+		keysB := b.MapKeys()
+		used := make([]bool, len(keysB))
+		for _, ka := range keysA {
+			matched := -1
+			for j, kb := range keysB {
+				if used[j] {
+					continue
+				}
+				if equalValue(ka, kb) {
+					matched = j
+					break
+				}
+			}
+			if matched < 0 {
+				return false
+			}
+			used[matched] = true
+			if !equalValue(a.MapIndex(ka), b.MapIndex(keysB[matched])) {
+				return false
+			}
+		}
+		return true
+	case reflect.Struct:
+		if a.Type() != b.Type() {
+			return false
+		}
+		for i := 0; i < a.NumField(); i++ {
+			if !equalValue(a.Field(i), b.Field(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Ptr:
+		if a.IsNil() || b.IsNil() {
+			return a.IsNil() && b.IsNil()
+		}
+		return equalValue(a.Elem(), b.Elem())
+	case reflect.Func:
+		return a.IsNil() && b.IsNil()
+	default:
+		if a.Type() == b.Type() && a.Type().Comparable() {
+			return a.Interface() == b.Interface()
+		}
+		if a.CanInterface() && b.CanInterface() {
+			return reflect.DeepEqual(a.Interface(), b.Interface())
+		}
+		return false
+	}
+}
+
+func unwrapInterface(v reflect.Value) reflect.Value {
+	for v.IsValid() && v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return reflect.Value{}
+		}
+		v = v.Elem()
+	}
+	return v
+}
+
+func toRational(v any) (*big.Rat, bool) {
+	switch n := v.(type) {
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return new(big.Rat).SetInt64(i), true
+		}
+		f, err := n.Float64()
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, false
+		}
+		r, ok := new(big.Rat).SetString(n.String())
+		if ok {
+			return r, true
+		}
+		return nil, false
+	case int:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int8:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int16:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int32:
+		return new(big.Rat).SetInt64(int64(n)), true
+	case int64:
+		return new(big.Rat).SetInt64(n), true
+	case uint:
+		return new(big.Rat).SetUint64(uint64(n)), true
+	case uint8:
+		return new(big.Rat).SetUint64(uint64(n)), true
+	case uint16:
+		return new(big.Rat).SetUint64(uint64(n)), true
+	case uint32:
+		return new(big.Rat).SetUint64(uint64(n)), true
+	case uint64:
+		return new(big.Rat).SetUint64(n), true
+	case uintptr:
+		return new(big.Rat).SetUint64(uint64(n)), true
+	case float32:
+		f := float64(n)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return nil, false
+		}
+		r, ok := new(big.Rat).SetString(strconv.FormatFloat(f, 'g', -1, 32))
+		if !ok {
+			return nil, false
+		}
+		return r, true
+	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return nil, false
+		}
+		r, ok := new(big.Rat).SetString(strconv.FormatFloat(n, 'g', -1, 64))
+		if !ok {
+			return nil, false
+		}
+		return r, true
+	default:
+		return nil, false
+	}
 }

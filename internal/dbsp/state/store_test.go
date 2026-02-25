@@ -89,3 +89,34 @@ func TestTable_Update(t *testing.T) {
 		t.Errorf("expected INSERT with Count=1, got %d", updateBatch[1].Count)
 	}
 }
+
+func TestTable_ApplyBatch_DeleteWithMapPayloadAndNumericCoercion(t *testing.T) {
+	store := NewStore()
+	table := store.GetTable("events")
+
+	err := table.ApplyBatch(types.Batch{{
+		Tuple: types.Tuple{
+			"id":      int64(1),
+			"payload": map[string]any{"x": 1},
+		},
+		Count: 1,
+	}})
+	if err != nil {
+		t.Fatalf("insert ApplyBatch failed: %v", err)
+	}
+
+	err = table.ApplyBatch(types.Batch{{
+		Tuple: types.Tuple{
+			"id":      1.0,
+			"payload": map[string]any{"x": 1.0},
+		},
+		Count: -1,
+	}})
+	if err != nil {
+		t.Fatalf("delete ApplyBatch failed: %v", err)
+	}
+
+	if got := table.Count(); got != 0 {
+		t.Fatalf("expected table to be empty after matched delete, got %d rows", got)
+	}
+}

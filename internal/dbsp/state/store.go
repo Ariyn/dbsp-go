@@ -175,13 +175,5 @@ func copyTuple(t types.Tuple) types.Tuple {
 }
 
 func tuplesEqual(a, b types.Tuple) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
+	return types.TuplesEqual(a, b)
 }

@@ -107,16 +107,7 @@ func (o *OrderedBuffer) findPosition(orderValue any, tuple types.Tuple) int {
 
 // isSameTuple checks if two tuples are identical
 func (o *OrderedBuffer) isSameTuple(t1, t2 types.Tuple) bool {
-	if len(t1) != len(t2) {
-		return false
-	}
-	for k, v1 := range t1 {
-		v2, ok := t2[k]
-		if !ok || v1 != v2 {
-			return false
-		}
-	}
-	return true
+	return types.TuplesEqual(t1, t2)
 }
 
 // GetLagValue returns the LAG value for the row at the given position
@@ -340,7 +331,7 @@ func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 		}
 		newLagValue := monoid.Buffer.GetLagValue(pos, offset, lagCol, l.LagExpr)
 
-		if oldLagValue != newLagValue {
+		if !types.EqualAny(oldLagValue, newLagValue) {
 			// Emit delta: cancel old value, add new value
 			outTuple := copyTuple(entry.Tuple)
 
