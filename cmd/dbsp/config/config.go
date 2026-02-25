@@ -49,8 +49,8 @@ type TransformConfig struct {
 	Type  string `yaml:"type"` // e.g., "sql"
 	Query string `yaml:"query"`
 
-	// JoinTTL is an optional processing-time TTL for join state (e.g., "10s", "5 minutes").
-	JoinTTL string `yaml:"join_ttl"`
+	// TTL is a retention policy duration (e.g., "24h", "10s", "5 minutes").
+	TTL string `yaml:"ttl"`
 
 	// Watermark configures watermark/late-event handling for time windows.
 	Watermark WatermarkYAMLConfig `yaml:"watermark"`

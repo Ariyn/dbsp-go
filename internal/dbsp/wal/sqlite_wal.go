@@ -27,8 +27,9 @@ type Checkpoint struct {
 }
 
 type SQLiteWAL struct {
-	db         *sql.DB
-	insertStmt *sql.Stmt
+	db           *sql.DB
+	insertStmt   *sql.Stmt
+	retentionTTL time.Duration
 }
 
 func NewSQLiteWAL(path string) (*SQLiteWAL, error) {
@@ -109,9 +110,40 @@ func (w *SQLiteWAL) Append(ctx context.Context, batch types.Batch) error {
 		return err
 	}
 
-	_, err = w.insertStmt.ExecContext(ctx, time.Now().UnixMilli(), sqliteCodecGobV1, payload)
+	now := time.Now()
+	_, err = w.insertStmt.ExecContext(ctx, now.UnixMilli(), sqliteCodecGobV1, payload)
 	if err != nil {
 		return fmt.Errorf("append wal: %w", err)
+	}
+
+	if w.retentionTTL > 0 {
+		if err := w.PruneBefore(ctx, now.Add(-w.retentionTTL).UnixMilli()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *SQLiteWAL) SetRetentionTTL(ttl time.Duration) {
+	if w == nil {
+		return
+	}
+	w.retentionTTL = ttl
+}
+
+// PruneBefore deletes WAL batches/checkpoints older than the given unix-ms cutoff.
+func (w *SQLiteWAL) PruneBefore(ctx context.Context, cutoffUnixMS int64) error {
+	if w == nil || w.db == nil {
+		return fmt.Errorf("wal is nil")
+	}
+	if cutoffUnixMS <= 0 {
+		return nil
+	}
+	if _, err := w.db.ExecContext(ctx, `DELETE FROM wal_batches WHERE created_at_unix_ms < ?`, cutoffUnixMS); err != nil {
+		return fmt.Errorf("prune wal batches: %w", err)
+	}
+	if _, err := w.db.ExecContext(ctx, `DELETE FROM wal_checkpoints WHERE created_at_unix_ms < ?`, cutoffUnixMS); err != nil {
+		return fmt.Errorf("prune wal checkpoints: %w", err)
 	}
 	return nil
 }

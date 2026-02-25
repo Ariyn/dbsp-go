@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -9,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/cmd/dbsp/pipeline"
@@ -49,8 +51,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	var cfg config.PipelineConfig
-	if err := yaml.Unmarshal(configFile, &cfg); err != nil {
+	cfg, err := parsePipelineConfig(configFile)
+	if err != nil {
 		fmt.Printf("Error parsing config file: %v\n", err)
 		os.Exit(1)
 	}
@@ -214,15 +216,9 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig, partitio
 		fmt.Printf("Applied watermark enabled=%v policy=%v\n", wmCfg.Enabled, wmCfg.Policy)
 	}
 
-	if cfg.Pipeline.Transform.JoinTTL != "" {
-		ttl, err := pipeline.ParseJoinTTL(cfg.Pipeline.Transform.JoinTTL)
-		if err != nil {
-			return fmt.Errorf("parsing join_ttl: %w", err)
-		}
-		if ttl > 0 {
-			pipeline.ApplyJoinTTL(rootNode, ttl)
-			fmt.Printf("Applied join_ttl=%s\n", ttl)
-		}
+	ttl, err := validateTransformTTL(cfg.Pipeline.Transform.TTL, cfg.Pipeline.WAL.Enabled)
+	if err != nil {
+		return err
 	}
 
 	// 4. Initialize Sink
@@ -258,6 +254,10 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig, partitio
 		writeAheadLog, err = wal.NewSQLiteWAL(walPath)
 		if err != nil {
 			return fmt.Errorf("initializing WAL: %w", err)
+		}
+		if ttl > 0 {
+			writeAheadLog.SetRetentionTTL(ttl)
+			fmt.Printf("Applied ttl=%s (WAL retention)\n", ttl)
 		}
 		defer writeAheadLog.Close()
 		fmt.Printf("WAL enabled: sqlite=%s\n", walPath)
@@ -311,14 +311,9 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 		}
 		watermark.ApplyWatermarkConfig(rootNode, wmCfg)
 	}
-	if cfg.Pipeline.Transform.JoinTTL != "" {
-		ttl, err := pipeline.ParseJoinTTL(cfg.Pipeline.Transform.JoinTTL)
-		if err != nil {
-			return nil, fmt.Errorf("parsing join_ttl: %w", err)
-		}
-		if ttl > 0 {
-			pipeline.ApplyJoinTTL(rootNode, ttl)
-		}
+	ttl, err := validateTransformTTL(cfg.Pipeline.Transform.TTL, cfg.Pipeline.WAL.Enabled)
+	if err != nil {
+		return nil, err
 	}
 
 	sinkCfg := cloneConfigMap(cfg.Pipeline.Sink.Config)
@@ -365,6 +360,9 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 			_ = snk.Close()
 			return nil, fmt.Errorf("initializing WAL: %w", err)
 		}
+		if ttl > 0 {
+			writeAheadLog.SetRetentionTTL(ttl)
+		}
 	}
 
 	rt := &partitionRuntime{
@@ -386,6 +384,33 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 	}
 
 	return rt, nil
+}
+
+func parsePipelineConfig(configFile []byte) (config.PipelineConfig, error) {
+	var cfg config.PipelineConfig
+	dec := yaml.NewDecoder(bytes.NewReader(configFile))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
+		return config.PipelineConfig{}, err
+	}
+	return cfg, nil
+}
+
+func validateTransformTTL(ttl string, walEnabled bool) (time.Duration, error) {
+	if strings.TrimSpace(ttl) == "" {
+		return 0, nil
+	}
+	parsed, err := pipeline.ParseTTL(ttl)
+	if err != nil {
+		return 0, fmt.Errorf("parsing ttl: %w", err)
+	}
+	if parsed <= 0 {
+		return 0, fmt.Errorf("ttl must be greater than 0")
+	}
+	if !walEnabled {
+		return 0, fmt.Errorf("transform.ttl requires pipeline.wal.enabled=true (ttl currently applies to WAL retention)")
+	}
+	return parsed, nil
 }
 
 func runPartitionBatch(ctx context.Context, cfg *config.PipelineConfig, rt *partitionRuntime, batch types.Batch) error {

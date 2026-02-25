@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 
@@ -144,5 +145,45 @@ func TestSQLiteWAL_Checkpoint_SaveLoad_AndReplayFrom(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected 1 batch from ReplayFrom, got %d", count)
+	}
+}
+
+func TestSQLiteWAL_RetentionTTL_PrunesOldRowsOnAppend(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	if err := w.Append(ctx, types.Batch{{Tuple: types.Tuple{"id": int64(1)}, Count: 1}}); err != nil {
+		t.Fatalf("Append #1: %v", err)
+	}
+	if err := w.Append(ctx, types.Batch{{Tuple: types.Tuple{"id": int64(2)}, Count: 1}}); err != nil {
+		t.Fatalf("Append #2: %v", err)
+	}
+
+	old := time.Now().Add(-2 * time.Hour).UnixMilli()
+	if _, err := w.db.ExecContext(ctx, `UPDATE wal_batches SET created_at_unix_ms = ?`, old); err != nil {
+		t.Fatalf("mark old wal_batches: %v", err)
+	}
+	if _, err := w.db.ExecContext(ctx, `UPDATE wal_checkpoints SET created_at_unix_ms = ?`, old); err != nil {
+		t.Fatalf("mark old wal_checkpoints: %v", err)
+	}
+
+	w.SetRetentionTTL(1 * time.Hour)
+	if err := w.Append(ctx, types.Batch{{Tuple: types.Tuple{"id": int64(3)}, Count: 1}}); err != nil {
+		t.Fatalf("Append #3 with retention: %v", err)
+	}
+
+	var count int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM wal_batches`).Scan(&count); err != nil {
+		t.Fatalf("count wal_batches: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected only newest row to remain after retention prune, got %d", count)
 	}
 }

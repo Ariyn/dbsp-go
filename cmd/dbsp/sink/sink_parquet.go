@@ -386,7 +386,7 @@ func parseRotationDuration(s string) (time.Duration, error) {
 	if d, err := time.ParseDuration(s); err == nil {
 		return d, nil
 	}
-	// Match join_ttl / watermark style: "5 minutes".
+	// Match ttl / watermark style: "5 minutes".
 	iv, err := types.ParseInterval(s)
 	if err != nil {
 		return 0, fmt.Errorf("invalid rotate_every %q: %w", s, err)

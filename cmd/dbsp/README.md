@@ -139,12 +139,13 @@ pipeline:
 pipeline:
   transform:
     type: sql
-    join_ttl: "10 minutes"
+    ttl: "24h"
     query: "SELECT time_bucket, SUM(amount) AS total_sales FROM sales GROUP BY time_bucket"
 ```
 
-- `join_ttl`(선택): 조인 상태를 처리시간 기준으로 만료시키는 TTL(예: `"10s"`, `"5 minutes"`).
-  - `0` 또는 미설정이면 TTL을 적용하지 않습니다.
+- `ttl`(선택): WAL 보존 기간(예: `"24h"`, `"10s"`, `"5 minutes"`).
+  - 현재 구현에서 `ttl`은 `pipeline.wal.enabled=true`일 때 WAL 배치/체크포인트 정리에 적용됩니다.
+  - DBSP 의미론 보존을 위해 논리 상태의 처리시간 만료에는 적용하지 않습니다.
 
 ## Partition fan-out (Hive-style)
 

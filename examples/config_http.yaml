@@ -1,6 +1,6 @@
 pipeline:
   wal:
-    enabled: false
+    enabled: true
     path: /tmp/dbsp-wal.db
   source:
     type: http
@@ -13,7 +13,7 @@ pipeline:
         product: string
   transform:
     type: sql
-    join_ttl: "10 minutes"
+    ttl: "24h"
     # watermark:
     #   enabled: true
     #   max_out_of_orderness: "2s"

@@ -28,7 +28,7 @@ go build -o dbsp ./cmd/dbsp
 - **GROUP BY + Aggregates**: `SUM`, `COUNT` (다중 GROUP BY 키 지원)
 - **JOIN**: 2-way equi-join 중심 (delete/retraction 포함 증분 전파 테스트 포함)
 - **시간 기반 윈도우 집계**: Tumbling / Sliding / Session
-- **Join state TTL (옵션)**: 설정의 `transform.join_ttl`로 조인 상태를 처리시간 기준으로 만료시키고 관련 retraction을 생성
+- **TTL 설정 키 (옵션)**: `transform.ttl`을 설정하면 WAL 보존 기간으로 적용되어 오래된 WAL 배치/체크포인트를 정리합니다(논리 상태의 처리시간 만료에는 사용하지 않음).
 
 ## 제한 사항(현재)
 
