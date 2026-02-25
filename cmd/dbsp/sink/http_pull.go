@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -68,14 +69,19 @@ func NewHTTPPullSink(cfg map[string]interface{}, partitionBy []string, schema *c
 	// Start HTTP server in background
 	mux := http.NewServeMux()
 	mux.HandleFunc(hcfg.Path, s.handlePull)
+	addr := fmt.Sprintf(":%d", hcfg.Port)
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", hcfg.Port),
+		Addr:    addr,
 		Handler: mux,
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("binding http_pull sink to %s: %w", addr, err)
 	}
 
 	go func() {
 		fmt.Printf("HTTP Pull Sink listening on :%d%s\n", hcfg.Port, hcfg.Path)
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("HTTP Pull Sink server error: %v\n", err)
 		}
 	}()

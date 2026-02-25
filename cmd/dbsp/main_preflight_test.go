@@ -5,8 +5,20 @@ import (
 	"testing"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
+	"github.com/ariyn/dbsp/internal/dbsp/types"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 )
+
+type closeCountingSink struct {
+	closeCalls int
+}
+
+func (s *closeCountingSink) WriteBatch(types.Batch) error { return nil }
+
+func (s *closeCountingSink) Close() error {
+	s.closeCalls++
+	return nil
+}
 
 func TestPreflightPartitionQueryBuild_SkipsWhenPartitionDisabled(t *testing.T) {
 	orig := compileIncrementalQuery
@@ -93,5 +105,20 @@ func TestPreflightPartitionQueryBuild_ErrsOnEmptyQuery(t *testing.T) {
 
 	if err := preflightPartitionQueryBuild(cfg); err == nil {
 		t.Fatal("expected error for empty query, got nil")
+	}
+}
+
+func TestClosePartitionRuntimes_ClosesSharedSinkOnce(t *testing.T) {
+	shared := &closeCountingSink{}
+	runtimes := map[string]*partitionRuntime{
+		"a": {sink: shared},
+		"b": {sink: shared},
+	}
+
+	if err := closePartitionRuntimes(runtimes); err != nil {
+		t.Fatalf("closePartitionRuntimes failed: %v", err)
+	}
+	if shared.closeCalls != 1 {
+		t.Fatalf("expected sink close to be called once, got %d", shared.closeCalls)
 	}
 }

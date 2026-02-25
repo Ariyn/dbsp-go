@@ -120,6 +120,7 @@ func runPartitionFanout(ctx context.Context, cfg *config.PipelineConfig) error {
 
 	runtimes := map[string]*partitionRuntime{}
 	defer closePartitionRuntimes(runtimes)
+	var sharedPartitionSink provider.Sink
 
 	droppedRecords := 0
 	for {
@@ -143,9 +144,12 @@ func runPartitionFanout(ctx context.Context, cfg *config.PipelineConfig) error {
 			}
 			key := makePartitionKey(partCfg.Keys, partitionValues)
 			if _, exists := runtimes[key]; !exists {
-				rt, err := buildPartitionRuntime(cfg, partitionValues)
+				rt, err := buildPartitionRuntime(cfg, partitionValues, sharedPartitionSink)
 				if err != nil {
 					return fmt.Errorf("initializing runtime for partition %s: %w", config.PartitionSummary(partitionValues, partCfg.Keys), err)
+				}
+				if cfg.Pipeline.Sink.Type == "http_pull" && sharedPartitionSink == nil {
+					sharedPartitionSink = rt.sink
 				}
 				runtimes[key] = rt
 				fmt.Printf("Created partition runtime (%s)\n", config.PartitionSummary(partitionValues, partCfg.Keys))
@@ -294,7 +298,7 @@ func newSource(cfg *config.PipelineConfig) (provider.Source, error) {
 	}
 }
 
-func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[string]string) (*partitionRuntime, error) {
+func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[string]string, sharedSink provider.Sink) (*partitionRuntime, error) {
 	if cfg.Pipeline.Transform.Type != "sql" {
 		return nil, fmt.Errorf("unsupported transform type: %s", cfg.Pipeline.Transform.Type)
 	}
@@ -317,10 +321,12 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 	}
 
 	sinkCfg := cloneConfigMap(cfg.Pipeline.Sink.Config)
-	applyHivePathToSink(cfg.Pipeline.Sink.Type, sinkCfg, cfg.Pipeline.Partition.Keys, partitionValues)
+	if cfg.Pipeline.Sink.Type != "http_pull" {
+		applyHivePathToSink(cfg.Pipeline.Sink.Type, sinkCfg, cfg.Pipeline.Partition.Keys, partitionValues)
+	}
 
 	var parquetSchema *config.ParquetSchema
-	if cfg.Pipeline.Sink.Type == "parquet" || cfg.Pipeline.Sink.Type == "http_pull" {
+	if sharedSink == nil && (cfg.Pipeline.Sink.Type == "parquet" || cfg.Pipeline.Sink.Type == "http_pull") {
 		parquetSchema, err = config.InferOrLoadParquetSchema(query, cfg.Pipeline.Source, sinkCfg)
 		if err != nil {
 			return nil, fmt.Errorf("inferring parquet schema: %w", err)
@@ -328,25 +334,29 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 	}
 
 	var snk provider.Sink
-	switch cfg.Pipeline.Sink.Type {
-	case "console":
-		snk, err = sink.NewConsoleSink(sinkCfg)
-	case "file":
-		snk, err = sink.NewFileSink(sinkCfg)
-	case "parquet":
-		snk, err = sink.NewParquetSink(sinkCfg, parquetSchema)
-	case "http_pull":
-		snk, err = sink.NewHTTPPullSink(sinkCfg, rootNode.PartitionBy, parquetSchema)
-	default:
-		err = fmt.Errorf("unsupported sink type: %s", cfg.Pipeline.Sink.Type)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("initializing sink: %w", err)
-	}
-	snk, err = sink.WrapSinkWithBatchingIfConfigured(sinkCfg, snk)
-	if err != nil {
-		_ = snk.Close()
-		return nil, fmt.Errorf("initializing sink batching: %w", err)
+	if sharedSink != nil {
+		snk = sharedSink
+	} else {
+		switch cfg.Pipeline.Sink.Type {
+		case "console":
+			snk, err = sink.NewConsoleSink(sinkCfg)
+		case "file":
+			snk, err = sink.NewFileSink(sinkCfg)
+		case "parquet":
+			snk, err = sink.NewParquetSink(sinkCfg, parquetSchema)
+		case "http_pull":
+			snk, err = sink.NewHTTPPullSink(sinkCfg, rootNode.PartitionBy, parquetSchema)
+		default:
+			err = fmt.Errorf("unsupported sink type: %s", cfg.Pipeline.Sink.Type)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("initializing sink: %w", err)
+		}
+		snk, err = sink.WrapSinkWithBatchingIfConfigured(sinkCfg, snk)
+		if err != nil {
+			_ = snk.Close()
+			return nil, fmt.Errorf("initializing sink batching: %w", err)
+		}
 	}
 
 	var writeAheadLog *wal.SQLiteWAL
@@ -493,10 +503,14 @@ func makePartitionKey(keys []string, values map[string]string) string {
 
 func closePartitionRuntimes(runtimes map[string]*partitionRuntime) error {
 	var errs []error
+	closedSinks := map[provider.Sink]struct{}{}
 	for _, rt := range runtimes {
 		if rt.sink != nil {
-			if err := rt.sink.Close(); err != nil {
-				errs = append(errs, err)
+			if _, exists := closedSinks[rt.sink]; !exists {
+				closedSinks[rt.sink] = struct{}{}
+				if err := rt.sink.Close(); err != nil {
+					errs = append(errs, err)
+				}
 			}
 		}
 		if rt.wal != nil {

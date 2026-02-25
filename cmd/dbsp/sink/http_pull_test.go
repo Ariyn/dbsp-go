@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -301,5 +302,35 @@ func TestHTTPPullSink_EmptyAfterDelete(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNoContent {
 		t.Errorf("expected StatusNoContent (204) after full delete, got %v", resp.Status)
+	}
+}
+
+func TestHTTPPullSink_FailsFastOnPortConflict(t *testing.T) {
+	port := 9095
+	path := "/snapshot"
+	cfg := map[string]interface{}{
+		"port": port,
+		"path": path,
+	}
+
+	schema := &config.ParquetSchema{
+		Columns: []config.ParquetColumn{{Name: "id", Type: "int64"}},
+	}
+
+	s1, err := NewHTTPPullSink(cfg, []string{"id"}, schema)
+	if err != nil {
+		t.Fatalf("failed to create first sink: %v", err)
+	}
+	defer s1.Close()
+
+	s2, err := NewHTTPPullSink(cfg, []string{"id"}, schema)
+	if err == nil {
+		if s2 != nil {
+			_ = s2.Close()
+		}
+		t.Fatal("expected port binding error, got nil")
+	}
+	if !strings.Contains(err.Error(), "address already in use") {
+		t.Fatalf("expected address-in-use error, got: %v", err)
 	}
 }
