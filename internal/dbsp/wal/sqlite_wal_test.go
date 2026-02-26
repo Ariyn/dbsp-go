@@ -148,6 +148,380 @@ func TestSQLiteWAL_Checkpoint_SaveLoad_AndReplayFrom(t *testing.T) {
 	}
 }
 
+func TestSQLiteWAL_Checkpoint_IncrementalMeta_AndLoadLatestFullBefore(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 10, BaseSeq: 10, Snapshot: []byte("full-10")}); err != nil {
+		t.Fatalf("SaveCheckpoint(full): %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 15, BaseSeq: 10}); err != nil {
+		t.Fatalf("SaveCheckpoint(incremental): %v", err)
+	}
+
+	latest, err := w.LoadLatestCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected latest checkpoint")
+	}
+	if latest.Mode != "incremental" {
+		t.Fatalf("expected incremental mode, got %q", latest.Mode)
+	}
+	if latest.BaseSeq != 10 {
+		t.Fatalf("expected BaseSeq=10, got %d", latest.BaseSeq)
+	}
+
+	full, err := w.LoadLatestFullCheckpointBefore(ctx, latest.BaseSeq)
+	if err != nil {
+		t.Fatalf("LoadLatestFullCheckpointBefore: %v", err)
+	}
+	if full == nil {
+		t.Fatalf("expected full checkpoint lookup result")
+	}
+	if full.LastSeq != 10 {
+		t.Fatalf("expected full LastSeq=10, got %d", full.LastSeq)
+	}
+	if string(full.Snapshot) != "full-10" {
+		t.Fatalf("unexpected full snapshot payload: %q", string(full.Snapshot))
+	}
+}
+
+func TestSQLiteWAL_Checkpoint_IncrementalMeta_AndFullLookup(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 10, BaseSeq: 10, Snapshot: []byte("full-10")}); err != nil {
+		t.Fatalf("SaveCheckpoint full-10: %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 15, BaseSeq: 10}); err != nil {
+		t.Fatalf("SaveCheckpoint inc-15: %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 20, BaseSeq: 20, Snapshot: []byte("full-20")}); err != nil {
+		t.Fatalf("SaveCheckpoint full-20: %v", err)
+	}
+
+	latest, err := w.LoadLatestCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if latest == nil || latest.Mode != "full" || latest.LastSeq != 20 {
+		t.Fatalf("expected latest full checkpoint seq=20, got %+v", latest)
+	}
+
+	// Create a newest incremental checkpoint and verify metadata decode.
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 25, BaseSeq: 20}); err != nil {
+		t.Fatalf("SaveCheckpoint inc-25: %v", err)
+	}
+	latest, err = w.LoadLatestCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint after inc: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected latest checkpoint")
+	}
+	if latest.Mode != "incremental" {
+		t.Fatalf("expected incremental mode, got %q", latest.Mode)
+	}
+	if latest.BaseSeq != 20 || latest.LastSeq != 25 {
+		t.Fatalf("expected incremental base=20 last=25, got %+v", latest)
+	}
+
+	fullBefore, err := w.LoadLatestFullCheckpointBefore(ctx, latest.BaseSeq)
+	if err != nil {
+		t.Fatalf("LoadLatestFullCheckpointBefore: %v", err)
+	}
+	if fullBefore == nil {
+		t.Fatalf("expected full checkpoint before seq=%d", latest.BaseSeq)
+	}
+	if fullBefore.LastSeq != 20 {
+		t.Fatalf("expected full checkpoint seq=20, got %d", fullBefore.LastSeq)
+	}
+}
+
+func TestSQLiteWAL_SaveCheckpoint_FullCompactsOldWALAndCheckpoints(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	for i := 1; i <= 5; i++ {
+		if err := w.Append(ctx, types.Batch{{Tuple: types.Tuple{"id": int64(i)}, Count: 1}}); err != nil {
+			t.Fatalf("Append #%d: %v", i, err)
+		}
+	}
+
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 2, BaseSeq: 2, Snapshot: []byte("full-2")}); err != nil {
+		t.Fatalf("SaveCheckpoint full-2: %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 3, BaseSeq: 2}); err != nil {
+		t.Fatalf("SaveCheckpoint inc-3: %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 4, BaseSeq: 4, Snapshot: []byte("full-4")}); err != nil {
+		t.Fatalf("SaveCheckpoint full-4: %v", err)
+	}
+
+	var cpCount int
+	if err := w.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM wal_checkpoints`).Scan(&cpCount); err != nil {
+		t.Fatalf("count wal_checkpoints: %v", err)
+	}
+	if cpCount != 1 {
+		t.Fatalf("expected only latest full checkpoint to remain after compaction, got %d", cpCount)
+	}
+
+	replayed := 0
+	if err := w.Replay(ctx, func(types.Batch) error {
+		replayed++
+		return nil
+	}); err != nil {
+		t.Fatalf("Replay after compaction: %v", err)
+	}
+	if replayed != 1 {
+		t.Fatalf("expected only seq>4 WAL batch to remain, got %d", replayed)
+	}
+}
+
+func TestSQLiteWAL_ResolveCheckpointSnapshot_IncrementalDelta(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	baseSnapshot := []byte("snapshot-A")
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 10, BaseSeq: 10, Snapshot: baseSnapshot}); err != nil {
+		t.Fatalf("SaveCheckpoint(full): %v", err)
+	}
+
+	targetSnapshot := []byte("snapshot-B")
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 12, BaseSeq: 10, Snapshot: targetSnapshot}); err != nil {
+		t.Fatalf("SaveCheckpoint(incremental): %v", err)
+	}
+
+	latest, err := w.LoadLatestCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected latest checkpoint")
+	}
+	if latest.Codec != sqliteCodecGraphIncDV1 {
+		t.Fatalf("expected incremental delta codec %q, got %q", sqliteCodecGraphIncDV1, latest.Codec)
+	}
+
+	resolvedSnapshot, afterSeq, err := w.ResolveCheckpointSnapshot(ctx, latest)
+	if err != nil {
+		t.Fatalf("ResolveCheckpointSnapshot: %v", err)
+	}
+	if string(resolvedSnapshot) != string(targetSnapshot) {
+		t.Fatalf("expected resolved snapshot %q, got %q", string(targetSnapshot), string(resolvedSnapshot))
+	}
+	if afterSeq != latest.LastSeq {
+		t.Fatalf("expected afterSeq=%d, got %d", latest.LastSeq, afterSeq)
+	}
+}
+
+func TestSQLiteWAL_ResolveCheckpointSnapshot_ChainedIncrementalDeltas(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 1, BaseSeq: 1, Snapshot: []byte("snap-1")}); err != nil {
+		t.Fatalf("SaveCheckpoint(full): %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 2, BaseSeq: 1, Snapshot: []byte("snap-2")}); err != nil {
+		t.Fatalf("SaveCheckpoint(inc-2): %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 3, BaseSeq: 2, Snapshot: []byte("snap-3")}); err != nil {
+		t.Fatalf("SaveCheckpoint(inc-3): %v", err)
+	}
+
+	latest, err := w.LoadLatestCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected latest checkpoint")
+	}
+	if latest.Mode != "incremental" || latest.BaseSeq != 2 {
+		t.Fatalf("expected chained incremental checkpoint with base_seq=2, got %+v", latest)
+	}
+
+	resolved, afterSeq, err := w.ResolveCheckpointSnapshot(ctx, latest)
+	if err != nil {
+		t.Fatalf("ResolveCheckpointSnapshot: %v", err)
+	}
+	if string(resolved) != "snap-3" {
+		t.Fatalf("expected resolved snapshot snap-3, got %q", string(resolved))
+	}
+	if afterSeq != 3 {
+		t.Fatalf("expected afterSeq=3, got %d", afterSeq)
+	}
+}
+
+func TestSQLiteWAL_LoadLatestCheckpoint_IncrementalCarriesMutations(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 5, BaseSeq: 5, Snapshot: []byte("snap-5")}); err != nil {
+		t.Fatalf("SaveCheckpoint(full): %v", err)
+	}
+
+	mutations := []CheckpointMutation{
+		{Type: "put", Key: []byte("join/L|R"), Value: []byte("payload-1")},
+		{Type: "delete", Key: []byte("group/K")},
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 6, BaseSeq: 5, Snapshot: []byte("snap-6"), Mutations: mutations}); err != nil {
+		t.Fatalf("SaveCheckpoint(incremental): %v", err)
+	}
+
+	latest, err := w.LoadLatestCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected latest checkpoint")
+	}
+	if len(latest.Mutations) != len(mutations) {
+		t.Fatalf("expected %d mutations, got %d", len(mutations), len(latest.Mutations))
+	}
+	if latest.Mutations[0].Type != "put" || string(latest.Mutations[0].Key) != "join/L|R" {
+		t.Fatalf("unexpected first mutation: %+v", latest.Mutations[0])
+	}
+	if latest.Mutations[1].Type != "delete" || string(latest.Mutations[1].Key) != "group/K" {
+		t.Fatalf("unexpected second mutation: %+v", latest.Mutations[1])
+	}
+}
+
+func TestSQLiteWAL_ResolveCheckpointSnapshotWithMutations_Chained(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 1, BaseSeq: 1, Snapshot: []byte("snap-1")}); err != nil {
+		t.Fatalf("SaveCheckpoint(full): %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 2, BaseSeq: 1, Snapshot: []byte("snap-2"), Mutations: []CheckpointMutation{{Type: "put", Key: []byte("k1"), Value: []byte("v1")}}}); err != nil {
+		t.Fatalf("SaveCheckpoint(inc-2): %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 3, BaseSeq: 2, Snapshot: []byte("snap-3"), Mutations: []CheckpointMutation{{Type: "delete", Key: []byte("k1")}}}); err != nil {
+		t.Fatalf("SaveCheckpoint(inc-3): %v", err)
+	}
+
+	latest, err := w.LoadLatestCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected latest checkpoint")
+	}
+
+	resolvedSnapshot, afterSeq, resolvedMutations, err := w.ResolveCheckpointSnapshotWithMutations(ctx, latest)
+	if err != nil {
+		t.Fatalf("ResolveCheckpointSnapshotWithMutations: %v", err)
+	}
+	if string(resolvedSnapshot) != "snap-3" {
+		t.Fatalf("expected resolved snapshot snap-3, got %q", string(resolvedSnapshot))
+	}
+	if afterSeq != 3 {
+		t.Fatalf("expected afterSeq=3, got %d", afterSeq)
+	}
+	if len(resolvedMutations) != 2 {
+		t.Fatalf("expected 2 resolved mutations, got %d", len(resolvedMutations))
+	}
+	if resolvedMutations[0].Type != "put" || string(resolvedMutations[0].Key) != "k1" {
+		t.Fatalf("unexpected resolved mutation[0]: %+v", resolvedMutations[0])
+	}
+	if resolvedMutations[1].Type != "delete" || string(resolvedMutations[1].Key) != "k1" {
+		t.Fatalf("unexpected resolved mutation[1]: %+v", resolvedMutations[1])
+	}
+}
+
+func TestSQLiteWAL_IncrementalChainDepth(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 1, BaseSeq: 1, Snapshot: []byte("snap-1")}); err != nil {
+		t.Fatalf("SaveCheckpoint(full-1): %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 2, BaseSeq: 1, Snapshot: []byte("snap-2")}); err != nil {
+		t.Fatalf("SaveCheckpoint(inc-2): %v", err)
+	}
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "incremental", LastSeq: 3, BaseSeq: 2, Snapshot: []byte("snap-3")}); err != nil {
+		t.Fatalf("SaveCheckpoint(inc-3): %v", err)
+	}
+
+	depth, err := w.IncrementalChainDepth(ctx, 3)
+	if err != nil {
+		t.Fatalf("IncrementalChainDepth: %v", err)
+	}
+	if depth != 2 {
+		t.Fatalf("expected incremental chain depth 2, got %d", depth)
+	}
+
+	if err := w.SaveCheckpoint(ctx, Checkpoint{Mode: "full", LastSeq: 4, BaseSeq: 4, Snapshot: []byte("snap-4")}); err != nil {
+		t.Fatalf("SaveCheckpoint(full-4): %v", err)
+	}
+	depth, err = w.IncrementalChainDepth(ctx, 4)
+	if err != nil {
+		t.Fatalf("IncrementalChainDepth after full: %v", err)
+	}
+	if depth != 0 {
+		t.Fatalf("expected incremental chain depth 0 after full checkpoint, got %d", depth)
+	}
+}
+
 func TestSQLiteWAL_RetentionTTL_PrunesOldRowsOnAppend(t *testing.T) {
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "wal.db")

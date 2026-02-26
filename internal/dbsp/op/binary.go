@@ -49,6 +49,11 @@ type BinaryOp struct {
 
 	// Now is used for TTL; defaults to time.Now when nil.
 	Now func() time.Time
+
+	// Optional backend-based join state storage (Unit 3).
+	// When nil, join state uses in-memory maps (existing behavior).
+	joinStateBackend StateBackend
+	joinStatePrefix  string
 }
 
 type binarySnapshotV1 struct {
@@ -231,6 +236,22 @@ func stableTupleKey(t types.Tuple) string {
 	return fmt.Sprintf("%#v", t)
 }
 
+func stableJoinKey(key any) string {
+	return stableAnyKey(key)
+}
+
+func (b *BinaryOp) SetJoinStateBackend(backend StateBackend, prefix string) {
+	b.joinStateBackend = backend
+	b.joinStatePrefix = prefix
+	if b.joinStatePrefix == "" {
+		b.joinStatePrefix = "join/default"
+	}
+}
+
+func (b *BinaryOp) joinBackendEnabled() bool {
+	return b != nil && b.Type == BinaryJoin && b.joinStateBackend != nil
+}
+
 func (b *BinaryOp) applyDeltaToJoinState(state map[any]joinBucket, key any, td types.TupleDelta, now time.Time) error {
 	bucket, ok := state[key]
 	if !ok {
@@ -323,8 +344,299 @@ func (b *BinaryOp) evictExpiredJoinState(now time.Time) (types.Batch, error) {
 	return out, nil
 }
 
+func (b *BinaryOp) joinBackendBucketKey(side, encodedJoinKey string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s", b.joinStatePrefix, side, encodedJoinKey))
+}
+
+func encodeJoinBucket(bucket joinBucket) ([]byte, error) {
+	m := make(map[string]binaryJoinEntryV1, len(bucket))
+	for tk, entry := range bucket {
+		if entry == nil {
+			continue
+		}
+		m[tk] = binaryJoinEntryV1{Tuple: cloneTupleLocal(entry.tuple), Count: entry.count, ExpiresAt: entry.expiresAt}
+	}
+	return json.Marshal(m)
+}
+
+func decodeJoinBucket(payload []byte) (joinBucket, error) {
+	if len(payload) == 0 {
+		return make(joinBucket), nil
+	}
+	var m map[string]binaryJoinEntryV1
+	if err := json.Unmarshal(payload, &m); err != nil {
+		return nil, err
+	}
+	bucket := make(joinBucket, len(m))
+	for tk, entry := range m {
+		bucket[tk] = &joinEntry{tuple: cloneTupleLocal(entry.Tuple), count: entry.Count, expiresAt: entry.ExpiresAt}
+	}
+	return bucket, nil
+}
+
+func (b *BinaryOp) loadJoinBucket(side, encodedJoinKey string) (joinBucket, error) {
+	payload, ok, err := b.joinStateBackend.Get(b.joinBackendBucketKey(side, encodedJoinKey))
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return make(joinBucket), nil
+	}
+	return decodeJoinBucket(payload)
+}
+
+func (b *BinaryOp) saveJoinBucket(side, encodedJoinKey string, bucket joinBucket) error {
+	key := b.joinBackendBucketKey(side, encodedJoinKey)
+	if len(bucket) == 0 {
+		return b.joinStateBackend.Delete(key)
+	}
+	payload, err := encodeJoinBucket(bucket)
+	if err != nil {
+		return err
+	}
+	return b.joinStateBackend.Put(key, payload)
+}
+
+func (b *BinaryOp) listJoinBuckets(side string) ([]struct {
+	keyEncoded string
+	bucket     joinBucket
+}, error) {
+	prefix := []byte(fmt.Sprintf("%s/%s/", b.joinStatePrefix, side))
+	rows := make([]struct {
+		keyEncoded string
+		bucket     joinBucket
+	}, 0)
+	err := b.joinStateBackend.IterPrefix(prefix, func(key, value []byte) error {
+		s := string(key)
+		if len(s) <= len(string(prefix)) {
+			return nil
+		}
+		enc := s[len(prefix):]
+		bucket, err := decodeJoinBucket(value)
+		if err != nil {
+			return fmt.Errorf("decode join bucket (%s): %w", s, err)
+		}
+		rows = append(rows, struct {
+			keyEncoded string
+			bucket     joinBucket
+		}{keyEncoded: enc, bucket: bucket})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (b *BinaryOp) applyDeltaToJoinBucket(bucket joinBucket, encodedKey string, td types.TupleDelta, now time.Time) (joinBucket, error) {
+	if bucket == nil {
+		bucket = make(joinBucket)
+	}
+	tk := stableTupleKey(td.Tuple)
+	entry, ok := bucket[tk]
+	if !ok {
+		if td.Count < 0 {
+			return nil, fmt.Errorf("join state underflow for key=%s tuple=%v count=%d", encodedKey, td.Tuple, td.Count)
+		}
+		entry = &joinEntry{tuple: td.Tuple}
+		bucket[tk] = entry
+	}
+
+	entry.count += td.Count
+	if entry.count == 0 {
+		delete(bucket, tk)
+		return bucket, nil
+	}
+	if entry.count < 0 {
+		return nil, fmt.Errorf("join state underflow for key=%s tuple=%v resultingCount=%d", encodedKey, td.Tuple, entry.count)
+	}
+
+	entry.tuple = td.Tuple
+	if b.JoinTTL > 0 && td.Count > 0 {
+		entry.expiresAt = now.Add(b.JoinTTL)
+	}
+	return bucket, nil
+}
+
+func (b *BinaryOp) evictExpiredJoinStateBackend(now time.Time) (types.Batch, error) {
+	if b.JoinTTL <= 0 {
+		return nil, nil
+	}
+	var out types.Batch
+
+	leftRows, err := b.listJoinBuckets("left")
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range leftRows {
+		leftBucket := row.bucket
+		rightBucket, err := b.loadJoinBucket("right", row.keyEncoded)
+		if err != nil {
+			return nil, err
+		}
+		for tk, le := range leftBucket {
+			if le.expiresAt.IsZero() || now.Before(le.expiresAt) {
+				continue
+			}
+			for _, re := range rightBucket {
+				count := -(le.count * re.count)
+				if count != 0 {
+					out = append(out, types.TupleDelta{Tuple: b.CombineFn(le.tuple, re.tuple), Count: count})
+				}
+			}
+			delete(leftBucket, tk)
+		}
+		if err := b.saveJoinBucket("left", row.keyEncoded, leftBucket); err != nil {
+			return nil, err
+		}
+	}
+
+	rightRows, err := b.listJoinBuckets("right")
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rightRows {
+		rightBucket := row.bucket
+		leftBucket, err := b.loadJoinBucket("left", row.keyEncoded)
+		if err != nil {
+			return nil, err
+		}
+		for tk, re := range rightBucket {
+			if re.expiresAt.IsZero() || now.Before(re.expiresAt) {
+				continue
+			}
+			for _, le := range leftBucket {
+				count := -(le.count * re.count)
+				if count != 0 {
+					out = append(out, types.TupleDelta{Tuple: b.CombineFn(le.tuple, re.tuple), Count: count})
+				}
+			}
+			delete(rightBucket, tk)
+		}
+		if err := b.saveJoinBucket("right", row.keyEncoded, rightBucket); err != nil {
+			return nil, err
+		}
+	}
+
+	return out, nil
+}
+
+func (b *BinaryOp) applyJoinWithBackend(leftDelta, rightDelta types.Batch) (types.Batch, error) {
+	var out types.Batch
+	now := b.now()
+
+	if b.JoinTTL > 0 {
+		evicted, err := b.evictExpiredJoinStateBackend(now)
+		if err != nil {
+			return nil, err
+		}
+		if len(evicted) > 0 {
+			out = append(out, evicted...)
+		}
+	}
+
+	for _, ld := range leftDelta {
+		leftKey := b.LeftKeyFn(ld.Tuple)
+		if leftKey == nil {
+			continue
+		}
+		rightBucket, err := b.loadJoinBucket("right", stableJoinKey(leftKey))
+		if err != nil {
+			return nil, err
+		}
+		for _, re := range rightBucket {
+			count := ld.Count * re.count
+			if count != 0 {
+				out = append(out, types.TupleDelta{Tuple: b.CombineFn(ld.Tuple, re.tuple), Count: count})
+			}
+		}
+	}
+
+	for _, rd := range rightDelta {
+		rightKey := b.RightKeyFn(rd.Tuple)
+		if rightKey == nil {
+			continue
+		}
+		leftBucket, err := b.loadJoinBucket("left", stableJoinKey(rightKey))
+		if err != nil {
+			return nil, err
+		}
+		for _, le := range leftBucket {
+			count := le.count * rd.Count
+			if count != 0 {
+				out = append(out, types.TupleDelta{Tuple: b.CombineFn(le.tuple, rd.Tuple), Count: count})
+			}
+		}
+	}
+
+	rightByKey := make(map[string][]types.TupleDelta)
+	for _, rd := range rightDelta {
+		k := b.RightKeyFn(rd.Tuple)
+		if k == nil {
+			continue
+		}
+		rightByKey[stableJoinKey(k)] = append(rightByKey[stableJoinKey(k)], rd)
+	}
+	for _, ld := range leftDelta {
+		k := b.LeftKeyFn(ld.Tuple)
+		if k == nil {
+			continue
+		}
+		enc := stableJoinKey(k)
+		for _, rd := range rightByKey[enc] {
+			count := ld.Count * rd.Count
+			if count != 0 {
+				out = append(out, types.TupleDelta{Tuple: b.CombineFn(ld.Tuple, rd.Tuple), Count: count})
+			}
+		}
+	}
+
+	for _, ld := range leftDelta {
+		k := b.LeftKeyFn(ld.Tuple)
+		if k == nil {
+			continue
+		}
+		enc := stableJoinKey(k)
+		bucket, err := b.loadJoinBucket("left", enc)
+		if err != nil {
+			return nil, err
+		}
+		bucket, err = b.applyDeltaToJoinBucket(bucket, enc, ld, now)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.saveJoinBucket("left", enc, bucket); err != nil {
+			return nil, err
+		}
+	}
+	for _, rd := range rightDelta {
+		k := b.RightKeyFn(rd.Tuple)
+		if k == nil {
+			continue
+		}
+		enc := stableJoinKey(k)
+		bucket, err := b.loadJoinBucket("right", enc)
+		if err != nil {
+			return nil, err
+		}
+		bucket, err = b.applyDeltaToJoinBucket(bucket, enc, rd, now)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.saveJoinBucket("right", enc, bucket); err != nil {
+			return nil, err
+		}
+	}
+
+	return out, nil
+}
+
 // applyJoin implements incremental join: ΔJoin = (ΔR⋈S) + (R⋈ΔS) + (ΔR⋈ΔS)
 func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, error) {
+	if b.joinBackendEnabled() {
+		return b.applyJoinWithBackend(leftDelta, rightDelta)
+	}
+
 	var out types.Batch
 
 	now := b.now()

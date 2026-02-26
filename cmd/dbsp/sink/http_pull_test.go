@@ -165,8 +165,8 @@ func TestHTTPPullSink_DiskSpill(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 2. Verify File Creation (filename is just "10.parquet" for id=10)
-	expectedFile := filepath.Join(tmpDir, "10.parquet")
+	// 2. Verify File Creation (Hive-style path)
+	expectedFile := filepath.Join(tmpDir, "id=10", "snapshot.parquet")
 	if _, err := os.Stat(expectedFile); os.IsNotExist(err) {
 		t.Errorf("expected file %s was not created", expectedFile)
 	}
@@ -187,6 +187,49 @@ func TestHTTPPullSink_DiskSpill(t *testing.T) {
 	}
 	if info.Size() == 0 {
 		t.Errorf("file %s is empty", expectedFile)
+	}
+}
+
+func TestHTTPPullSink_DiskSpill_CompositeKeyHivePath(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "dbsp-spill-composite-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	port := 9096
+	path := "/snapshot"
+	cfg := map[string]interface{}{
+		"port":            port,
+		"path":            path,
+		"disk_spill_path": tmpDir,
+	}
+
+	partitionBy := []string{"tenant_id", "region"}
+	schema := &config.ParquetSchema{
+		Columns: []config.ParquetColumn{
+			{Name: "tenant_id", Type: "int64"},
+			{Name: "region", Type: "string"},
+			{Name: "value", Type: "string"},
+		},
+	}
+
+	s, err := NewHTTPPullSink(cfg, partitionBy, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	batch := types.Batch{
+		{Tuple: types.Tuple{"tenant_id": int64(7), "region": "AP", "value": "v"}, Count: 1},
+	}
+	if err := s.WriteBatch(batch); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedFile := filepath.Join(tmpDir, "tenant_id=7", "region=AP", "snapshot.parquet")
+	if _, err := os.Stat(expectedFile); os.IsNotExist(err) {
+		t.Fatalf("expected file %s was not created", expectedFile)
 	}
 }
 

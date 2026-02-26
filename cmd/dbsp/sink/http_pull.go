@@ -124,11 +124,10 @@ func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
 }
 
 func (s *HTTPPullSink) persistPartition(pk string, store *op.ZSetStore) error {
-	// Clean filename from partition key
-	// If it's JSON, it might have characters we don't want.
-	// For now, assume it's simple or handle carefully.
-	filename := fmt.Sprintf("%s.parquet", pk)
-	path := filepath.Join(s.cfg.DiskSpillPath, filename)
+	path := s.partitionSpillPath(pk)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
 
 	f, err := os.Create(path)
 	if err != nil {
@@ -158,6 +157,27 @@ func (s *HTTPPullSink) persistPartition(pk string, store *op.ZSetStore) error {
 	defer rec.Release()
 
 	return fw.Write(rec)
+}
+
+func (s *HTTPPullSink) partitionSpillPath(pk string) string {
+	if len(s.partitionBy) == 0 {
+		return filepath.Join(s.cfg.DiskSpillPath, "default.parquet")
+	}
+
+	values := make(map[string]string, len(s.partitionBy))
+	if len(s.partitionBy) == 1 {
+		values[s.partitionBy[0]] = pk
+	} else {
+		var parsed map[string]string
+		if err := json.Unmarshal([]byte(pk), &parsed); err == nil {
+			for _, key := range s.partitionBy {
+				values[key] = parsed[key]
+			}
+		}
+	}
+
+	baseFilePath := filepath.Join(s.cfg.DiskSpillPath, "snapshot.parquet")
+	return config.BuildHivePartitionPath(baseFilePath, s.partitionBy, values)
 }
 
 func (s *HTTPPullSink) getPartitionKey(t types.Tuple) string {

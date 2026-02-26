@@ -2,6 +2,14 @@ pipeline:
   wal:
     enabled: true
     path: /tmp/dbsp-wal.db
+    checkpoint_every_batches: 1
+  state_backend:
+    enabled: true
+    type: kv
+    path: /tmp/dbsp-state.db
+    checkpoint_mode: incremental
+    checkpoint_every_batches: 100
+    max_incremental_mutation_bytes: 1048576
   source:
     type: csv
     config:

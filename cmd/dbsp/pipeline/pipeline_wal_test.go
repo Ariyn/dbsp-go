@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -15,6 +16,25 @@ type countingSink struct {
 	mu         sync.Mutex
 	writeCalls int
 }
+
+type failOnceSink struct {
+	mu        sync.Mutex
+	failed    bool
+	writeCalls int
+}
+
+func (s *failOnceSink) WriteBatch(types.Batch) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writeCalls++
+	if !s.failed {
+		s.failed = true
+		return fmt.Errorf("injected sink failure")
+	}
+	return nil
+}
+
+func (s *failOnceSink) Close() error { return nil }
 
 func (s *countingSink) WriteBatch(types.Batch) error {
 	s.mu.Lock()
@@ -112,6 +132,85 @@ type testSnapshotter struct {
 	restoreCalls int
 }
 
+type policySnapshotter struct {
+	*testSnapshotter
+	mode     string
+	fullEvery int
+	maxMutationBytes int
+}
+
+func (p *policySnapshotter) CheckpointMode() string { return p.mode }
+func (p *policySnapshotter) FullSnapshotEvery() int { return p.fullEvery }
+func (p *policySnapshotter) MaxIncrementalMutationBytes() int { return p.maxMutationBytes }
+
+type mutationPolicySnapshotter struct {
+	*policySnapshotter
+	mu              sync.Mutex
+	mutations       []wal.CheckpointMutation
+	rolledBack      []wal.CheckpointMutation
+	rollbackInvoked int
+}
+
+func (m *mutationPolicySnapshotter) DrainCheckpointMutations() []wal.CheckpointMutation {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := append([]wal.CheckpointMutation(nil), m.mutations...)
+	m.mutations = nil
+	return out
+}
+
+func (m *mutationPolicySnapshotter) RollbackCheckpointMutations(in []wal.CheckpointMutation) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rollbackInvoked++
+	m.rolledBack = append(m.rolledBack, in...)
+	m.mutations = append(in, m.mutations...)
+}
+
+func (m *mutationPolicySnapshotter) RollbackCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rollbackInvoked
+}
+
+func (m *mutationPolicySnapshotter) RolledBackMutations() []wal.CheckpointMutation {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]wal.CheckpointMutation(nil), m.rolledBack...)
+}
+
+type failingCheckpointWAL struct {
+	inner wal.SQLiteWAL
+	fail  bool
+}
+
+func (f *failingCheckpointWAL) Append(ctx context.Context, batch types.Batch) error {
+	return f.inner.Append(ctx, batch)
+}
+
+func (f *failingCheckpointWAL) Replay(ctx context.Context, apply func(types.Batch) error) error {
+	return f.inner.Replay(ctx, apply)
+}
+
+func (f *failingCheckpointWAL) ReplayFrom(ctx context.Context, afterSeq int64, apply func(types.Batch) error) error {
+	return f.inner.ReplayFrom(ctx, afterSeq, apply)
+}
+
+func (f *failingCheckpointWAL) MaxSeq(ctx context.Context) (int64, error) {
+	return f.inner.MaxSeq(ctx)
+}
+
+func (f *failingCheckpointWAL) LoadLatestCheckpoint(ctx context.Context) (*wal.Checkpoint, error) {
+	return f.inner.LoadLatestCheckpoint(ctx)
+}
+
+func (f *failingCheckpointWAL) SaveCheckpoint(ctx context.Context, cp wal.Checkpoint) error {
+	if f.fail {
+		return fmt.Errorf("injected checkpoint save failure")
+	}
+	return f.inner.SaveCheckpoint(ctx, cp)
+}
+
 func (t *testSnapshotter) Snapshot() ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -187,5 +286,293 @@ func TestRunPipeline_WAL_Checkpoint_RestoreAndSuffixReplay(t *testing.T) {
 	}
 	if sink.Calls() != 0 {
 		t.Fatalf("expected sink to not be written during replay, got %d", sink.Calls())
+	}
+}
+
+func TestRunPipeline_WAL_Checkpoint_IncrementalMode_RestoresFromLatestFull(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := wal.NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	batches := []types.Batch{
+		{{Tuple: types.Tuple{"id": int64(1)}, Count: 1}},
+		{{Tuple: types.Tuple{"id": int64(2)}, Count: 1}},
+		{{Tuple: types.Tuple{"id": int64(3)}, Count: 1}},
+	}
+
+	sink := &countingSink{}
+	baseSnap := &testSnapshotter{snapshot: []byte("snap")}
+	policySnap := &policySnapshotter{testSnapshotter: baseSnap, mode: "incremental", fullEvery: 100}
+
+	execute := func(b types.Batch) (types.Batch, error) { return b, nil }
+	if err := RunPipeline(ctx, testutil.NewSliceSource(batches), sink, execute, w, policySnap, 1); err != nil {
+		t.Fatalf("RunPipeline(incremental mode): %v", err)
+	}
+
+	latest, err := w.LoadLatestCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected latest checkpoint")
+	}
+	if latest.Mode != "incremental" {
+		t.Fatalf("expected latest checkpoint mode incremental, got %q", latest.Mode)
+	}
+	if latest.BaseSeq != 2 {
+		t.Fatalf("expected chained incremental base seq=2, got %d", latest.BaseSeq)
+	}
+
+	recoverySnap := &policySnapshotter{testSnapshotter: &testSnapshotter{}, mode: "incremental", fullEvery: 2}
+	replayExecCalls := 0
+	if err := RunPipeline(ctx, testutil.NewSliceSource(nil), &countingSink{}, func(b types.Batch) (types.Batch, error) {
+		replayExecCalls++
+		return b, nil
+	}, w, recoverySnap, 0); err != nil {
+		t.Fatalf("RunPipeline(recovery): %v", err)
+	}
+
+	if recoverySnap.RestoreCalls() != 1 {
+		t.Fatalf("expected one snapshot restore from latest full checkpoint, got %d", recoverySnap.RestoreCalls())
+	}
+	if replayExecCalls != 0 {
+		t.Fatalf("expected no suffix replay call after delta restore, got %d", replayExecCalls)
+	}
+}
+
+func TestRunPipeline_WAL_Checkpoint_IncrementalMode_AutoCompactsLongChainToFull(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := wal.NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	batches := make([]types.Batch, 12)
+	for i := range batches {
+		batches[i] = types.Batch{{Tuple: types.Tuple{"id": int64(i + 1)}, Count: 1}}
+	}
+
+	policySnap := &policySnapshotter{
+		testSnapshotter: &testSnapshotter{snapshot: []byte("snap")},
+		mode:            "incremental",
+		fullEvery:       1000,
+	}
+
+	if err := RunPipeline(ctx, testutil.NewSliceSource(batches), &countingSink{}, func(b types.Batch) (types.Batch, error) {
+		return b, nil
+	}, w, policySnap, 1); err != nil {
+		t.Fatalf("RunPipeline: %v", err)
+	}
+
+	latest, err := w.LoadLatestCheckpoint(ctx)
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected latest checkpoint")
+	}
+	full, err := w.LoadLatestFullCheckpointBefore(ctx, latest.LastSeq)
+	if err != nil {
+		t.Fatalf("LoadLatestFullCheckpointBefore: %v", err)
+	}
+	if full == nil {
+		t.Fatalf("expected at least one full checkpoint after auto compaction")
+	}
+	if full.LastSeq < 10 {
+		t.Fatalf("expected auto-generated full checkpoint near chain threshold, got seq=%d", full.LastSeq)
+	}
+}
+
+func TestRunPipeline_WAL_CheckpointSaveFailure_RollsBackDrainedMutations(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	innerWAL, err := wal.NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer innerWAL.Close()
+
+	w := &failingCheckpointWAL{inner: *innerWAL, fail: true}
+
+	snapshotter := &mutationPolicySnapshotter{
+		policySnapshotter: &policySnapshotter{
+			testSnapshotter: &testSnapshotter{snapshot: []byte("snap")},
+			mode:            "incremental",
+			fullEvery:       100,
+		},
+		mutations: []wal.CheckpointMutation{{Type: "put", Key: []byte("k1"), Value: []byte("v1")}},
+	}
+
+	err = RunPipeline(
+		context.Background(),
+		testutil.NewSliceSource([]types.Batch{{{Tuple: types.Tuple{"id": int64(1)}, Count: 1}}}),
+		&countingSink{},
+		func(b types.Batch) (types.Batch, error) { return b, nil },
+		w,
+		snapshotter,
+		1,
+	)
+	if err == nil {
+		t.Fatalf("expected checkpoint save failure")
+	}
+
+	if snapshotter.RollbackCount() != 1 {
+		t.Fatalf("expected rollback callback once, got %d", snapshotter.RollbackCount())
+	}
+	rolledBack := snapshotter.RolledBackMutations()
+	if len(rolledBack) != 1 {
+		t.Fatalf("expected 1 rolled back mutation, got %d", len(rolledBack))
+	}
+	if rolledBack[0].Type != "put" || string(rolledBack[0].Key) != "k1" {
+		t.Fatalf("unexpected rolled back mutation: %+v", rolledBack[0])
+	}
+}
+
+func TestRunPipeline_WAL_CheckpointBoundary_ExecuteFailure_DoesNotAdvanceCheckpoint(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := wal.NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	snap := &testSnapshotter{snapshot: []byte("snap")}
+	err = RunPipeline(
+		context.Background(),
+		testutil.NewSliceSource([]types.Batch{{{Tuple: types.Tuple{"id": int64(1)}, Count: 1}}}),
+		&countingSink{},
+		func(types.Batch) (types.Batch, error) { return nil, fmt.Errorf("injected execute failure") },
+		w,
+		snap,
+		1,
+	)
+	if err == nil {
+		t.Fatalf("expected execute failure")
+	}
+
+	cp, err := w.LoadLatestCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if cp != nil {
+		t.Fatalf("expected no checkpoint persisted on execute failure, got %+v", cp)
+	}
+
+	replayExecCalls := 0
+	if err := RunPipeline(context.Background(), testutil.NewSliceSource(nil), &countingSink{}, func(b types.Batch) (types.Batch, error) {
+		replayExecCalls++
+		return b, nil
+	}, w, nil, 0); err != nil {
+		t.Fatalf("RunPipeline(replay): %v", err)
+	}
+	if replayExecCalls != 1 {
+		t.Fatalf("expected one replayed batch after execute failure, got %d", replayExecCalls)
+	}
+}
+
+func TestRunPipeline_WAL_CheckpointBoundary_SinkFailure_DoesNotAdvanceCheckpoint(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := wal.NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	sink := &failOnceSink{}
+	err = RunPipeline(
+		context.Background(),
+		testutil.NewSliceSource([]types.Batch{{{Tuple: types.Tuple{"id": int64(1)}, Count: 1}}}),
+		sink,
+		func(b types.Batch) (types.Batch, error) { return b, nil },
+		w,
+		&testSnapshotter{snapshot: []byte("snap")},
+		1,
+	)
+	if err == nil {
+		t.Fatalf("expected sink failure")
+	}
+
+	cp, err := w.LoadLatestCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if cp != nil {
+		t.Fatalf("expected no checkpoint persisted on sink failure, got %+v", cp)
+	}
+
+	replayExecCalls := 0
+	if err := RunPipeline(context.Background(), testutil.NewSliceSource(nil), &countingSink{}, func(b types.Batch) (types.Batch, error) {
+		replayExecCalls++
+		return b, nil
+	}, w, nil, 0); err != nil {
+		t.Fatalf("RunPipeline(replay): %v", err)
+	}
+	if replayExecCalls != 1 {
+		t.Fatalf("expected one replayed batch after sink failure, got %d", replayExecCalls)
+	}
+}
+
+func TestRunPipeline_WAL_Checkpoint_IncrementalMode_ForceFullOnLargeMutationPayload(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	w, err := wal.NewSQLiteWAL(dbPath)
+	if err != nil {
+		t.Fatalf("NewSQLiteWAL: %v", err)
+	}
+	defer w.Close()
+
+	largeValue := make([]byte, 128)
+	for index := range largeValue {
+		largeValue[index] = 'x'
+	}
+
+	snapshotter := &mutationPolicySnapshotter{
+		policySnapshotter: &policySnapshotter{
+			testSnapshotter: &testSnapshotter{snapshot: []byte("snap")},
+			mode:            "incremental",
+			fullEvery:       100,
+			maxMutationBytes: 64,
+		},
+		mutations: []wal.CheckpointMutation{{Type: "put", Key: []byte("k1"), Value: largeValue}},
+	}
+
+	err = RunPipeline(
+		context.Background(),
+		testutil.NewSliceSource([]types.Batch{{{Tuple: types.Tuple{"id": int64(1)}, Count: 1}}}),
+		&countingSink{},
+		func(b types.Batch) (types.Batch, error) { return b, nil },
+		w,
+		snapshotter,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("RunPipeline: %v", err)
+	}
+
+	latest, err := w.LoadLatestCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("LoadLatestCheckpoint: %v", err)
+	}
+	if latest == nil {
+		t.Fatalf("expected latest checkpoint")
+	}
+	if latest.Mode != "full" {
+		t.Fatalf("expected forced full checkpoint, got mode=%q", latest.Mode)
 	}
 }

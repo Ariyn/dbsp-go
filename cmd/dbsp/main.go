@@ -31,6 +31,7 @@ type partitionRuntime struct {
 	rootNode    *op.Node
 	sink        provider.Sink
 	wal         *wal.SQLiteWAL
+	state       op.StateBackend
 	snapshotter pipeline.PipelineSnapshotter
 	batchCount  int
 }
@@ -267,14 +268,59 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig, partitio
 		fmt.Printf("WAL enabled: sqlite=%s\n", walPath)
 	}
 
+	var stateBackend op.StateBackend
+	var mutationTracker op.StateMutationTracker
+	if cfg.Pipeline.State.Enabled {
+		statePath := cfg.Pipeline.State.Path
+		if cfg.Pipeline.Partition.Enabled && len(partitionValues) > 0 && strings.TrimSpace(statePath) != "" {
+			statePath = config.BuildHivePartitionPath(statePath, cfg.Pipeline.Partition.Keys, partitionValues)
+		}
+		baseStateBackend, stateErr := op.NewStateBackendFromConfig(true, cfg.Pipeline.State.Type, statePath)
+		if stateErr != nil {
+			err = stateErr
+		} else {
+			tracked := op.NewMutationTrackingStateBackend(baseStateBackend)
+			stateBackend = tracked
+			mutationTracker = tracked
+		}
+		if err != nil {
+			return fmt.Errorf("initializing state backend: %w", err)
+		}
+		joinAttached := op.AttachJoinStateBackend(rootNode, stateBackend)
+		groupAttached := op.AttachGroupAggStateBackend(rootNode, stateBackend)
+		windowAttached := op.AttachWindowAggStateBackend(rootNode, stateBackend)
+		defer stateBackend.Close()
+		fmt.Printf("State backend enabled: type=%s path=%s join_ops=%d groupagg_ops=%d windowagg_ops=%d\n", cfg.Pipeline.State.Type, statePath, joinAttached, groupAttached, windowAttached)
+	}
+
 	// 5. Run Pipeline
 	fmt.Println("Starting pipeline...")
 	err = pipeline.RunPipeline(ctx, src, snk, func(batch types.Batch) (types.Batch, error) {
 		return op.Execute(rootNode, batch)
 	}, writeAheadLog,
 		pipeline.PipelineSnapshotterFunc{
-			SnapFunc:    func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
-			RestoreFunc: func(b []byte) error { return op.RestoreGraph(rootNode, b) },
+			SnapFunc:                 func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
+			RestoreFunc:              func(b []byte) error { return op.RestoreGraph(rootNode, b) },
+			DrainCheckpointMutationsFunc: func() []walpkg.CheckpointMutation {
+				if mutationTracker == nil {
+					return nil
+				}
+				drained := mutationTracker.DrainMutations()
+				mutations := checkpointMutationsFromStateOps(drained)
+				if len(mutations) > 0 {
+					fmt.Printf("State mutation changelog drained for checkpoint: ops=%d\n", len(mutations))
+				}
+				return mutations
+			},
+			ApplyCheckpointMutationsFunc: func(mutations []walpkg.CheckpointMutation) error {
+				return applyCheckpointMutationsToStateBackend(stateBackend, mutations)
+			},
+			RollbackCheckpointMutationsFunc: func(mutations []walpkg.CheckpointMutation) {
+				restoreCheckpointMutationsToTracker(mutationTracker, mutations)
+			},
+			Mode:                     strings.ToLower(strings.TrimSpace(cfg.Pipeline.State.CheckpointMode)),
+			FullSnapshotEveryBatches: cfg.Pipeline.State.CheckpointEveryBatches,
+			MaxIncrementalMutationBytesVal: cfg.Pipeline.State.MaxIncrementalMutationBytes,
 		},
 		cfg.Pipeline.WAL.CheckpointEveryBatches,
 	)
@@ -375,14 +421,62 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 		}
 	}
 
+	var stateBackend op.StateBackend
+	var mutationTracker op.StateMutationTracker
+	if cfg.Pipeline.State.Enabled {
+		statePath := cfg.Pipeline.State.Path
+		if strings.TrimSpace(statePath) != "" {
+			statePath = config.BuildHivePartitionPath(statePath, cfg.Pipeline.Partition.Keys, partitionValues)
+		}
+		baseStateBackend, stateErr := op.NewStateBackendFromConfig(true, cfg.Pipeline.State.Type, statePath)
+		if stateErr != nil {
+			err = stateErr
+		} else {
+			tracked := op.NewMutationTrackingStateBackend(baseStateBackend)
+			stateBackend = tracked
+			mutationTracker = tracked
+		}
+		if err != nil {
+			if writeAheadLog != nil {
+				_ = writeAheadLog.Close()
+			}
+			_ = snk.Close()
+			return nil, fmt.Errorf("initializing state backend: %w", err)
+		}
+		op.AttachJoinStateBackend(rootNode, stateBackend)
+		op.AttachGroupAggStateBackend(rootNode, stateBackend)
+		op.AttachWindowAggStateBackend(rootNode, stateBackend)
+	}
+
 	rt := &partitionRuntime{
 		values:   partitionValues,
 		rootNode: rootNode,
 		sink:     snk,
 		wal:      writeAheadLog,
+		state:    stateBackend,
 		snapshotter: pipeline.PipelineSnapshotterFunc{
-			SnapFunc:    func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
-			RestoreFunc: func(b []byte) error { return op.RestoreGraph(rootNode, b) },
+			SnapFunc:                 func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
+			RestoreFunc:              func(b []byte) error { return op.RestoreGraph(rootNode, b) },
+			DrainCheckpointMutationsFunc: func() []walpkg.CheckpointMutation {
+				if mutationTracker == nil {
+					return nil
+				}
+				drained := mutationTracker.DrainMutations()
+				mutations := checkpointMutationsFromStateOps(drained)
+				if len(mutations) > 0 {
+					fmt.Printf("State mutation changelog drained for checkpoint: ops=%d\n", len(mutations))
+				}
+				return mutations
+			},
+			ApplyCheckpointMutationsFunc: func(mutations []walpkg.CheckpointMutation) error {
+				return applyCheckpointMutationsToStateBackend(stateBackend, mutations)
+			},
+			RollbackCheckpointMutationsFunc: func(mutations []walpkg.CheckpointMutation) {
+				restoreCheckpointMutationsToTracker(mutationTracker, mutations)
+			},
+			Mode:                     strings.ToLower(strings.TrimSpace(cfg.Pipeline.State.CheckpointMode)),
+			FullSnapshotEveryBatches: cfg.Pipeline.State.CheckpointEveryBatches,
+			MaxIncrementalMutationBytesVal: cfg.Pipeline.State.MaxIncrementalMutationBytes,
 		},
 	}
 	if err := replayRuntime(context.Background(), rt); err != nil {
@@ -431,27 +525,122 @@ func runPartitionBatch(ctx context.Context, cfg *config.PipelineConfig, rt *part
 		}
 	}
 
-	if rt.wal != nil && rt.snapshotter != nil && cfg.Pipeline.WAL.CheckpointEveryBatches > 0 && (rt.batchCount%cfg.Pipeline.WAL.CheckpointEveryBatches) == 0 {
-		if cwal, ok := any(rt.wal).(pipeline.CheckpointWAL); ok {
-			snap, err := rt.snapshotter.Snapshot()
-			if err != nil {
-				return err
-			}
-			maxSeq, err := cwal.MaxSeq(ctx)
-			if err != nil {
-				return err
-			}
-			if err := cwal.SaveCheckpoint(ctx, walpkg.Checkpoint{LastSeq: maxSeq, Snapshot: snap}); err != nil {
-				return err
-			}
-		}
-	}
-
 	resultBatch, err := op.Execute(rt.rootNode, batch)
 	if err != nil {
 		return err
 	}
-	return rt.sink.WriteBatch(resultBatch)
+	if err := rt.sink.WriteBatch(resultBatch); err != nil {
+		return err
+	}
+
+	if rt.wal != nil && rt.snapshotter != nil && cfg.Pipeline.WAL.CheckpointEveryBatches > 0 && (rt.batchCount%cfg.Pipeline.WAL.CheckpointEveryBatches) == 0 {
+		if cwal, ok := any(rt.wal).(pipeline.CheckpointWAL); ok {
+			hook, hasHook := any(rt.snapshotter).(pipeline.CheckpointHookProvider)
+			mutationProvider, hasMutationProvider := any(rt.snapshotter).(pipeline.CheckpointMutationProvider)
+			mutationRollbackProvider, hasMutationRollbackProvider := any(rt.snapshotter).(pipeline.CheckpointMutationRollbackProvider)
+			maxSeq, err := cwal.MaxSeq(ctx)
+			if err != nil {
+				return err
+			}
+			mode := strings.ToLower(strings.TrimSpace(cfg.Pipeline.State.CheckpointMode))
+			fullEvery := cfg.Pipeline.State.CheckpointEveryBatches
+			maxMutationBytes := cfg.Pipeline.State.MaxIncrementalMutationBytes
+			if maxMutationBytes <= 0 {
+				maxMutationBytes = 1 << 20
+			}
+			if fullEvery <= 0 {
+				fullEvery = cfg.Pipeline.WAL.CheckpointEveryBatches
+			}
+
+			if mode == "incremental" {
+				checkpointMutations := []walpkg.CheckpointMutation(nil)
+				if hasMutationProvider {
+					checkpointMutations = mutationProvider.DrainCheckpointMutations()
+				}
+				cp, err := cwal.LoadLatestCheckpoint(ctx)
+				if err != nil {
+					return err
+				}
+				lastFullSeq := int64(0)
+				lastCheckpointSeq := int64(0)
+				if cp != nil {
+					lastCheckpointSeq = cp.LastSeq
+					if cp.Mode == "full" {
+						lastFullSeq = cp.LastSeq
+					} else {
+						lastFullSeq = cp.BaseSeq
+					}
+				}
+
+				forceFull := false
+				if depthProvider, ok := cwal.(pipeline.CheckpointChainDepthProvider); ok {
+					depth, err := depthProvider.IncrementalChainDepth(ctx, maxSeq)
+					if err != nil {
+						return err
+					}
+					if depth >= 8 {
+						forceFull = true
+					}
+				}
+				if checkpointMutationSize(checkpointMutations) >= maxMutationBytes {
+					forceFull = true
+				}
+
+				if forceFull || lastFullSeq == 0 || (fullEvery > 0 && (rt.batchCount%fullEvery) == 0) {
+					snap, err := rt.snapshotter.Snapshot()
+					if err != nil {
+						if hasMutationRollbackProvider && len(checkpointMutations) > 0 {
+							mutationRollbackProvider.RollbackCheckpointMutations(checkpointMutations)
+						}
+						return err
+					}
+					if err := cwal.SaveCheckpoint(ctx, walpkg.Checkpoint{Mode: "full", LastSeq: maxSeq, BaseSeq: maxSeq, Snapshot: snap, Mutations: checkpointMutations}); err != nil {
+						if hasMutationRollbackProvider && len(checkpointMutations) > 0 {
+							mutationRollbackProvider.RollbackCheckpointMutations(checkpointMutations)
+						}
+						return err
+					}
+					if hasHook {
+						hook.AfterCheckpoint("full", maxSeq)
+					}
+				} else {
+					snap, err := rt.snapshotter.Snapshot()
+					if err != nil {
+						if hasMutationRollbackProvider && len(checkpointMutations) > 0 {
+							mutationRollbackProvider.RollbackCheckpointMutations(checkpointMutations)
+						}
+						return err
+					}
+					baseSeq := lastCheckpointSeq
+					if baseSeq <= 0 {
+						baseSeq = lastFullSeq
+					}
+					if err := cwal.SaveCheckpoint(ctx, walpkg.Checkpoint{Mode: "incremental", LastSeq: maxSeq, BaseSeq: baseSeq, Snapshot: snap, Mutations: checkpointMutations}); err != nil {
+						if hasMutationRollbackProvider && len(checkpointMutations) > 0 {
+							mutationRollbackProvider.RollbackCheckpointMutations(checkpointMutations)
+						}
+						return err
+					}
+					if hasHook {
+						hook.AfterCheckpoint("incremental", maxSeq)
+					}
+				}
+			} else {
+				snap, err := rt.snapshotter.Snapshot()
+				if err != nil {
+					return err
+				}
+				if err := cwal.SaveCheckpoint(ctx, walpkg.Checkpoint{Mode: "full", LastSeq: maxSeq, BaseSeq: maxSeq, Snapshot: snap}); err != nil {
+					return err
+				}
+				if hasHook {
+					hook.AfterCheckpoint("full", maxSeq)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func replayRuntime(ctx context.Context, rt *partitionRuntime) error {
@@ -464,11 +653,54 @@ func replayRuntime(ctx context.Context, rt *partitionRuntime) error {
 			return err
 		}
 		afterSeq := int64(0)
-		if cp != nil && len(cp.Snapshot) > 0 {
-			if err := rt.snapshotter.Restore(cp.Snapshot); err != nil {
+		restoreSnapshot := []byte(nil)
+		restoreMutations := []walpkg.CheckpointMutation(nil)
+		if cp != nil {
+			if resolver, ok := cwal.(pipeline.CheckpointSnapshotResolverWithMutations); ok {
+				snap, seq, mutations, err := resolver.ResolveCheckpointSnapshotWithMutations(ctx, cp)
+				if err != nil {
+					return err
+				}
+				restoreSnapshot = snap
+				afterSeq = seq
+				restoreMutations = mutations
+			} else if resolver, ok := cwal.(pipeline.CheckpointSnapshotResolver); ok {
+				snap, seq, err := resolver.ResolveCheckpointSnapshot(ctx, cp)
+				if err != nil {
+					return err
+				}
+				restoreSnapshot = snap
+				afterSeq = seq
+			} else {
+				restoreCP := cp
+				if cp.Mode == "incremental" {
+					if lookup, ok := cwal.(pipeline.CheckpointWALWithFullLookup); ok {
+						fullCP, err := lookup.LoadLatestFullCheckpointBefore(ctx, cp.BaseSeq)
+						if err != nil {
+							return err
+						}
+						restoreCP = fullCP
+					} else {
+						restoreCP = nil
+					}
+				}
+				if restoreCP != nil {
+					restoreSnapshot = restoreCP.Snapshot
+					afterSeq = restoreCP.LastSeq
+				}
+			}
+		}
+		if len(restoreSnapshot) > 0 {
+			if err := rt.snapshotter.Restore(restoreSnapshot); err != nil {
 				return err
 			}
-			afterSeq = cp.LastSeq
+		}
+		if len(restoreMutations) > 0 {
+			if applier, ok := any(rt.snapshotter).(pipeline.CheckpointMutationApplier); ok {
+				if err := applier.ApplyCheckpointMutations(restoreMutations); err != nil {
+					return err
+				}
+			}
 		}
 		return cwal.ReplayFrom(ctx, afterSeq, func(b types.Batch) error {
 			_, err := op.Execute(rt.rootNode, b)
@@ -518,6 +750,11 @@ func closePartitionRuntimes(runtimes map[string]*partitionRuntime) error {
 				errs = append(errs, err)
 			}
 		}
+		if rt.state != nil {
+			if err := rt.state.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -559,4 +796,74 @@ func applyHivePathToSink(sinkType string, sinkCfg map[string]interface{}, keys [
 		}
 		sinkCfg["disk_spill_path"] = config.BuildHivePartitionPath(diskSpillPath, keys, values)
 	}
+}
+
+func checkpointMutationsFromStateOps(ops []op.StateBatchOp) []walpkg.CheckpointMutation {
+	if len(ops) == 0 {
+		return nil
+	}
+	out := make([]walpkg.CheckpointMutation, 0, len(ops))
+	for _, stateOp := range ops {
+		mutationType := "put"
+		if stateOp.Type == op.StateBatchDelete {
+			mutationType = "delete"
+		}
+		out = append(out, walpkg.CheckpointMutation{
+			Type:  mutationType,
+			Key:   append([]byte(nil), stateOp.Key...),
+			Value: append([]byte(nil), stateOp.Value...),
+		})
+	}
+	return out
+}
+
+func applyCheckpointMutationsToStateBackend(backend op.StateBackend, mutations []walpkg.CheckpointMutation) error {
+	if backend == nil || len(mutations) == 0 {
+		return nil
+	}
+	ops := make([]op.StateBatchOp, 0, len(mutations))
+	for _, mutation := range mutations {
+		typ := op.StateBatchPut
+		if strings.EqualFold(strings.TrimSpace(mutation.Type), "delete") {
+			typ = op.StateBatchDelete
+		}
+		ops = append(ops, op.StateBatchOp{
+			Type:  typ,
+			Key:   append([]byte(nil), mutation.Key...),
+			Value: append([]byte(nil), mutation.Value...),
+		})
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	return backend.BatchWrite(ops)
+}
+
+func restoreCheckpointMutationsToTracker(tracker op.StateMutationTracker, mutations []walpkg.CheckpointMutation) {
+	if tracker == nil || len(mutations) == 0 {
+		return
+	}
+	ops := make([]op.StateBatchOp, 0, len(mutations))
+	for _, mutation := range mutations {
+		typ := op.StateBatchPut
+		if strings.EqualFold(strings.TrimSpace(mutation.Type), "delete") {
+			typ = op.StateBatchDelete
+		}
+		ops = append(ops, op.StateBatchOp{
+			Type:  typ,
+			Key:   append([]byte(nil), mutation.Key...),
+			Value: append([]byte(nil), mutation.Value...),
+		})
+	}
+	tracker.RestoreMutations(ops)
+}
+
+func checkpointMutationSize(mutations []walpkg.CheckpointMutation) int {
+	total := 0
+	for _, mutation := range mutations {
+		total += len(mutation.Type)
+		total += len(mutation.Key)
+		total += len(mutation.Value)
+	}
+	return total
 }

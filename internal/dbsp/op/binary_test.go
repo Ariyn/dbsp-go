@@ -729,3 +729,84 @@ func TestJoinOp_TTLExpiry_RefreshExtendsExpiration(t *testing.T) {
 		t.Fatalf("expected one -2 retraction at t=16, got %v", out2)
 	}
 }
+
+func TestJoinOp_BackendModeMatchesInMemory(t *testing.T) {
+	build := func() *BinaryOp {
+		return NewJoinOp(
+			func(tuple types.Tuple) any { return tuple["key"] },
+			func(tuple types.Tuple) any { return tuple["key"] },
+			func(l, r types.Tuple) types.Tuple {
+				return types.Tuple{"key": l["key"], "l": l["l"], "r": r["r"]}
+			},
+		)
+	}
+
+	inMem := build()
+	backendMode := build()
+	backendMode.SetJoinStateBackend(NewMemoryStateBackend(), "join/test")
+
+	steps := []struct {
+		left  types.Batch
+		right types.Batch
+	}{
+		{
+			left:  types.Batch{{Tuple: types.Tuple{"key": "a", "l": 1}, Count: 1}},
+			right: types.Batch{{Tuple: types.Tuple{"key": "a", "r": 10}, Count: 1}},
+		},
+		{
+			left:  types.Batch{{Tuple: types.Tuple{"key": "a", "l": 2}, Count: 1}},
+			right: nil,
+		},
+		{
+			left:  nil,
+			right: types.Batch{{Tuple: types.Tuple{"key": "a", "r": 10}, Count: -1}},
+		},
+		{
+			left:  types.Batch{{Tuple: types.Tuple{"key": "a", "l": 1}, Count: -1}},
+			right: nil,
+		},
+	}
+
+	for i, step := range steps {
+		outA, err := inMem.ApplyBinary(step.left, step.right)
+		if err != nil {
+			t.Fatalf("in-memory step %d failed: %v", i, err)
+		}
+		outB, err := backendMode.ApplyBinary(step.left, step.right)
+		if err != nil {
+			t.Fatalf("backend step %d failed: %v", i, err)
+		}
+
+		mA := testBatchToCountMap(outA)
+		mB := testBatchToCountMap(outB)
+		if len(mA) != len(mB) {
+			t.Fatalf("step %d output length mismatch: in-memory=%v backend=%v", i, mA, mB)
+		}
+		for k, v := range mA {
+			if mB[k] != v {
+				t.Fatalf("step %d output mismatch: in-memory=%v backend=%v", i, mA, mB)
+			}
+		}
+	}
+}
+
+func TestAttachJoinStateBackend_AttachesOnlyJoinOps(t *testing.T) {
+	join := NewJoinOp(
+		func(tuple types.Tuple) any { return tuple["id"] },
+		func(tuple types.Tuple) any { return tuple["id"] },
+		func(l, r types.Tuple) types.Tuple { return types.Tuple{"id": l["id"]} },
+	)
+	root := &Node{Op: NewUnionOp(), Inputs: []*Node{
+		{Op: join, Inputs: []*Node{{Source: "a"}, {Source: "b"}}},
+		{Source: "c"},
+	}}
+
+	backend := NewMemoryStateBackend()
+	count := AttachJoinStateBackend(root, backend)
+	if count != 1 {
+		t.Fatalf("expected 1 attached join op, got %d", count)
+	}
+	if !join.joinBackendEnabled() {
+		t.Fatalf("expected join backend to be enabled")
+	}
+}

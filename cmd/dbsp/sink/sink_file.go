@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -42,6 +43,9 @@ func NewFileSink(cfg map[string]interface{}) (*FileSink, error) {
 	}
 	if fileConfig.Format == "" {
 		fileConfig.Format = "json"
+	}
+	if err := os.MkdirAll(filepath.Dir(fileConfig.Path), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create file sink directory: %w", err)
 	}
 
 	// Open file for read/write so we can detect existing CSV header.

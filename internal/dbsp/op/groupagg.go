@@ -32,6 +32,213 @@ type GroupAggOp struct {
 	// This is preferred for multi-key grouping because the internal key may be an
 	// encoded composite string.
 	GroupKeyColNames []string
+
+	stateBackend StateBackend
+	statePrefix  string
+}
+
+type groupAggStateRecordV1 struct {
+	Kind string `json:"kind"`
+
+	Float64 float64           `json:"f64,omitempty"`
+	Int64   int64             `json:"i64,omitempty"`
+	Avg     *AvgMonoid        `json:"avg,omitempty"`
+	Sorted  *groupAggSortedV1 `json:"sorted,omitempty"`
+	Buffer  *groupAggBufferV1 `json:"buffer,omitempty"`
+	JSON    []byte            `json:"json,omitempty"`
+}
+
+type groupAggSortedV1 struct {
+	Values map[string]int64 `json:"values"`
+	Sorted []string         `json:"sorted"`
+}
+
+type groupAggBufferV1 struct {
+	Entries    []BufferEntry `json:"entries"`
+	OrderByCol string        `json:"order_by_col"`
+}
+
+func (g *GroupAggOp) SetStateBackend(backend StateBackend, prefix string) {
+	g.stateBackend = backend
+	g.statePrefix = prefix
+	if g.statePrefix == "" {
+		g.statePrefix = "groupagg/default"
+	}
+}
+
+func (g *GroupAggOp) backendEnabled() bool {
+	return g != nil && g.stateBackend != nil
+}
+
+func (g *GroupAggOp) singleStateKey(key any) []byte {
+	return []byte(fmt.Sprintf("%s/single/%s", g.statePrefix, stableAnyKey(key)))
+}
+
+func (g *GroupAggOp) multiStateKey(key any) []byte {
+	return []byte(fmt.Sprintf("%s/multi/%s", g.statePrefix, stableAnyKey(key)))
+}
+
+func encodeGroupAggStateRecord(value any) ([]byte, error) {
+	rec := groupAggStateRecordV1{}
+	switch v := value.(type) {
+	case nil:
+		rec.Kind = "nil"
+	case float64:
+		rec.Kind = "f64"
+		rec.Float64 = v
+	case int:
+		rec.Kind = "i64"
+		rec.Int64 = int64(v)
+	case int64:
+		rec.Kind = "i64"
+		rec.Int64 = v
+	case AvgMonoid:
+		rec.Kind = "avg"
+		tmp := v
+		rec.Avg = &tmp
+	case SortedMultiset:
+		rec.Kind = "sorted"
+		values := make(map[string]int64, len(v.values))
+		for key, count := range v.values {
+			values[key] = count
+		}
+		rec.Sorted = &groupAggSortedV1{Values: values, Sorted: append([]string(nil), v.sorted...)}
+	case OrderedBuffer:
+		rec.Kind = "buffer"
+		rec.Buffer = &groupAggBufferV1{Entries: append([]BufferEntry(nil), v.entries...), OrderByCol: v.orderByCol}
+	default:
+		rec.Kind = "json"
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("unsupported groupagg state type %T", value)
+		}
+		rec.JSON = b
+	}
+	return json.Marshal(rec)
+}
+
+func decodeGroupAggStateRecord(payload []byte) (any, error) {
+	var rec groupAggStateRecordV1
+	if err := json.Unmarshal(payload, &rec); err != nil {
+		return nil, err
+	}
+	switch rec.Kind {
+	case "nil":
+		return nil, nil
+	case "f64":
+		return rec.Float64, nil
+	case "i64":
+		return rec.Int64, nil
+	case "avg":
+		if rec.Avg == nil {
+			return AvgMonoid{}, nil
+		}
+		return *rec.Avg, nil
+	case "sorted":
+		ms := NewSortedMultiset()
+		if rec.Sorted != nil {
+			ms.values = make(map[string]int64, len(rec.Sorted.Values))
+			for key, count := range rec.Sorted.Values {
+				ms.values[key] = count
+			}
+			ms.sorted = append([]string(nil), rec.Sorted.Sorted...)
+		}
+		return ms, nil
+	case "buffer":
+		var ob OrderedBuffer
+		if rec.Buffer != nil {
+			ob.entries = append([]BufferEntry(nil), rec.Buffer.Entries...)
+			ob.orderByCol = rec.Buffer.OrderByCol
+		}
+		return ob, nil
+	case "json":
+		var out any
+		if len(rec.JSON) == 0 {
+			return nil, nil
+		}
+		if err := json.Unmarshal(rec.JSON, &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unknown groupagg state kind %q", rec.Kind)
+	}
+}
+
+func (g *GroupAggOp) getSingleState(key any) (any, bool, error) {
+	if !g.backendEnabled() {
+		prev, ok := g.state[key]
+		return prev, ok, nil
+	}
+	payload, ok, err := g.stateBackend.Get(g.singleStateKey(key))
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	v, err := decodeGroupAggStateRecord(payload)
+	if err != nil {
+		return nil, false, err
+	}
+	return v, true, nil
+}
+
+func (g *GroupAggOp) putSingleState(key any, value any) error {
+	if !g.backendEnabled() {
+		g.state[key] = value
+		return nil
+	}
+	payload, err := encodeGroupAggStateRecord(value)
+	if err != nil {
+		return err
+	}
+	return g.stateBackend.Put(g.singleStateKey(key), payload)
+}
+
+func (g *GroupAggOp) getMultiState(key any) ([]any, bool, error) {
+	if !g.backendEnabled() {
+		states, ok := g.multiState[key]
+		if !ok {
+			return nil, false, nil
+		}
+		cpy := append([]any(nil), states...)
+		return cpy, true, nil
+	}
+	payload, ok, err := g.stateBackend.Get(g.multiStateKey(key))
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	var raws [][]byte
+	if err := json.Unmarshal(payload, &raws); err != nil {
+		return nil, false, err
+	}
+	out := make([]any, len(raws))
+	for i, raw := range raws {
+		v, err := decodeGroupAggStateRecord(raw)
+		if err != nil {
+			return nil, false, err
+		}
+		out[i] = v
+	}
+	return out, true, nil
+}
+
+func (g *GroupAggOp) putMultiState(key any, states []any) error {
+	if !g.backendEnabled() {
+		g.multiState[key] = append([]any(nil), states...)
+		return nil
+	}
+	raws := make([][]byte, len(states))
+	for i, state := range states {
+		enc, err := encodeGroupAggStateRecord(state)
+		if err != nil {
+			return err
+		}
+		raws[i] = enc
+	}
+	payload, err := json.Marshal(raws)
+	if err != nil {
+		return err
+	}
+	return g.stateBackend.Put(g.multiStateKey(key), payload)
 }
 
 type groupAggSnapshotV1 struct {
@@ -48,6 +255,23 @@ func (g *GroupAggOp) Snapshot() (any, error) {
 	snap := groupAggSnapshotV1{KeyColName: g.KeyColName}
 	if len(g.GroupKeyColNames) > 0 {
 		snap.GroupKeyColNames = append([]string(nil), g.GroupKeyColNames...)
+	}
+	if g.backendEnabled() {
+		stateCopy := g.State()
+		if len(g.Aggs) > 0 {
+			snap.MultiState = make(map[any][]any, len(stateCopy))
+			for key, val := range stateCopy {
+				if vals, ok := val.([]any); ok {
+					snap.MultiState[key] = append([]any(nil), vals...)
+				}
+			}
+		} else {
+			snap.State = make(map[any]any, len(stateCopy))
+			for key, val := range stateCopy {
+				snap.State[key] = val
+			}
+		}
+		return snap, nil
 	}
 	if g.state != nil {
 		snap.State = make(map[any]any, len(g.state))
@@ -105,6 +329,22 @@ func (g *GroupAggOp) Restore(state any) error {
 	} else {
 		g.multiState = make(map[any][]any)
 	}
+
+	if g.backendEnabled() {
+		if len(g.Aggs) > 0 {
+			for key, vals := range g.multiState {
+				if err := g.putMultiState(key, vals); err != nil {
+					return err
+				}
+			}
+		} else {
+			for key, val := range g.state {
+				if err := g.putSingleState(key, val); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -150,12 +390,17 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	}
 	for _, td := range batch {
 		key := g.KeyFn(td.Tuple)
-		prev, ok := g.state[key]
+		prev, ok, err := g.getSingleState(key)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			prev = g.AggInit()
 		}
 		newVal, outDelta := g.AggFn.Apply(prev, td)
-		g.state[key] = newVal
+		if err := g.putSingleState(key, newVal); err != nil {
+			return nil, err
+		}
 		if outDelta != nil {
 			if outDelta.Tuple == nil {
 				outDelta.Tuple = types.Tuple{}
@@ -245,7 +490,10 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 
 	for _, td := range batch {
 		key := g.KeyFn(td.Tuple)
-		states, ok := g.multiState[key]
+		states, ok, err := g.getMultiState(key)
+		if err != nil {
+			return nil, err
+		}
 		if !ok || len(states) != len(g.Aggs) {
 			states = make([]any, len(g.Aggs))
 			for i, a := range g.Aggs {
@@ -275,7 +523,9 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 			mergePendingTupleDeltaLocal(pending, key, outDelta, skipCols)
 		}
 
-		g.multiState[key] = states
+		if err := g.putMultiState(key, states); err != nil {
+			return nil, err
+		}
 	}
 
 	for _, td := range pending {
@@ -406,6 +656,51 @@ func toInt64Local(v any) int64 {
 
 // State returns a copy of the internal aggregate state (for testing/inspection).
 func (g *GroupAggOp) State() map[any]any {
+	if g.backendEnabled() {
+		copy := make(map[any]any)
+		if len(g.Aggs) > 0 {
+			prefix := []byte(fmt.Sprintf("%s/multi/", g.statePrefix))
+			_ = g.stateBackend.IterPrefix(prefix, func(key, value []byte) error {
+				encKey := strings.TrimPrefix(string(key), string(prefix))
+				decodedKey, err := decodeAnyKey(encKey)
+				if err != nil {
+					decodedKey = encKey
+				}
+				var raws [][]byte
+				if err := json.Unmarshal(value, &raws); err != nil {
+					return nil
+				}
+				vals := make([]any, len(raws))
+				for i, raw := range raws {
+					v, err := decodeGroupAggStateRecord(raw)
+					if err != nil {
+						return nil
+					}
+					vals[i] = v
+				}
+				copy[decodedKey] = vals
+				return nil
+			})
+			return copy
+		}
+
+		prefix := []byte(fmt.Sprintf("%s/single/", g.statePrefix))
+		_ = g.stateBackend.IterPrefix(prefix, func(key, value []byte) error {
+			encKey := strings.TrimPrefix(string(key), string(prefix))
+			decodedKey, err := decodeAnyKey(encKey)
+			if err != nil {
+				decodedKey = encKey
+			}
+			v, err := decodeGroupAggStateRecord(value)
+			if err != nil {
+				return nil
+			}
+			copy[decodedKey] = v
+			return nil
+		})
+		return copy
+	}
+
 	if len(g.Aggs) > 0 {
 		copy := make(map[any]any, len(g.multiState))
 		for k, v := range g.multiState {

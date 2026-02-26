@@ -610,3 +610,106 @@ func TestSortedMultiset_Properties(t *testing.T) {
 		t.Errorf("after removing all: expected max=nil, got %v", m.Max())
 	}
 }
+
+func TestGroupAgg_BackendModeMatchesInMemory_Sum(t *testing.T) {
+	keyFn := func(tu types.Tuple) any { return tu["k"] }
+	build := func() *GroupAggOp {
+		return NewGroupAggOp(keyFn, func() any { return float64(0) }, &SumAgg{})
+	}
+
+	inMem := build()
+	withBackend := build()
+	withBackend.SetStateBackend(NewMemoryStateBackend(), "groupagg/test-sum")
+
+	steps := []types.Batch{
+		{
+			{Tuple: types.Tuple{"k": "A", "v": 2}, Count: 1},
+			{Tuple: types.Tuple{"k": "A", "v": 3}, Count: 1},
+		},
+		{{Tuple: types.Tuple{"k": "A", "v": 2}, Count: -1}},
+	}
+
+	for i, step := range steps {
+		outA, err := inMem.Apply(step)
+		if err != nil {
+			t.Fatalf("in-memory apply step %d failed: %v", i, err)
+		}
+		outB, err := withBackend.Apply(step)
+		if err != nil {
+			t.Fatalf("backend apply step %d failed: %v", i, err)
+		}
+
+		mA := testBatchToCountMap(outA)
+		mB := testBatchToCountMap(outB)
+		if len(mA) != len(mB) {
+			t.Fatalf("step %d output mismatch: %v vs %v", i, mA, mB)
+		}
+		for k, v := range mA {
+			if mB[k] != v {
+				t.Fatalf("step %d output mismatch: %v vs %v", i, mA, mB)
+			}
+		}
+	}
+
+	stA := inMem.State()
+	stB := withBackend.State()
+	if stA["A"] != stB["A"] {
+		t.Fatalf("state mismatch: in-memory=%v backend=%v", stA, stB)
+	}
+}
+
+func TestGroupAgg_BackendModeMatchesInMemory_Multi(t *testing.T) {
+	keyFn := func(tu types.Tuple) any { return tu["k"] }
+	build := func() *GroupAggOp {
+		g := NewGroupAggMultiOp(keyFn, []AggSlot{
+			{Init: func() any { return float64(0) }, Fn: &SumAgg{ColName: "v", DeltaCol: "agg_delta"}},
+			{Init: func() any { return int64(0) }, Fn: &CountAgg{ColName: "id", DeltaCol: "count_delta"}},
+		})
+		g.SetGroupKeyColNames([]string{"k"})
+		return g
+	}
+
+	inMem := build()
+	withBackend := build()
+	withBackend.SetStateBackend(NewMemoryStateBackend(), "groupagg/test-multi")
+
+	step := types.Batch{
+		{Tuple: types.Tuple{"k": "A", "id": int64(1), "v": int64(10)}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "id": int64(2), "v": int64(5)}, Count: 1},
+		{Tuple: types.Tuple{"k": "A", "id": int64(1), "v": int64(10)}, Count: -1},
+	}
+
+	outA, err := inMem.Apply(step)
+	if err != nil {
+		t.Fatalf("in-memory apply failed: %v", err)
+	}
+	outB, err := withBackend.Apply(step)
+	if err != nil {
+		t.Fatalf("backend apply failed: %v", err)
+	}
+
+	mA := testBatchToCountMap(outA)
+	mB := testBatchToCountMap(outB)
+	if len(mA) != len(mB) {
+		t.Fatalf("output mismatch: %v vs %v", mA, mB)
+	}
+	for k, v := range mA {
+		if mB[k] != v {
+			t.Fatalf("output mismatch: %v vs %v", mA, mB)
+		}
+	}
+}
+
+func TestAttachGroupAggStateBackend_AttachesGroupAggOnly(t *testing.T) {
+	group := NewGroupAggOp(func(tu types.Tuple) any { return tu["k"] }, func() any { return float64(0) }, &SumAgg{})
+	root := &Node{Op: NewUnionOp(), Inputs: []*Node{{Op: group, Inputs: []*Node{{Source: "s"}}}, {Source: "t"}}}
+
+	backend := NewMemoryStateBackend()
+	count := AttachGroupAggStateBackend(root, backend)
+	if count != 1 {
+		t.Fatalf("expected 1 groupagg attachment, got %d", count)
+	}
+	if !group.backendEnabled() {
+		t.Fatalf("expected groupagg backend enabled")
+	}
+}

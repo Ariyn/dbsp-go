@@ -7,8 +7,31 @@ type PipelineConfig struct {
 		Transform TransformConfig `yaml:"transform"`
 		Sink      SinkConfig      `yaml:"sink"`
 		WAL       WALConfig       `yaml:"wal"`
+		State     StateBackendConfig `yaml:"state_backend"`
 		Partition PartitionConfig `yaml:"partition"`
 	} `yaml:"pipeline"`
+}
+
+// StateBackendConfig controls operator-state storage backend.
+//
+// Default behavior remains in-memory when Enabled=false.
+type StateBackendConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Type    string `yaml:"type"` // memory|kv|sqlite
+	Path    string `yaml:"path"`
+
+	// CacheMaxEntries is reserved for future hot-cache tuning.
+	CacheMaxEntries int `yaml:"cache_max_entries"`
+
+	// CheckpointMode is reserved for full|incremental state checkpoint strategy.
+	CheckpointMode string `yaml:"checkpoint_mode"`
+
+	// CheckpointEveryBatches is reserved for state backend checkpoint cadence.
+	CheckpointEveryBatches int `yaml:"checkpoint_every_batches"`
+
+	// MaxIncrementalMutationBytes forces full checkpoint when drained mutation payload
+	// size reaches this threshold in incremental mode. 0 uses internal default.
+	MaxIncrementalMutationBytes int `yaml:"max_incremental_mutation_bytes"`
 }
 
 // PartitionConfig controls partition fan-out execution mode.

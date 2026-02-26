@@ -1,10 +1,19 @@
 package op
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
+
+func windowBatchSignature(batch types.Batch) map[string]int64 {
+	out := make(map[string]int64)
+	for _, td := range batch {
+		out[tupleKeyLocal(td.Tuple)] += td.Count
+	}
+	return out
+}
 
 func TestWindowAggOp_RowsFrame(t *testing.T) {
 	// Test ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
@@ -1067,6 +1076,212 @@ func TestWindowAggOp_SessionWindowMultipleUsers(t *testing.T) {
 	// Each user should have separate sessions
 	if len(out) == 0 {
 		t.Error("expected session windows for multiple users")
+	}
+}
+
+func TestWindowAgg_BackendModeMatchesInMemory_Session(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", WindowType: WindowTypeSession, GapMillis: 5000}
+	keyFn := func(t types.Tuple) any { return t["user"] }
+	aggInit := func() any { return int64(0) }
+	agg := &CountAgg{}
+
+	inMemory := NewWindowAggOp(spec, keyFn, []string{"user"}, aggInit, agg)
+	withBackend := NewWindowAggOp(spec, keyFn, []string{"user"}, aggInit, agg)
+	withBackend.SetStateBackend(NewMemoryStateBackend(), "windowagg/test-session")
+
+	batches := []types.Batch{
+		{
+			{Tuple: types.Tuple{"user": "Alice", "ts": int64(1000)}, Count: 1},
+			{Tuple: types.Tuple{"user": "Alice", "ts": int64(10000)}, Count: 1},
+		},
+		{{Tuple: types.Tuple{"user": "Alice", "ts": int64(6000)}, Count: 1}},
+		{{Tuple: types.Tuple{"user": "Alice", "ts": int64(6000)}, Count: -1}},
+	}
+
+	for i, batch := range batches {
+		outMem, err := inMemory.Apply(batch)
+		if err != nil {
+			t.Fatalf("inMemory Apply batch %d failed: %v", i, err)
+		}
+		outBackend, err := withBackend.Apply(batch)
+		if err != nil {
+			t.Fatalf("backend Apply batch %d failed: %v", i, err)
+		}
+
+		if !reflect.DeepEqual(windowBatchSignature(outMem), windowBatchSignature(outBackend)) {
+			t.Fatalf("batch %d output mismatch\nmem=%v\nbackend=%v", i, outMem, outBackend)
+		}
+	}
+}
+
+func TestAttachWindowAggStateBackend_AttachesWindowAggOnly(t *testing.T) {
+	win := NewWindowAggOp(
+		WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling},
+		func(t types.Tuple) any { return t["k"] },
+		[]string{"k"},
+		func() any { return int64(0) },
+		&CountAgg{},
+	)
+	group := NewGroupAggOp(func(t types.Tuple) any { return t["k"] }, func() any { return int64(0) }, &CountAgg{})
+
+	root := &Node{Op: win, Inputs: []*Node{{Op: group}}}
+	backend := NewMemoryStateBackend()
+	count := AttachWindowAggStateBackend(root, backend)
+
+	if count != 1 {
+		t.Fatalf("expected 1 attached windowagg op, got %d", count)
+	}
+	if win.stateBackend == nil {
+		t.Fatalf("expected windowagg backend to be attached")
+	}
+	if group.stateBackend != nil {
+		t.Fatalf("expected non-window groupagg op to remain untouched")
+	}
+}
+
+func TestWindowAgg_BackendReloadAcrossOperatorInstances(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling}
+	keyFn := func(t types.Tuple) any { return t["region"] }
+	aggInit := func() any { return int64(0) }
+	agg := &CountAgg{}
+
+	backend := NewMemoryStateBackend()
+	prefix := "windowagg/test-reload"
+
+	op1 := NewWindowAggOp(spec, keyFn, []string{"region"}, aggInit, agg)
+	op1.SetStateBackend(backend, prefix)
+	_, err := op1.Apply(types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(1)}, Count: 1}})
+	if err != nil {
+		t.Fatalf("op1 insert failed: %v", err)
+	}
+
+	// Simulate restart: new operator instance with same backend+prefix.
+	op2 := NewWindowAggOp(spec, keyFn, []string{"region"}, aggInit, agg)
+	op2.SetStateBackend(backend, prefix)
+	out, err := op2.Apply(types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(1)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("op2 delete failed: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected one output delta after delete on reloaded state, got %d (%+v)", len(out), out)
+	}
+	if out[0].Count != 1 {
+		t.Fatalf("expected output Count=1, got %d", out[0].Count)
+	}
+	if out[0].Tuple["region"] != "East" {
+		t.Fatalf("expected region=East, got %v", out[0].Tuple["region"])
+	}
+	if out[0].Tuple["__window_start"] != int64(0) || out[0].Tuple["__window_end"] != int64(10) {
+		t.Fatalf("expected window [0,10), got start=%v end=%v", out[0].Tuple["__window_start"], out[0].Tuple["__window_end"])
+	}
+	delta, ok := out[0].Tuple["count_delta"].(int64)
+	if !ok {
+		t.Fatalf("expected count_delta int64, got %T", out[0].Tuple["count_delta"])
+	}
+	if delta != -1 {
+		t.Fatalf("expected count_delta=-1, got %d (%+v)", delta, out[0])
+	}
+}
+
+func TestWindowAgg_BackendV2KeyspaceWritesState(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling}
+	keyFn := func(t types.Tuple) any { return t["region"] }
+	aggInit := func() any { return int64(0) }
+	agg := &CountAgg{}
+
+	backend := NewMemoryStateBackend()
+	prefix := "windowagg/test-v2"
+	op := NewWindowAggOp(spec, keyFn, []string{"region"}, aggInit, agg)
+	op.SetStateBackend(backend, prefix)
+
+	if _, err := op.Apply(types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(1)}, Count: 1}}); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	if _, ok, err := backend.Get([]byte(prefix + "/snapshot")); err != nil {
+		t.Fatalf("Get legacy snapshot key failed: %v", err)
+	} else if ok {
+		t.Fatalf("expected legacy snapshot key to be absent when v2 key-space is used")
+	}
+
+	stateCount := 0
+	if err := backend.IterPrefix([]byte(prefix+"/v2/state/"), func(_, _ []byte) error {
+		stateCount++
+		return nil
+	}); err != nil {
+		t.Fatalf("IterPrefix state failed: %v", err)
+	}
+	if stateCount == 0 {
+		t.Fatalf("expected v2 state entries to be written")
+	}
+
+	countCount := 0
+	if err := backend.IterPrefix([]byte(prefix+"/v2/counts/"), func(_, _ []byte) error {
+		countCount++
+		return nil
+	}); err != nil {
+		t.Fatalf("IterPrefix counts failed: %v", err)
+	}
+	if countCount == 0 {
+		t.Fatalf("expected v2 count entries to be written")
+	}
+}
+
+func TestWindowAgg_BackendLegacySnapshotFallbackMigratesToV2(t *testing.T) {
+	spec := WindowSpecLite{TimeCol: "ts", SizeMillis: 10, WindowType: WindowTypeTumbling}
+	keyFn := func(t types.Tuple) any { return t["region"] }
+	aggInit := func() any { return int64(0) }
+	agg := &CountAgg{}
+
+	// Build a legacy snapshot payload.
+	legacyOp := NewWindowAggOp(spec, keyFn, []string{"region"}, aggInit, agg)
+	if _, err := legacyOp.Apply(types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(1)}, Count: 1}}); err != nil {
+		t.Fatalf("legacy op Apply failed: %v", err)
+	}
+	legacyAny, err := legacyOp.Snapshot()
+	if err != nil {
+		t.Fatalf("legacy op Snapshot failed: %v", err)
+	}
+	legacySnap, ok := legacyAny.(windowAggSnapshotV1)
+	if !ok {
+		t.Fatalf("unexpected legacy snapshot type %T", legacyAny)
+	}
+	legacyPayload, err := encodeWindowAggSnapshot(legacySnap)
+	if err != nil {
+		t.Fatalf("encode legacy snapshot failed: %v", err)
+	}
+
+	backend := NewMemoryStateBackend()
+	prefix := "windowagg/test-legacy-migrate"
+	if err := backend.Put([]byte(prefix+"/snapshot"), legacyPayload); err != nil {
+		t.Fatalf("put legacy snapshot failed: %v", err)
+	}
+
+	migratingOp := NewWindowAggOp(spec, keyFn, []string{"region"}, aggInit, agg)
+	migratingOp.SetStateBackend(backend, prefix)
+	out, err := migratingOp.Apply(types.Batch{{Tuple: types.Tuple{"region": "East", "ts": int64(1)}, Count: -1}})
+	if err != nil {
+		t.Fatalf("migrating op Apply failed: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected one output delta after loading legacy state, got %d (%+v)", len(out), out)
+	}
+
+	if _, ok, err := backend.Get([]byte(prefix + "/snapshot")); err != nil {
+		t.Fatalf("Get legacy snapshot key failed: %v", err)
+	} else if ok {
+		t.Fatalf("expected legacy snapshot key to be removed after v2 flush")
+	}
+
+	v2Count := 0
+	if err := backend.IterPrefix([]byte(prefix+"/v2/"), func(_, _ []byte) error {
+		v2Count++
+		return nil
+	}); err != nil {
+		t.Fatalf("IterPrefix v2 failed: %v", err)
+	}
+	if v2Count == 0 {
+		t.Fatalf("expected v2 keys to exist after migration")
 	}
 }
 

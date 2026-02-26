@@ -1,6 +1,8 @@
 package op
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"sort"
 	"strconv"
@@ -73,6 +75,10 @@ type WindowAggOp struct {
 	// sessionOut stores the last computed session output tuples per partition.
 	// We diff against this to emit retractions/insertions when sessions merge/split/extend.
 	sessionOut map[any]map[string]types.Tuple
+
+	stateBackend  StateBackend
+	statePrefix   string
+	backendLoaded bool
 }
 
 type windowAggSnapshotV1 struct {
@@ -87,6 +93,9 @@ type windowAggSnapshotV1 struct {
 func (w *WindowAggOp) Snapshot() (any, error) {
 	if w == nil {
 		return windowAggSnapshotV1{}, nil
+	}
+	if err := w.loadBackendState(); err != nil {
+		return nil, err
 	}
 	w.ensureStateMaps()
 
@@ -123,6 +132,10 @@ func (w *WindowAggOp) Restore(state any) error {
 	w.SessionBuffers = s.SessionBuffers
 	w.sessionOut = s.SessionOut
 	w.ensureStateMaps()
+	w.backendLoaded = true
+	if err := w.flushBackendState(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -155,6 +168,342 @@ func NewWindowAggOp(spec WindowSpecLite, keyFn func(types.Tuple) any, groupKeys 
 	}
 }
 
+func (w *WindowAggOp) SetStateBackend(backend StateBackend, prefix string) {
+	w.stateBackend = backend
+	w.statePrefix = prefix
+	if w.statePrefix == "" {
+		w.statePrefix = "windowagg/default"
+	}
+	w.backendLoaded = false
+}
+
+func (w *WindowAggOp) backendEnabled() bool {
+	return w != nil && w.stateBackend != nil
+}
+
+func (w *WindowAggOp) backendSnapshotKey() []byte {
+	return []byte(fmt.Sprintf("%s/snapshot", w.statePrefix))
+}
+
+func (w *WindowAggOp) backendV2BasePrefix() string {
+	return fmt.Sprintf("%s/v2", w.statePrefix)
+}
+
+func (w *WindowAggOp) backendV2Prefix() []byte {
+	return []byte(w.backendV2BasePrefix() + "/")
+}
+
+func (w *WindowAggOp) backendV2SpecKey() []byte {
+	return []byte(fmt.Sprintf("%s/spec", w.backendV2BasePrefix()))
+}
+
+func encodeWindowIDKey(wid WindowID) string {
+	return fmt.Sprintf("%d:%d", wid.Start, wid.End)
+}
+
+func decodeWindowIDKey(encoded string) (WindowID, error) {
+	parts := strings.SplitN(encoded, ":", 2)
+	if len(parts) != 2 {
+		return WindowID{}, fmt.Errorf("invalid window id key %q", encoded)
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return WindowID{}, err
+	}
+	end, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return WindowID{}, err
+	}
+	return WindowID{Start: start, End: end}, nil
+}
+
+func encodeGobValue(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeGobValue(payload []byte, out any) error {
+	return gob.NewDecoder(bytes.NewReader(payload)).Decode(out)
+}
+
+func parseWindowAggV2TwoPartKey(fullKey, sectionPrefix string) (string, string, error) {
+	rel := strings.TrimPrefix(fullKey, sectionPrefix)
+	parts := strings.SplitN(rel, "/", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid key format %q", fullKey)
+	}
+	return parts[0], parts[1], nil
+}
+
+func parseWindowAggV2OnePartKey(fullKey, sectionPrefix string) string {
+	return strings.TrimPrefix(fullKey, sectionPrefix)
+}
+
+func encodeWindowAggSnapshot(s windowAggSnapshotV1) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(s); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func decodeWindowAggSnapshot(payload []byte) (windowAggSnapshotV1, error) {
+	var s windowAggSnapshotV1
+	dec := gob.NewDecoder(bytes.NewReader(payload))
+	if err := dec.Decode(&s); err != nil {
+		return windowAggSnapshotV1{}, err
+	}
+	return s, nil
+}
+
+func (w *WindowAggOp) loadBackendState() error {
+	if !w.backendEnabled() || w.backendLoaded {
+		return nil
+	}
+
+	v2Prefix := w.backendV2Prefix()
+	v2Seen := false
+	if err := w.stateBackend.IterPrefix(v2Prefix, func(_, _ []byte) error {
+		v2Seen = true
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if v2Seen {
+		w.State = WindowAggState{Data: make(map[WindowID]map[any]any)}
+		w.GroupCounts = make(map[WindowID]map[any]int64)
+		w.PartitionBuffers = make(map[any]*PartitionBuffer)
+		w.SessionBuffers = make(map[any]*PartitionBuffer)
+		w.sessionOut = make(map[any]map[string]types.Tuple)
+
+		if payload, ok, err := w.stateBackend.Get(w.backendV2SpecKey()); err != nil {
+			return err
+		} else if ok {
+			if err := decodeGobValue(payload, &w.Spec); err != nil {
+				return err
+			}
+		}
+
+		statePrefix := fmt.Sprintf("%s/state/", w.backendV2BasePrefix())
+		if err := w.stateBackend.IterPrefix([]byte(statePrefix), func(key, value []byte) error {
+			windowEnc, groupEnc, err := parseWindowAggV2TwoPartKey(string(key), statePrefix)
+			if err != nil {
+				return nil
+			}
+			wid, err := decodeWindowIDKey(windowEnc)
+			if err != nil {
+				return nil
+			}
+			groupKey, err := decodeAnyKey(groupEnc)
+			if err != nil {
+				groupKey = groupEnc
+			}
+			aggState, err := decodeGroupAggStateRecord(value)
+			if err != nil {
+				return nil
+			}
+			gm := w.State.Data[wid]
+			if gm == nil {
+				gm = make(map[any]any)
+				w.State.Data[wid] = gm
+			}
+			gm[groupKey] = aggState
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		countPrefix := fmt.Sprintf("%s/counts/", w.backendV2BasePrefix())
+		if err := w.stateBackend.IterPrefix([]byte(countPrefix), func(key, value []byte) error {
+			windowEnc, groupEnc, err := parseWindowAggV2TwoPartKey(string(key), countPrefix)
+			if err != nil {
+				return nil
+			}
+			wid, err := decodeWindowIDKey(windowEnc)
+			if err != nil {
+				return nil
+			}
+			groupKey, err := decodeAnyKey(groupEnc)
+			if err != nil {
+				groupKey = groupEnc
+			}
+			count, err := strconv.ParseInt(string(value), 10, 64)
+			if err != nil {
+				return nil
+			}
+			cm := w.GroupCounts[wid]
+			if cm == nil {
+				cm = make(map[any]int64)
+				w.GroupCounts[wid] = cm
+			}
+			cm[groupKey] = count
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		pbPrefix := fmt.Sprintf("%s/pbuf/", w.backendV2BasePrefix())
+		if err := w.stateBackend.IterPrefix([]byte(pbPrefix), func(key, value []byte) error {
+			partitionEnc := parseWindowAggV2OnePartKey(string(key), pbPrefix)
+			partitionKey, err := decodeAnyKey(partitionEnc)
+			if err != nil {
+				partitionKey = partitionEnc
+			}
+			var pb PartitionBuffer
+			if err := decodeGobValue(value, &pb); err != nil {
+				return nil
+			}
+			w.PartitionBuffers[partitionKey] = &pb
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		sbPrefix := fmt.Sprintf("%s/sbuf/", w.backendV2BasePrefix())
+		if err := w.stateBackend.IterPrefix([]byte(sbPrefix), func(key, value []byte) error {
+			partitionEnc := parseWindowAggV2OnePartKey(string(key), sbPrefix)
+			partitionKey, err := decodeAnyKey(partitionEnc)
+			if err != nil {
+				partitionKey = partitionEnc
+			}
+			var sb PartitionBuffer
+			if err := decodeGobValue(value, &sb); err != nil {
+				return nil
+			}
+			w.SessionBuffers[partitionKey] = &sb
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		soutPrefix := fmt.Sprintf("%s/sout/", w.backendV2BasePrefix())
+		if err := w.stateBackend.IterPrefix([]byte(soutPrefix), func(key, value []byte) error {
+			partitionEnc := parseWindowAggV2OnePartKey(string(key), soutPrefix)
+			partitionKey, err := decodeAnyKey(partitionEnc)
+			if err != nil {
+				partitionKey = partitionEnc
+			}
+			var out map[string]types.Tuple
+			if err := decodeGobValue(value, &out); err != nil {
+				return nil
+			}
+			w.sessionOut[partitionKey] = out
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		w.ensureStateMaps()
+		w.backendLoaded = true
+		return nil
+	}
+
+	payload, ok, err := w.stateBackend.Get(w.backendSnapshotKey())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		w.ensureStateMaps()
+		w.backendLoaded = true
+		return nil
+	}
+	s, err := decodeWindowAggSnapshot(payload)
+	if err != nil {
+		return err
+	}
+	w.Spec = s.Spec
+	w.State = s.State
+	w.GroupCounts = s.GroupCounts
+	w.PartitionBuffers = s.PartitionBuffers
+	w.SessionBuffers = s.SessionBuffers
+	w.sessionOut = s.SessionOut
+	w.ensureStateMaps()
+	w.backendLoaded = true
+	return nil
+}
+
+func (w *WindowAggOp) flushBackendState() error {
+	if !w.backendEnabled() {
+		return nil
+	}
+	w.ensureStateMaps()
+
+	ops := make([]StateBatchOp, 0, 64)
+	if err := w.stateBackend.IterPrefix(w.backendV2Prefix(), func(key, _ []byte) error {
+		ops = append(ops, StateBatchOp{Type: StateBatchDelete, Key: key})
+		return nil
+	}); err != nil {
+		return err
+	}
+	ops = append(ops, StateBatchOp{Type: StateBatchDelete, Key: w.backendSnapshotKey()})
+
+	specPayload, err := encodeGobValue(w.Spec)
+	if err != nil {
+		return err
+	}
+	ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: w.backendV2SpecKey(), Value: specPayload})
+
+	for wid, gm := range w.State.Data {
+		windowEnc := encodeWindowIDKey(wid)
+		for groupKey, aggState := range gm {
+			aggPayload, err := encodeGroupAggStateRecord(aggState)
+			if err != nil {
+				return err
+			}
+			key := []byte(fmt.Sprintf("%s/state/%s/%s", w.backendV2BasePrefix(), windowEnc, stableAnyKey(groupKey)))
+			ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: key, Value: aggPayload})
+		}
+	}
+
+	for wid, cm := range w.GroupCounts {
+		windowEnc := encodeWindowIDKey(wid)
+		for groupKey, count := range cm {
+			key := []byte(fmt.Sprintf("%s/counts/%s/%s", w.backendV2BasePrefix(), windowEnc, stableAnyKey(groupKey)))
+			ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: key, Value: []byte(strconv.FormatInt(count, 10))})
+		}
+	}
+
+	for partitionKey, pb := range w.PartitionBuffers {
+		if pb == nil {
+			continue
+		}
+		payload, err := encodeGobValue(*pb)
+		if err != nil {
+			return err
+		}
+		key := []byte(fmt.Sprintf("%s/pbuf/%s", w.backendV2BasePrefix(), stableAnyKey(partitionKey)))
+		ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: key, Value: payload})
+	}
+
+	for partitionKey, sb := range w.SessionBuffers {
+		if sb == nil {
+			continue
+		}
+		payload, err := encodeGobValue(*sb)
+		if err != nil {
+			return err
+		}
+		key := []byte(fmt.Sprintf("%s/sbuf/%s", w.backendV2BasePrefix(), stableAnyKey(partitionKey)))
+		ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: key, Value: payload})
+	}
+
+	for partitionKey, out := range w.sessionOut {
+		payload, err := encodeGobValue(out)
+		if err != nil {
+			return err
+		}
+		key := []byte(fmt.Sprintf("%s/sout/%s", w.backendV2BasePrefix(), stableAnyKey(partitionKey)))
+		ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: key, Value: payload})
+	}
+
+	return w.stateBackend.BatchWrite(ops)
+}
+
 func (w *WindowAggOp) ensureStateMaps() {
 	if w.State.Data == nil {
 		w.State.Data = make(map[WindowID]map[any]any)
@@ -164,6 +513,9 @@ func (w *WindowAggOp) ensureStateMaps() {
 	}
 	if w.SessionBuffers == nil {
 		w.SessionBuffers = make(map[any]*PartitionBuffer)
+	}
+	if w.PartitionBuffers == nil {
+		w.PartitionBuffers = make(map[any]*PartitionBuffer)
 	}
 	if w.sessionOut == nil {
 		w.sessionOut = make(map[any]map[string]types.Tuple)
@@ -272,20 +624,36 @@ func windowIDsForSession(spec WindowSpecLite, ts int64) []WindowID {
 // Apply applies a delta-batch to windowed aggregates and returns the
 // corresponding delta output for affected windows only.
 func (w *WindowAggOp) Apply(batch types.Batch) (types.Batch, error) {
-	// Choose execution path based on frame specification
-	if w.FrameSpec != nil && w.OrderByCol != "" {
-		return w.applyFrameBased(batch)
+	if err := w.loadBackendState(); err != nil {
+		return nil, err
 	}
 
-	// Choose window type
-	switch w.Spec.WindowType {
-	case WindowTypeSliding:
-		return w.applySliding(batch)
-	case WindowTypeSession:
-		return w.applySession(batch)
-	default: // TUMBLING or empty
-		return w.applyTumbling(batch)
+	var (
+		out types.Batch
+		err error
+	)
+
+	// Choose execution path based on frame specification
+	if w.FrameSpec != nil && w.OrderByCol != "" {
+		out, err = w.applyFrameBased(batch)
+	} else {
+		// Choose window type
+		switch w.Spec.WindowType {
+		case WindowTypeSliding:
+			out, err = w.applySliding(batch)
+		case WindowTypeSession:
+			out, err = w.applySession(batch)
+		default: // TUMBLING or empty
+			out, err = w.applyTumbling(batch)
+		}
 	}
+	if err != nil {
+		return nil, err
+	}
+	if err := w.flushBackendState(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // applyTumbling handles tumbling windows (original implementation)

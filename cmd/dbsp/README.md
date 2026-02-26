@@ -33,6 +33,13 @@ pipeline:
   sink:
     type: console | file
     config: {}
+  state_backend:
+    enabled: false
+    type: memory | kv
+    path: /tmp/dbsp-state.db
+    checkpoint_mode: full | incremental
+    checkpoint_every_batches: 100
+    max_incremental_mutation_bytes: 1048576
   partition:
     enabled: false
     keys: [plant_id, local_date]
@@ -40,8 +47,33 @@ pipeline:
 
 - `wal.enabled`(선택, 기본 false): 입력 배치를 SQLite에 append-only로 기록(WAL)
 - `wal.path`(선택): SQLite DB 파일 경로
+- `state_backend.max_incremental_mutation_bytes`(선택, 기본 1048576): incremental checkpoint에서 drain된 mutation payload가 임계치를 넘으면 자동 full checkpoint로 승격
 - `partition.enabled`(선택, 기본 false): 파티션 fan-out 실행 모드
 - `partition.keys`(필수 when enabled): Hive 경로 키 순서 (예: `[plant_id, local_date]`)
+
+### state_backend 튜닝 가이드
+
+`state_backend.checkpoint_mode: incremental`를 사용할 때는 아래 두 값을 함께 조정하는 것을 권장합니다.
+
+- `state_backend.checkpoint_every_batches`
+- `state_backend.max_incremental_mutation_bytes`
+
+권장 시작값:
+
+| 워크로드 성격 | checkpoint_every_batches | max_incremental_mutation_bytes | 의도 |
+| --- | ---: | ---: | --- |
+| 저변화율(작은 업데이트 다수) | 50~200 | 524288~1048576 | 증분 체크포인트 위주로 I/O 절감 |
+| 중간 변화율(일반 OLAP ingest) | 20~100 | 1048576~4194304 | 복구 시간/체크포인트 비용 균형 |
+| 고변화율(대량 upsert/delete burst) | 5~50 | 262144~1048576 | chain 장기화 방지, full 승격 빠르게 |
+
+튜닝 순서:
+
+1. 기본값(`checkpoint_every_batches=100`, `max_incremental_mutation_bytes=1048576`)으로 시작
+2. 복구 시간이 길면 `checkpoint_every_batches`를 줄임
+3. 체크포인트 I/O가 과하면 `checkpoint_every_batches`를 늘리되,
+   mutation burst가 크면 `max_incremental_mutation_bytes`를 낮춰 자동 full 승격을 빠르게 유도
+4. partition fan-out 환경에서는 파티션별 mutation 크기 편차가 크므로,
+   먼저 hottest partition 기준으로 값을 맞춘 뒤 전체를 확장
 
 주의: WAL replay는 **엔진 state 복구 목적**이며, 기본 구현은 replay 구간의 결과를 sink로 재출력하지 않습니다(중복 방지).
 추가로, 이 정책에서는 프로세스가 “WAL에는 기록했지만 sink에 쓰기 전에” 크래시되면 해당 구간의 출력이 유실될 수 있습니다(재시작 시 replay가 출력 복구를 하지 않기 때문).
