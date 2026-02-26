@@ -7,9 +7,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/ariyn/dbsp/internal/dbsp/testutil"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 	"github.com/ariyn/dbsp/internal/dbsp/wal"
-	"github.com/ariyn/dbsp/internal/dbsp/testutil"
 )
 
 type countingSink struct {
@@ -18,8 +18,8 @@ type countingSink struct {
 }
 
 type failOnceSink struct {
-	mu        sync.Mutex
-	failed    bool
+	mu         sync.Mutex
+	failed     bool
 	writeCalls int
 }
 
@@ -134,13 +134,13 @@ type testSnapshotter struct {
 
 type policySnapshotter struct {
 	*testSnapshotter
-	mode     string
-	fullEvery int
+	mode             string
+	fullEvery        int
 	maxMutationBytes int
 }
 
-func (p *policySnapshotter) CheckpointMode() string { return p.mode }
-func (p *policySnapshotter) FullSnapshotEvery() int { return p.fullEvery }
+func (p *policySnapshotter) CheckpointMode() string           { return p.mode }
+func (p *policySnapshotter) FullSnapshotEvery() int           { return p.fullEvery }
 func (p *policySnapshotter) MaxIncrementalMutationBytes() int { return p.maxMutationBytes }
 
 type mutationPolicySnapshotter struct {
@@ -544,9 +544,9 @@ func TestRunPipeline_WAL_Checkpoint_IncrementalMode_ForceFullOnLargeMutationPayl
 
 	snapshotter := &mutationPolicySnapshotter{
 		policySnapshotter: &policySnapshotter{
-			testSnapshotter: &testSnapshotter{snapshot: []byte("snap")},
-			mode:            "incremental",
-			fullEvery:       100,
+			testSnapshotter:  &testSnapshotter{snapshot: []byte("snap")},
+			mode:             "incremental",
+			fullEvery:        100,
 			maxMutationBytes: 64,
 		},
 		mutations: []wal.CheckpointMutation{{Type: "put", Key: []byte("k1"), Value: largeValue}},

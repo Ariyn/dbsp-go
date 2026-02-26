@@ -3,15 +3,15 @@ package pipeline
 import walpkg "github.com/ariyn/dbsp/internal/dbsp/wal"
 
 type PipelineSnapshotterFunc struct {
-	SnapFunc    func() ([]byte, error)
-	RestoreFunc func([]byte) error
-	AfterCheckpointFunc func(mode string, lastSeq int64)
-	DrainCheckpointMutationsFunc func() []walpkg.CheckpointMutation
-	ApplyCheckpointMutationsFunc func([]walpkg.CheckpointMutation) error
+	SnapFunc                        func() ([]byte, error)
+	RestoreFunc                     func([]byte) error
+	AfterCheckpointFunc             func(mode string, lastSeq int64)
+	DrainCheckpointMutationsFunc    func() []walpkg.CheckpointMutation
+	ApplyCheckpointMutationsFunc    func([]walpkg.CheckpointMutation) error
 	RollbackCheckpointMutationsFunc func([]walpkg.CheckpointMutation)
 
-	Mode                    string
-	FullSnapshotEveryBatches int
+	Mode                           string
+	FullSnapshotEveryBatches       int
 	MaxIncrementalMutationBytesVal int
 }
 

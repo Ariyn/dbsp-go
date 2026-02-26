@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/apache/arrow/go/v15/arrow"
@@ -123,6 +124,34 @@ func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
 	return nil
 }
 
+func (s *HTTPPullSink) WriteBatchWithPartition(batch types.Batch, values map[string]string) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	pk := s.partitionKeyFromValues(values)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	store, ok := s.partitions[pk]
+	if !ok {
+		store = op.NewZSetStore()
+		s.partitions[pk] = store
+	}
+	if err := store.ApplyDelta(batch); err != nil {
+		return err
+	}
+
+	if s.cfg.DiskSpillPath != "" {
+		if err := s.persistPartition(pk, store); err != nil {
+			fmt.Printf("failed to persist partition %s: %v\n", pk, err)
+		}
+	}
+
+	return nil
+}
+
 func (s *HTTPPullSink) persistPartition(pk string, store *op.ZSetStore) error {
 	path := s.partitionSpillPath(pk)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -195,6 +224,29 @@ func (s *HTTPPullSink) getPartitionKey(t types.Tuple) string {
 	}
 	b, _ := json.Marshal(vals)
 	return string(b)
+}
+
+func (s *HTTPPullSink) partitionKeyFromValues(values map[string]string) string {
+	if len(s.partitionBy) == 0 {
+		return "default"
+	}
+	if len(s.partitionBy) == 1 {
+		return normalizePartitionValue(values[s.partitionBy[0]])
+	}
+
+	vals := make(map[string]string, len(s.partitionBy))
+	for _, col := range s.partitionBy {
+		vals[col] = normalizePartitionValue(values[col])
+	}
+	b, _ := json.Marshal(vals)
+	return string(b)
+}
+
+func normalizePartitionValue(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "null"
+	}
+	return value
 }
 
 func (s *HTTPPullSink) Close() error {

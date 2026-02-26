@@ -30,7 +30,9 @@ func (passthroughOp) Apply(batch types.Batch) (types.Batch, error) { return batc
 
 type failingOp struct{}
 
-func (failingOp) Apply(types.Batch) (types.Batch, error) { return nil, fmt.Errorf("injected execute failure") }
+func (failingOp) Apply(types.Batch) (types.Batch, error) {
+	return nil, fmt.Errorf("injected execute failure")
+}
 
 type failOncePartitionSink struct {
 	failed bool

@@ -10,6 +10,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// PartitionedSink supports writing batches with fixed partition values.
+type PartitionedSink interface {
+	WriteBatchWithPartition(batch types.Batch, values map[string]string) error
+}
+
 type SinkBatchConfig struct {
 	MaxBatchSize    int `yaml:"max_batch_size"`
 	MaxBatchDelayMS int `yaml:"max_batch_delay_ms"`
@@ -62,6 +67,8 @@ type BatchSink struct {
 	timer    *time.Timer
 	closed   bool
 	asyncErr error
+
+	partitionValues map[string]string
 }
 
 func NewBatchSink(inner provider.Sink, maxBatchSize int, maxBatchDelay time.Duration) *BatchSink {
@@ -90,6 +97,51 @@ func (s *BatchSink) WriteBatch(batch types.Batch) error {
 		s.mu.Unlock()
 		return fmt.Errorf("batch sink is closed")
 	}
+	if s.partitionValues != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("batch sink cannot accept non-partitioned batches while partitioned buffer is active")
+	}
+
+	wasEmpty := len(s.buffer) == 0
+	s.buffer = append(s.buffer, batch...)
+	if wasEmpty && len(s.buffer) > 0 {
+		s.startTimerLocked()
+	}
+
+	if s.maxBatchSize > 0 && len(s.buffer) >= s.maxBatchSize {
+		shouldFlush = true
+	}
+	s.mu.Unlock()
+
+	if shouldFlush {
+		return s.Flush()
+	}
+	return nil
+}
+
+func (s *BatchSink) WriteBatchWithPartition(batch types.Batch, values map[string]string) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	var shouldFlush bool
+
+	s.mu.Lock()
+	if s.asyncErr != nil {
+		err := s.asyncErr
+		s.mu.Unlock()
+		return err
+	}
+	if s.closed {
+		s.mu.Unlock()
+		return fmt.Errorf("batch sink is closed")
+	}
+	if s.partitionValues == nil {
+		s.partitionValues = copyPartitionValues(values)
+	} else if !partitionValuesEqual(s.partitionValues, values) {
+		s.mu.Unlock()
+		return fmt.Errorf("batch sink received mixed partition values")
+	}
 
 	wasEmpty := len(s.buffer) == 0
 	s.buffer = append(s.buffer, batch...)
@@ -110,14 +162,25 @@ func (s *BatchSink) WriteBatch(batch types.Batch) error {
 
 func (s *BatchSink) Flush() error {
 	for {
-		chunk, remaining, err := s.takeChunkForFlush()
+		chunk, remaining, values, err := s.takeChunkForFlush()
 		if err != nil {
 			return err
 		}
 		if len(chunk) == 0 {
 			return nil
 		}
-		if err := s.inner.WriteBatch(chunk); err != nil {
+		if values != nil {
+			ps, ok := s.inner.(PartitionedSink)
+			if !ok {
+				err := fmt.Errorf("batch sink inner does not support partitioned writes")
+				s.setAsyncErr(err)
+				return err
+			}
+			if err := ps.WriteBatchWithPartition(chunk, values); err != nil {
+				s.setAsyncErr(err)
+				return err
+			}
+		} else if err := s.inner.WriteBatch(chunk); err != nil {
 			s.setAsyncErr(err)
 			return err
 		}
@@ -180,16 +243,16 @@ func (s *BatchSink) stopTimerLocked() {
 	}
 }
 
-func (s *BatchSink) takeChunkForFlush() (chunk types.Batch, remaining bool, err error) {
+func (s *BatchSink) takeChunkForFlush() (chunk types.Batch, remaining bool, values map[string]string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.asyncErr != nil {
-		return nil, false, s.asyncErr
+		return nil, false, nil, s.asyncErr
 	}
 	if len(s.buffer) == 0 {
 		s.stopTimerLocked()
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 
 	maxSize := s.maxBatchSize
@@ -201,17 +264,20 @@ func (s *BatchSink) takeChunkForFlush() (chunk types.Batch, remaining bool, err 
 		chunk = append(types.Batch(nil), s.buffer[:maxSize]...)
 		s.buffer = s.buffer[maxSize:]
 		remaining = true
+		values = copyPartitionValues(s.partitionValues)
 		// Keep timer running if delay-based batching is enabled.
 		if s.maxBatchDelay > 0 {
 			s.timer.Reset(s.maxBatchDelay)
 		}
-		return chunk, remaining, nil
+		return chunk, remaining, values, nil
 	}
 
 	chunk = append(types.Batch(nil), s.buffer...)
 	s.buffer = nil
 	s.stopTimerLocked()
-	return chunk, false, nil
+	values = copyPartitionValues(s.partitionValues)
+	s.partitionValues = nil
+	return chunk, false, values, nil
 }
 
 func (s *BatchSink) setAsyncErr(err error) {
@@ -225,4 +291,27 @@ func (s *BatchSink) setAsyncErr(err error) {
 	}
 	// stop timer so we don't keep trying
 	s.stopTimerLocked()
+}
+
+func copyPartitionValues(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for k, v := range values {
+		out[k] = v
+	}
+	return out
+}
+
+func partitionValuesEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }

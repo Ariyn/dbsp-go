@@ -145,12 +145,13 @@ func runPartitionFanout(ctx context.Context, cfg *config.PipelineConfig) error {
 			}
 			key := makePartitionKey(partCfg.Keys, partitionValues)
 			if _, exists := runtimes[key]; !exists {
-				rt, err := buildPartitionRuntime(cfg, partitionValues, sharedPartitionSink)
+				rt, sharedSink, err := buildPartitionRuntime(cfg, partitionValues, sharedPartitionSink)
 				if err != nil {
 					return fmt.Errorf("initializing runtime for partition %s: %w", config.PartitionSummary(partitionValues, partCfg.Keys), err)
 				}
-				if cfg.Pipeline.Sink.Type == "http_pull" && sharedPartitionSink == nil {
-					sharedPartitionSink = rt.sink
+				if cfg.Pipeline.Sink.Type == "http_pull" && sharedPartitionSink == nil && sharedSink != nil {
+					sharedPartitionSink = sharedSink
+					defer sharedPartitionSink.Close()
 				}
 				runtimes[key] = rt
 				fmt.Printf("Created partition runtime (%s)\n", config.PartitionSummary(partitionValues, partCfg.Keys))
@@ -209,6 +210,11 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig, partitio
 		parquetSchema, err = config.InferOrLoadParquetSchema(query, cfg.Pipeline.Source, sinkCfg)
 		if err != nil {
 			return fmt.Errorf("inferring parquet schema: %w", err)
+		}
+	}
+	if cfg.Pipeline.Sink.Type == "http_pull" && !cfg.Pipeline.Partition.Enabled {
+		if err := validatePartitionColumns(parquetSchema, rootNode.PartitionBy); err != nil {
+			return err
 		}
 	}
 
@@ -299,8 +305,8 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig, partitio
 		return op.Execute(rootNode, batch)
 	}, writeAheadLog,
 		pipeline.PipelineSnapshotterFunc{
-			SnapFunc:                 func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
-			RestoreFunc:              func(b []byte) error { return op.RestoreGraph(rootNode, b) },
+			SnapFunc:    func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
+			RestoreFunc: func(b []byte) error { return op.RestoreGraph(rootNode, b) },
 			DrainCheckpointMutationsFunc: func() []walpkg.CheckpointMutation {
 				if mutationTracker == nil {
 					return nil
@@ -318,8 +324,8 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig, partitio
 			RollbackCheckpointMutationsFunc: func(mutations []walpkg.CheckpointMutation) {
 				restoreCheckpointMutationsToTracker(mutationTracker, mutations)
 			},
-			Mode:                     strings.ToLower(strings.TrimSpace(cfg.Pipeline.State.CheckpointMode)),
-			FullSnapshotEveryBatches: cfg.Pipeline.State.CheckpointEveryBatches,
+			Mode:                           strings.ToLower(strings.TrimSpace(cfg.Pipeline.State.CheckpointMode)),
+			FullSnapshotEveryBatches:       cfg.Pipeline.State.CheckpointEveryBatches,
 			MaxIncrementalMutationBytesVal: cfg.Pipeline.State.MaxIncrementalMutationBytes,
 		},
 		cfg.Pipeline.WAL.CheckpointEveryBatches,
@@ -344,26 +350,26 @@ func newSource(cfg *config.PipelineConfig) (provider.Source, error) {
 	}
 }
 
-func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[string]string, sharedSink provider.Sink) (*partitionRuntime, error) {
+func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[string]string, sharedSink provider.Sink) (*partitionRuntime, provider.Sink, error) {
 	if cfg.Pipeline.Transform.Type != "sql" {
-		return nil, fmt.Errorf("unsupported transform type: %s", cfg.Pipeline.Transform.Type)
+		return nil, nil, fmt.Errorf("unsupported transform type: %s", cfg.Pipeline.Transform.Type)
 	}
 	query := strings.TrimSpace(cfg.Pipeline.Transform.Query)
 	rootNode, err := compileIncrementalQuery(query)
 	if err != nil {
-		return nil, fmt.Errorf("compiling SQL query: %w", err)
+		return nil, nil, fmt.Errorf("compiling SQL query: %w", err)
 	}
 
 	if cfg.Pipeline.Transform.Watermark.Enabled {
 		wmCfg, err := watermark.BuildWatermarkConfig(cfg.Pipeline.Transform.Watermark)
 		if err != nil {
-			return nil, fmt.Errorf("parsing watermark config: %w", err)
+			return nil, nil, fmt.Errorf("parsing watermark config: %w", err)
 		}
 		watermark.ApplyWatermarkConfig(rootNode, wmCfg)
 	}
 	ttl, err := validateTransformTTL(cfg.Pipeline.Transform.TTL, cfg.Pipeline.WAL.Enabled)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	sinkCfg := cloneConfigMap(cfg.Pipeline.Sink.Config)
@@ -375,12 +381,33 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 	if sharedSink == nil && (cfg.Pipeline.Sink.Type == "parquet" || cfg.Pipeline.Sink.Type == "http_pull") {
 		parquetSchema, err = config.InferOrLoadParquetSchema(query, cfg.Pipeline.Source, sinkCfg)
 		if err != nil {
-			return nil, fmt.Errorf("inferring parquet schema: %w", err)
+			return nil, nil, fmt.Errorf("inferring parquet schema: %w", err)
+		}
+	}
+	if cfg.Pipeline.Sink.Type == "http_pull" && !cfg.Pipeline.Partition.Enabled {
+		if err := validatePartitionColumns(parquetSchema, rootNode.PartitionBy); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	var snk provider.Sink
-	if sharedSink != nil {
+	var sharedHTTPPull provider.Sink
+	if cfg.Pipeline.Sink.Type == "http_pull" {
+		if sharedSink != nil {
+			snk = sink.NewNoopCloseSink(sharedSink)
+		} else {
+			partitionBy := rootNode.PartitionBy
+			if cfg.Pipeline.Partition.Enabled {
+				partitionBy = cfg.Pipeline.Partition.Keys
+			}
+			snk, err = sink.NewHTTPPullSink(sinkCfg, partitionBy, parquetSchema)
+			if err != nil {
+				return nil, nil, fmt.Errorf("initializing sink: %w", err)
+			}
+			sharedHTTPPull = snk
+			snk = sink.NewNoopCloseSink(snk)
+		}
+	} else if sharedSink != nil {
 		snk = sharedSink
 	} else {
 		switch cfg.Pipeline.Sink.Type {
@@ -390,19 +417,17 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 			snk, err = sink.NewFileSink(sinkCfg)
 		case "parquet":
 			snk, err = sink.NewParquetSink(sinkCfg, parquetSchema)
-		case "http_pull":
-			snk, err = sink.NewHTTPPullSink(sinkCfg, rootNode.PartitionBy, parquetSchema)
 		default:
 			err = fmt.Errorf("unsupported sink type: %s", cfg.Pipeline.Sink.Type)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("initializing sink: %w", err)
+			return nil, nil, fmt.Errorf("initializing sink: %w", err)
 		}
-		snk, err = sink.WrapSinkWithBatchingIfConfigured(sinkCfg, snk)
-		if err != nil {
-			_ = snk.Close()
-			return nil, fmt.Errorf("initializing sink batching: %w", err)
-		}
+	}
+	snk, err = sink.WrapSinkWithBatchingIfConfigured(sinkCfg, snk)
+	if err != nil {
+		_ = snk.Close()
+		return nil, nil, fmt.Errorf("initializing sink batching: %w", err)
 	}
 
 	var writeAheadLog *wal.SQLiteWAL
@@ -414,7 +439,7 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 		writeAheadLog, err = wal.NewSQLiteWAL(walPath)
 		if err != nil {
 			_ = snk.Close()
-			return nil, fmt.Errorf("initializing WAL: %w", err)
+			return nil, nil, fmt.Errorf("initializing WAL: %w", err)
 		}
 		if ttl > 0 {
 			writeAheadLog.SetRetentionTTL(ttl)
@@ -441,7 +466,7 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 				_ = writeAheadLog.Close()
 			}
 			_ = snk.Close()
-			return nil, fmt.Errorf("initializing state backend: %w", err)
+			return nil, nil, fmt.Errorf("initializing state backend: %w", err)
 		}
 		op.AttachJoinStateBackend(rootNode, stateBackend)
 		op.AttachGroupAggStateBackend(rootNode, stateBackend)
@@ -455,8 +480,8 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 		wal:      writeAheadLog,
 		state:    stateBackend,
 		snapshotter: pipeline.PipelineSnapshotterFunc{
-			SnapFunc:                 func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
-			RestoreFunc:              func(b []byte) error { return op.RestoreGraph(rootNode, b) },
+			SnapFunc:    func() ([]byte, error) { return op.SnapshotGraph(rootNode) },
+			RestoreFunc: func(b []byte) error { return op.RestoreGraph(rootNode, b) },
 			DrainCheckpointMutationsFunc: func() []walpkg.CheckpointMutation {
 				if mutationTracker == nil {
 					return nil
@@ -474,8 +499,8 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 			RollbackCheckpointMutationsFunc: func(mutations []walpkg.CheckpointMutation) {
 				restoreCheckpointMutationsToTracker(mutationTracker, mutations)
 			},
-			Mode:                     strings.ToLower(strings.TrimSpace(cfg.Pipeline.State.CheckpointMode)),
-			FullSnapshotEveryBatches: cfg.Pipeline.State.CheckpointEveryBatches,
+			Mode:                           strings.ToLower(strings.TrimSpace(cfg.Pipeline.State.CheckpointMode)),
+			FullSnapshotEveryBatches:       cfg.Pipeline.State.CheckpointEveryBatches,
 			MaxIncrementalMutationBytesVal: cfg.Pipeline.State.MaxIncrementalMutationBytes,
 		},
 	}
@@ -484,10 +509,10 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 		if rt.wal != nil {
 			_ = rt.wal.Close()
 		}
-		return nil, err
+		return nil, nil, err
 	}
 
-	return rt, nil
+	return rt, sharedHTTPPull, nil
 }
 
 func parsePipelineConfig(configFile []byte) (config.PipelineConfig, error) {
@@ -517,6 +542,30 @@ func validateTransformTTL(ttl string, walEnabled bool) (time.Duration, error) {
 	return parsed, nil
 }
 
+func validatePartitionColumns(schema *config.ParquetSchema, partitionBy []string) error {
+	if len(partitionBy) == 0 || schema == nil {
+		return nil
+	}
+	available := make(map[string]struct{}, len(schema.Columns))
+	colNames := make([]string, 0, len(schema.Columns))
+	for _, col := range schema.Columns {
+		available[col.Name] = struct{}{}
+		colNames = append(colNames, col.Name)
+	}
+
+	missing := make([]string, 0, len(partitionBy))
+	for _, key := range partitionBy {
+		if _, ok := available[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("http_pull partition keys must be present in the query output; missing=%s output_columns=%s", strings.Join(missing, ","), strings.Join(colNames, ","))
+}
+
 func runPartitionBatch(ctx context.Context, cfg *config.PipelineConfig, rt *partitionRuntime, batch types.Batch) error {
 	rt.batchCount++
 	if rt.wal != nil {
@@ -529,7 +578,15 @@ func runPartitionBatch(ctx context.Context, cfg *config.PipelineConfig, rt *part
 	if err != nil {
 		return err
 	}
-	if err := rt.sink.WriteBatch(resultBatch); err != nil {
+	if cfg.Pipeline.Partition.Enabled && cfg.Pipeline.Sink.Type == "http_pull" {
+		if ps, ok := rt.sink.(sink.PartitionedSink); ok {
+			if err := ps.WriteBatchWithPartition(resultBatch, rt.values); err != nil {
+				return err
+			}
+		} else if err := rt.sink.WriteBatch(resultBatch); err != nil {
+			return err
+		}
+	} else if err := rt.sink.WriteBatch(resultBatch); err != nil {
 		return err
 	}
 

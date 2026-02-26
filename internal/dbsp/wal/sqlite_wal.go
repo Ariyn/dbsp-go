@@ -14,20 +14,20 @@ import (
 )
 
 const (
-	sqliteCodecGobV1      = "gob-v1"
-	sqliteCodecGraphGobV1 = "graph-gob-v1"
-	sqliteCodecGraphIncV1 = "graph-inc-meta-v1"
+	sqliteCodecGobV1       = "gob-v1"
+	sqliteCodecGraphGobV1  = "graph-gob-v1"
+	sqliteCodecGraphIncV1  = "graph-inc-meta-v1"
 	sqliteCodecGraphIncDV1 = "graph-inc-delta-v1"
 )
 
 // Checkpoint represents a persisted operator-graph snapshot paired with a WAL position.
 // lastSeq is the maximum seq included in the snapshot; replay should continue with seq > lastSeq.
 type Checkpoint struct {
-	LastSeq  int64
-	Codec    string
-	Snapshot []byte
-	Mode     string
-	BaseSeq  int64
+	LastSeq   int64
+	Codec     string
+	Snapshot  []byte
+	Mode      string
+	BaseSeq   int64
 	Mutations []CheckpointMutation
 }
 

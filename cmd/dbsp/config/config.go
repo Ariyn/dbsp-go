@@ -3,12 +3,12 @@ package config
 // PipelineConfig defines the structure of the configuration file
 type PipelineConfig struct {
 	Pipeline struct {
-		Source    SourceConfig    `yaml:"source"`
-		Transform TransformConfig `yaml:"transform"`
-		Sink      SinkConfig      `yaml:"sink"`
-		WAL       WALConfig       `yaml:"wal"`
+		Source    SourceConfig       `yaml:"source"`
+		Transform TransformConfig    `yaml:"transform"`
+		Sink      SinkConfig         `yaml:"sink"`
+		WAL       WALConfig          `yaml:"wal"`
 		State     StateBackendConfig `yaml:"state_backend"`
-		Partition PartitionConfig `yaml:"partition"`
+		Partition PartitionConfig    `yaml:"partition"`
 	} `yaml:"pipeline"`
 }
 
