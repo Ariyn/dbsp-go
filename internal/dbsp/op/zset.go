@@ -44,6 +44,9 @@ func (s *ZSetStore) ApplyDelta(delta types.Batch) error {
 	if s.entries == nil {
 		s.entries = make(map[string]*zsetEntry)
 	}
+	// NOTE: This function mutates state as it scans the batch.
+	// If it returns an error (e.g. underflow) part-way through, earlier updates
+	// have already been applied and are NOT rolled back.
 	for _, td := range delta {
 		tk := stableTupleKey(td.Tuple)
 		e, ok := s.entries[tk]
@@ -90,6 +93,9 @@ func (s *ZSetStore) LookupByKey(key any, keyFn func(types.Tuple) any) []types.Tu
 		if keyFn == nil {
 			return true
 		}
+		// WARNING: Comparing interface{} with '==' panics if the dynamic values are
+		// not comparable (e.g. slices, maps). Ensure keyFn returns comparable types,
+		// or switch to a safe equality helper.
 		if keyFn(t) == key {
 			out = append(out, types.TupleDelta{Tuple: t, Count: count})
 		}
