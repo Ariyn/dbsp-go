@@ -54,7 +54,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64,darwin/arm64
           cache-from: type=gha,scope=dbsp-go-image
           cache-to: type=gha,scope=dbsp-go-image,mode=max
           tags: ${{ steps.meta.outputs.tags }}
