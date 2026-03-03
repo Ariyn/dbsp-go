@@ -13,6 +13,15 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+func pragmaInt(t *testing.T, db *sql.DB, name string) int64 {
+	t.Helper()
+	var out int64
+	if err := db.QueryRow("PRAGMA " + name + ";").Scan(&out); err != nil {
+		t.Fatalf("PRAGMA %s: %v", name, err)
+	}
+	return out
+}
+
 func TestSQLiteWAL_AppendAndReplay_RoundTrip(t *testing.T) {
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "wal.db")
@@ -86,6 +95,43 @@ func TestSQLiteWAL_TableRowCount(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("expected 2 rows, got %d", count)
+	}
+}
+
+func TestSQLiteWAL_PragmasApplied(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "wal.db")
+
+	cfg := SQLiteWALConfig{
+		TempStore:     "FILE",
+		CacheSize:     2000,
+		MmapSize:      1 << 20,
+		BusyTimeoutMS: 5000,
+		ExtraPragmas: map[string]string{
+			"journal_size_limit": "1048576",
+		},
+	}
+
+	w, err := NewSQLiteWALWithConfig(dbPath, cfg)
+	if err != nil {
+		t.Fatalf("NewSQLiteWALWithConfig: %v", err)
+	}
+	defer w.Close()
+
+	if got := pragmaInt(t, w.db, "temp_store"); got != 1 {
+		t.Fatalf("temp_store pragma mismatch: got=%d want=1", got)
+	}
+	if got := pragmaInt(t, w.db, "cache_size"); got != 2000 {
+		t.Fatalf("cache_size pragma mismatch: got=%d want=2000", got)
+	}
+	if got := pragmaInt(t, w.db, "mmap_size"); got != 1<<20 {
+		t.Fatalf("mmap_size pragma mismatch: got=%d want=%d", got, 1<<20)
+	}
+	if got := pragmaInt(t, w.db, "busy_timeout"); got != 5000 {
+		t.Fatalf("busy_timeout pragma mismatch: got=%d want=5000", got)
+	}
+	if got := pragmaInt(t, w.db, "journal_size_limit"); got != 1048576 {
+		t.Fatalf("journal_size_limit pragma mismatch: got=%d want=1048576", got)
 	}
 }
 

@@ -56,9 +56,32 @@ type WALConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
 
+	// SQLitePragmas tune SQLite WAL memory usage and behavior.
+	SQLitePragmas WALSQLitePragmaConfig `yaml:"sqlite_pragmas"`
+
 	// CheckpointEveryBatches enables periodic operator-graph snapshots.
 	// If 0, checkpointing is disabled.
 	CheckpointEveryBatches int `yaml:"checkpoint_every_batches"`
+}
+
+// WALSQLitePragmaConfig exposes optional SQLite pragmas for WAL tuning.
+// Empty values keep the SQLite defaults or internal WAL defaults.
+type WALSQLitePragmaConfig struct {
+	// TempStore controls temp storage: MEMORY | FILE | DEFAULT.
+	TempStore string `yaml:"temp_store"`
+
+	// CacheSize sets the page cache size. 0 keeps SQLite default.
+	CacheSize int `yaml:"cache_size"`
+
+	// MmapSize sets mmap size in bytes. 0 keeps SQLite default.
+	MmapSize int64 `yaml:"mmap_size"`
+
+	// BusyTimeoutMS sets the busy timeout in milliseconds. 0 keeps SQLite default.
+	BusyTimeoutMS int `yaml:"busy_timeout_ms"`
+
+	// ExtraPragmas allows arbitrary pragma overrides.
+	// Example: {"journal_size_limit": "1048576"}
+	ExtraPragmas map[string]string `yaml:"extra_pragmas"`
 }
 
 // SourceConfig defines the configuration for the data source

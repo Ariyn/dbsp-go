@@ -262,7 +262,7 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig, partitio
 		if cfg.Pipeline.Partition.Enabled && len(partitionValues) > 0 && strings.TrimSpace(walPath) != "" {
 			walPath = config.BuildHivePartitionPath(walPath, cfg.Pipeline.Partition.Keys, partitionValues)
 		}
-		writeAheadLog, err = wal.NewSQLiteWAL(walPath)
+		writeAheadLog, err = wal.NewSQLiteWALWithConfig(walPath, buildSQLiteWALConfig(cfg.Pipeline.WAL))
 		if err != nil {
 			return fmt.Errorf("initializing WAL: %w", err)
 		}
@@ -436,7 +436,7 @@ func buildPartitionRuntime(cfg *config.PipelineConfig, partitionValues map[strin
 		if strings.TrimSpace(walPath) != "" {
 			walPath = config.BuildHivePartitionPath(walPath, cfg.Pipeline.Partition.Keys, partitionValues)
 		}
-		writeAheadLog, err = wal.NewSQLiteWAL(walPath)
+		writeAheadLog, err = wal.NewSQLiteWALWithConfig(walPath, buildSQLiteWALConfig(cfg.Pipeline.WAL))
 		if err != nil {
 			_ = snk.Close()
 			return nil, nil, fmt.Errorf("initializing WAL: %w", err)
@@ -523,6 +523,17 @@ func parsePipelineConfig(configFile []byte) (config.PipelineConfig, error) {
 		return config.PipelineConfig{}, err
 	}
 	return cfg, nil
+}
+
+func buildSQLiteWALConfig(cfg config.WALConfig) wal.SQLiteWALConfig {
+	pragmas := cfg.SQLitePragmas
+	return wal.SQLiteWALConfig{
+		TempStore:     pragmas.TempStore,
+		CacheSize:     pragmas.CacheSize,
+		MmapSize:      pragmas.MmapSize,
+		BusyTimeoutMS: pragmas.BusyTimeoutMS,
+		ExtraPragmas:  pragmas.ExtraPragmas,
+	}
 }
 
 func validateTransformTTL(ttl string, walEnabled bool) (time.Duration, error) {

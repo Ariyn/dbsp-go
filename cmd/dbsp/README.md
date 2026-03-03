@@ -24,6 +24,12 @@ pipeline:
   wal:
     enabled: false
     path: /tmp/dbsp-wal.db
+    sqlite_pragmas:
+      temp_store: MEMORY | FILE | DEFAULT
+      cache_size: 0
+      mmap_size: 0
+      busy_timeout_ms: 0
+      extra_pragmas: {}
   source:
     type: csv | http | chain
     config: {}
@@ -47,6 +53,12 @@ pipeline:
 
 - `wal.enabled`(선택, 기본 false): 입력 배치를 SQLite에 append-only로 기록(WAL)
 - `wal.path`(선택): SQLite DB 파일 경로
+- `wal.sqlite_pragmas`(선택): SQLite pragma 튜닝(메모리/동시성/IO 제어)
+  - `temp_store`: MEMORY | FILE | DEFAULT
+  - `cache_size`: 페이지 캐시 크기(0이면 기본값)
+  - `mmap_size`: mmap 크기(바이트, 0이면 기본값)
+  - `busy_timeout_ms`: busy timeout(ms)
+  - `extra_pragmas`: 추가 pragma map
 - `state_backend.max_incremental_mutation_bytes`(선택, 기본 1048576): incremental checkpoint에서 drain된 mutation payload가 임계치를 넘으면 자동 full checkpoint로 승격
 - `partition.enabled`(선택, 기본 false): 파티션 fan-out 실행 모드
 - `partition.keys`(필수 when enabled): Hive 경로 키 순서 (예: `[plant_id, local_date]`)

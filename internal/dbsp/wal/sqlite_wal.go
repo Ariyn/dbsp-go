@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,7 +68,20 @@ type SQLiteWAL struct {
 	retentionTTL time.Duration
 }
 
+// SQLiteWALConfig controls optional SQLite pragma overrides for WAL.
+type SQLiteWALConfig struct {
+	TempStore     string
+	CacheSize     int
+	MmapSize      int64
+	BusyTimeoutMS int
+	ExtraPragmas  map[string]string
+}
+
 func NewSQLiteWAL(path string) (*SQLiteWAL, error) {
+	return NewSQLiteWALWithConfig(path, SQLiteWALConfig{})
+}
+
+func NewSQLiteWALWithConfig(path string, cfg SQLiteWALConfig) (*SQLiteWAL, error) {
 	if path == "" {
 		return nil, fmt.Errorf("wal sqlite path is empty")
 	}
@@ -83,7 +97,7 @@ func NewSQLiteWAL(path string) (*SQLiteWAL, error) {
 
 	// Ensure we close db if initialization fails.
 	w := &SQLiteWAL{db: db}
-	if err := w.init(); err != nil {
+	if err := w.init(cfg); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -124,15 +138,30 @@ func ensureSQLiteDir(dsn string) error {
 	return nil
 }
 
-func (w *SQLiteWAL) init() error {
+func (w *SQLiteWAL) init(cfg SQLiteWALConfig) error {
 	// Tuning for many small appends.
 	// We prefer durability/perf balance; callers can override via DSN if needed.
 	pragmas := []string{
 		`PRAGMA journal_mode=WAL;`,
 		`PRAGMA synchronous=NORMAL;`,
-		`PRAGMA temp_store=MEMORY;`,
 		`PRAGMA foreign_keys=ON;`,
 	}
+
+	if p := normalizeTempStore(cfg.TempStore); p != "" {
+		pragmas = append(pragmas, fmt.Sprintf("PRAGMA temp_store=%s;", p))
+	} else {
+		pragmas = append(pragmas, `PRAGMA temp_store=MEMORY;`)
+	}
+	if cfg.BusyTimeoutMS > 0 {
+		pragmas = append(pragmas, fmt.Sprintf("PRAGMA busy_timeout=%d;", cfg.BusyTimeoutMS))
+	}
+	if cfg.CacheSize != 0 {
+		pragmas = append(pragmas, fmt.Sprintf("PRAGMA cache_size=%d;", cfg.CacheSize))
+	}
+	if cfg.MmapSize > 0 {
+		pragmas = append(pragmas, fmt.Sprintf("PRAGMA mmap_size=%d;", cfg.MmapSize))
+	}
+	appendExtraPragmas(&pragmas, cfg.ExtraPragmas)
 	for _, p := range pragmas {
 		if _, err := w.db.Exec(p); err != nil {
 			return fmt.Errorf("sqlite pragma failed (%s): %w", p, err)
@@ -163,6 +192,44 @@ CREATE INDEX IF NOT EXISTS idx_wal_checkpoints_created_at ON wal_checkpoints(cre
 	}
 
 	return nil
+}
+
+func normalizeTempStore(input string) string {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return ""
+	}
+	upper := strings.ToUpper(trimmed)
+	if upper == "DEFAULT" {
+		return ""
+	}
+	return upper
+}
+
+func appendExtraPragmas(out *[]string, pragmas map[string]string) {
+	if len(pragmas) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(pragmas))
+	for k := range pragmas {
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := strings.TrimSpace(pragmas[key])
+		if value == "" {
+			*out = append(*out, fmt.Sprintf("PRAGMA %s;", key))
+			continue
+		}
+		*out = append(*out, fmt.Sprintf("PRAGMA %s=%s;", key, value))
+	}
 }
 
 func (w *SQLiteWAL) Append(ctx context.Context, batch types.Batch) error {
