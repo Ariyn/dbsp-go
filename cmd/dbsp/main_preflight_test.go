@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
-	"github.com/ariyn/dbsp/internal/dbsp/types"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
+	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
 type closeCountingSink struct {

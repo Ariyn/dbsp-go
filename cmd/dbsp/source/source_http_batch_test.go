@@ -9,16 +9,18 @@ import (
 
 func TestHTTPSourceBatch_MaxBatchSize(t *testing.T) {
 	s := &HTTPSource{
-		buffer:        make(chan types.TupleDelta, 100),
+		buffer:        make(chan bufferedBatch, 100),
 		done:          make(chan struct{}),
 		maxBatchSize:  3,
 		maxBatchDelay: 500 * time.Millisecond,
 	}
 
 	// Pre-fill more than maxBatchSize.
+	items := make(types.Batch, 0, 5)
 	for i := 0; i < 5; i++ {
-		s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": i}, Count: 1}
+		items = append(items, types.TupleDelta{Tuple: types.Tuple{"id": i}, Count: 1})
 	}
+	s.buffer <- bufferedBatch{batch: items, sizeBytes: 0}
 
 	batch, err := s.NextBatch()
 	if err != nil {
@@ -39,21 +41,21 @@ func TestHTTPSourceBatch_MaxBatchSize(t *testing.T) {
 
 func TestHTTPSourceBatch_MaxBatchDelay(t *testing.T) {
 	s := &HTTPSource{
-		buffer:        make(chan types.TupleDelta, 100),
+		buffer:        make(chan bufferedBatch, 100),
 		done:          make(chan struct{}),
 		maxBatchSize:  100,
 		maxBatchDelay: 50 * time.Millisecond,
 	}
 
 	// First item is available immediately.
-	s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": 1}, Count: 1}
+	s.buffer <- bufferedBatch{batch: types.Batch{{Tuple: types.Tuple{"id": 1}, Count: 1}}, sizeBytes: 0}
 
 	// Second item arrives before the deadline; third arrives after.
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": 2}, Count: 1}
+		s.buffer <- bufferedBatch{batch: types.Batch{{Tuple: types.Tuple{"id": 2}, Count: 1}}, sizeBytes: 0}
 		time.Sleep(70 * time.Millisecond)
-		s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": 3}, Count: 1}
+		s.buffer <- bufferedBatch{batch: types.Batch{{Tuple: types.Tuple{"id": 3}, Count: 1}}, sizeBytes: 0}
 	}()
 
 	start := time.Now()

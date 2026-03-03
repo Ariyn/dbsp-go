@@ -112,9 +112,18 @@ type HTTPSourceConfig struct {
 	// Options: "auto" (default), "s", "ms", "us", "ns".
 	TimestampUnit string `yaml:"timestamp_unit"`
 
+	// BufferSize defines the number of pending batches buffered in memory.
 	BufferSize      int `yaml:"buffer_size"`
 	MaxBatchSize    int `yaml:"max_batch_size"`
 	MaxBatchDelayMS int `yaml:"max_batch_delay_ms"`
+
+	// MaxRequestBytes limits the maximum request body size for HTTP ingest.
+	// 0 disables the limit.
+	MaxRequestBytes int64 `yaml:"max_request_bytes"`
+
+	// MaxBufferBytes limits the total buffered request body size in memory.
+	// 0 disables the limit.
+	MaxBufferBytes int64 `yaml:"max_buffer_bytes"`
 }
 
 type ChainSourceConfig struct {

@@ -181,7 +181,7 @@ func TestHTTPAutoConvert(t *testing.T) {
 
 func TestHTTPIngest_MethodAndJSONErrors(t *testing.T) {
 	s := &HTTPSource{
-		buffer: make(chan types.TupleDelta, 10),
+		buffer: make(chan bufferedBatch, 10),
 		schema: map[string]string{"id": "int"},
 	}
 
@@ -202,9 +202,43 @@ func TestHTTPIngest_MethodAndJSONErrors(t *testing.T) {
 	}
 }
 
+func TestHTTPIngest_MaxRequestBytes(t *testing.T) {
+	s := &HTTPSource{
+		buffer:          make(chan bufferedBatch, 10),
+		schema:          map[string]string{"id": "int"},
+		maxRequestBytes: 16,
+	}
+
+	body := strings.Repeat("x", 32)
+	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	s.handleIngest(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", rr.Code)
+	}
+}
+
+func TestHTTPIngest_MaxBufferBytes(t *testing.T) {
+	s := &HTTPSource{
+		buffer:         make(chan bufferedBatch, 10),
+		schema:         map[string]string{"id": "int"},
+		maxBufferBytes: 8,
+	}
+
+	body := `["payload-too-large"]`
+	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	s.handleIngest(rr, req)
+
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", rr.Code)
+	}
+}
+
 func TestHTTPIngest_AtomicRejectOnConversionError(t *testing.T) {
 	s := &HTTPSource{
-		buffer: make(chan types.TupleDelta, 10),
+		buffer: make(chan bufferedBatch, 10),
 		schema: map[string]string{"id": "int"},
 	}
 
@@ -223,7 +257,7 @@ func TestHTTPIngest_AtomicRejectOnConversionError(t *testing.T) {
 
 func TestHTTPIngest_SingleObjectHappyPath(t *testing.T) {
 	s := &HTTPSource{
-		buffer: make(chan types.TupleDelta, 10),
+		buffer: make(chan bufferedBatch, 10),
 		schema: map[string]string{
 			"id":        "int",
 			"active":    "bool",
@@ -241,9 +275,13 @@ func TestHTTPIngest_SingleObjectHappyPath(t *testing.T) {
 		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
 	}
 	if len(s.buffer) != 1 {
-		t.Fatalf("expected 1 buffered tuple, got %d", len(s.buffer))
+		t.Fatalf("expected 1 buffered batch, got %d", len(s.buffer))
 	}
-	td := <-s.buffer
+	entry := <-s.buffer
+	if len(entry.batch) != 1 {
+		t.Fatalf("expected single tuple in batch, got %d", len(entry.batch))
+	}
+	td := entry.batch[0]
 	if td.Tuple["id"] != 7 {
 		t.Fatalf("expected converted id=7, got %v", td.Tuple["id"])
 	}
@@ -456,7 +494,7 @@ func TestNextBatch_DoneAndGuardPaths(t *testing.T) {
 		done := make(chan struct{})
 		close(done)
 		s := &HTTPSource{
-			buffer: make(chan types.TupleDelta, 1),
+			buffer: make(chan bufferedBatch, 1),
 			done:   done,
 		}
 
@@ -471,12 +509,11 @@ func TestNextBatch_DoneAndGuardPaths(t *testing.T) {
 
 	t.Run("maxBatchSize<=0 returns single item", func(t *testing.T) {
 		s := &HTTPSource{
-			buffer:       make(chan types.TupleDelta, 4),
+			buffer:       make(chan bufferedBatch, 4),
 			done:         make(chan struct{}),
 			maxBatchSize: 0,
 		}
-		s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": 1}, Count: 1}
-		s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": 2}, Count: 1}
+		s.buffer <- bufferedBatch{batch: types.Batch{{Tuple: types.Tuple{"id": 1}, Count: 1}, {Tuple: types.Tuple{"id": 2}, Count: 1}}, sizeBytes: 0}
 
 		batch, err := s.NextBatch()
 		if err != nil {
@@ -492,15 +529,12 @@ func TestNextBatch_DoneAndGuardPaths(t *testing.T) {
 
 	t.Run("maxBatchDelay<=0 fast drains buffered items up to max size", func(t *testing.T) {
 		s := &HTTPSource{
-			buffer:        make(chan types.TupleDelta, 8),
+			buffer:        make(chan bufferedBatch, 8),
 			done:          make(chan struct{}),
 			maxBatchSize:  3,
 			maxBatchDelay: 0,
 		}
-		s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": 1}, Count: 1}
-		s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": 2}, Count: 1}
-		s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": 3}, Count: 1}
-		s.buffer <- types.TupleDelta{Tuple: types.Tuple{"id": 4}, Count: 1}
+		s.buffer <- bufferedBatch{batch: types.Batch{{Tuple: types.Tuple{"id": 1}, Count: 1}, {Tuple: types.Tuple{"id": 2}, Count: 1}, {Tuple: types.Tuple{"id": 3}, Count: 1}, {Tuple: types.Tuple{"id": 4}, Count: 1}}, sizeBytes: 0}
 
 		batch, err := s.NextBatch()
 		if err != nil {

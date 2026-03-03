@@ -6,6 +6,9 @@ import (
 	"database/sql"
 	"encoding/gob"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
@@ -69,6 +72,10 @@ func NewSQLiteWAL(path string) (*SQLiteWAL, error) {
 		return nil, fmt.Errorf("wal sqlite path is empty")
 	}
 
+	if err := ensureSQLiteDir(path); err != nil {
+		return nil, err
+	}
+
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite wal: %w", err)
@@ -89,6 +96,32 @@ func NewSQLiteWAL(path string) (*SQLiteWAL, error) {
 	w.insertStmt = stmt
 
 	return w, nil
+}
+
+func ensureSQLiteDir(dsn string) error {
+	fsPath := strings.TrimSpace(dsn)
+	if fsPath == "" {
+		return nil
+	}
+	if strings.HasPrefix(fsPath, "file:") {
+		fsPath = strings.TrimPrefix(fsPath, "file:")
+	}
+	if idx := strings.Index(fsPath, "?"); idx >= 0 {
+		fsPath = fsPath[:idx]
+	}
+	fsPath = strings.TrimSpace(fsPath)
+	if fsPath == "" || fsPath == ":memory:" || fsPath == "::memory:" {
+		return nil
+	}
+
+	dir := filepath.Dir(fsPath)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating wal dir: %w", err)
+	}
+	return nil
 }
 
 func (w *SQLiteWAL) init() error {

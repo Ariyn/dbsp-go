@@ -114,14 +114,21 @@ pipeline:
       buffer_size: 1000
       max_batch_size: 100
       max_batch_delay_ms: 200
+      max_request_bytes: 1048576
+      max_buffer_bytes: 10485760
 ```
 
 - `port`(선택, 기본 8080)
 - `path`(선택, 기본 `/ingest`)
 - `schema`(선택): JSON 필드 타입 변환 힌트
-- `buffer_size`(선택, 기본 1000): 내부 버퍼 크기
+- `buffer_size`(선택, 기본 1000): 내부 대기 배치 수(배치 단위 버퍼링)
 - `max_batch_size`(선택, 기본 100): 한 번에 반환할 최대 레코드 수
 - `max_batch_delay_ms`(선택, 기본 0): 첫 레코드 수신 후 배치를 더 모을 최대 대기(ms)
+- `max_request_bytes`(선택, 기본 0): HTTP 요청 바디 최대 크기(바이트). 0은 제한 없음
+- `max_buffer_bytes`(선택, 기본 0): 내부 버퍼된 요청 바디 합산 크기 제한(바이트). 초과 시 429 반환
+
+성능 팁: 가능하면 요청당 JSON array 크기를 키우고 `max_batch_size`를 넉넉히 잡으면
+WAL/체크포인트 오버헤드가 줄어 ingest throughput이 개선됩니다.
 
 HTTP ingest는 `POST` JSON을 받습니다(단일 object 또는 array 모두 가능).
 
