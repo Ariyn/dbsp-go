@@ -14,6 +14,7 @@ type ProjectExprFn struct {
 type ProjectOp struct {
 	Columns []string
 	Exprs   []ProjectExprFn
+	KeepInput bool
 }
 
 func (p *ProjectOp) Apply(batch types.Batch) (types.Batch, error) {
@@ -23,6 +24,11 @@ func (p *ProjectOp) Apply(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
 	for _, td := range batch {
 		projected := make(types.Tuple)
+		if p.KeepInput {
+			for k, v := range td.Tuple {
+				projected[k] = v
+			}
+		}
 		for _, col := range p.Columns {
 			if v, ok := td.Tuple[col]; ok {
 				projected[col] = v

@@ -77,6 +77,10 @@ type SQLiteWALConfig struct {
 	ExtraPragmas  map[string]string
 }
 
+func init() {
+	gob.Register(time.Time{})
+}
+
 func NewSQLiteWAL(path string) (*SQLiteWAL, error) {
 	return NewSQLiteWALWithConfig(path, SQLiteWALConfig{})
 }

@@ -12,6 +12,9 @@ func TestParseQueryToLogicalPlan_JoinMultiAggPopulatesAggs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseQueryToLogicalPlan: %v", err)
 	}
+	if p, ok := lp.(*ir.LogicalProject); ok && p.Input != nil {
+		lp = p.Input
+	}
 	g, ok := lp.(*ir.LogicalGroupAgg)
 	if !ok {
 		t.Fatalf("expected *ir.LogicalGroupAgg, got %T", lp)

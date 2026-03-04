@@ -3,10 +3,12 @@ package ir
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ariyn/dbsp/internal/dbsp/parse"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
@@ -76,34 +78,8 @@ func buildCaseExprFunc(exprSQL string) func(types.Tuple) (any, error) {
 	}
 }
 
-func indexKeywordOutsideParens(upperSQL string, kw string) int {
-	depth := 0
-	for i := 0; i < len(upperSQL); i++ {
-		switch upperSQL[i] {
-		case '(':
-			depth++
-		case ')':
-			if depth > 0 {
-				depth--
-			}
-		}
-		if depth != 0 {
-			continue
-		}
-		if i+len(kw) <= len(upperSQL) && upperSQL[i:i+len(kw)] == kw {
-			// word boundary
-			leftOK := i == 0 || !isIdentChar(upperSQL[i-1])
-			rightOK := i+len(kw) == len(upperSQL) || !isIdentChar(upperSQL[i+len(kw)])
-			if leftOK && rightOK {
-				return i
-			}
-		}
-	}
-	return -1
-}
-
-func isIdentChar(c byte) bool {
-	return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.'
+func indexKeywordOutsideParens(upperSQL, kw string) int {
+	return parse.IndexKeyword(upperSQL, kw)
 }
 
 // --- CAST ---
@@ -683,6 +659,14 @@ func (n *funcCallNode) eval(t types.Tuple) (any, error) {
 			return nil, fmt.Errorf("STRFTIME requires 2 arguments")
 		}
 		return evalStrftime(evaluatedArgs[0], evaluatedArgs[1])
+	case "ROUND":
+		if len(evaluatedArgs) < 1 || len(evaluatedArgs) > 2 {
+			return nil, fmt.Errorf("ROUND requires 1 or 2 arguments")
+		}
+		if len(evaluatedArgs) == 1 {
+			return evalRound(evaluatedArgs[0], 0)
+		}
+		return evalRound(evaluatedArgs[0], toInt64(evaluatedArgs[1]))
 	default:
 		return nil, fmt.Errorf("unsupported function: %s", n.name)
 	}
@@ -725,6 +709,9 @@ func evalEpoch(ts any) (any, error) {
 }
 
 func evalStrftime(ts any, format any) (any, error) {
+	if ts == nil {
+		return nil, nil
+	}
 	t, err := toTime(ts)
 	if err != nil {
 		return nil, err
@@ -738,6 +725,21 @@ func evalStrftime(ts any, format any) (any, error) {
 	fmtStr = strings.ReplaceAll(fmtStr, "%M", "04")
 	fmtStr = strings.ReplaceAll(fmtStr, "%S", "05")
 	return t.Format(fmtStr), nil
+}
+
+func evalRound(value any, precision int64) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	f, ok := types.ToFloat64Safe(value)
+	if !ok {
+		return nil, fmt.Errorf("ROUND unsupported value type: %T", value)
+	}
+	if precision == 0 {
+		return math.Round(f), nil
+	}
+	pow := math.Pow10(int(precision))
+	return math.Round(f*pow) / pow, nil
 }
 
 func toTime(v any) (time.Time, error) {
@@ -759,6 +761,8 @@ func toTime(v any) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("cannot parse time: %s", x)
 	case int64:
 		return time.Unix(x, 0), nil
+	case int:
+		return time.Unix(int64(x), 0), nil
 	case float64:
 		return time.Unix(int64(x), 0), nil
 	default:

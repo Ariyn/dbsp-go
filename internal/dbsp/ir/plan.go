@@ -30,6 +30,8 @@ type LogicalProject struct {
 	Columns []string
 	// Exprs are computed expressions in SELECT list (require alias)
 	Exprs []ProjectExpr
+	// KeepInput keeps all input columns and adds/replaces projected columns.
+	KeepInput bool
 	// Input is the child logical node
 	Input LogicalNode
 }
@@ -85,6 +87,7 @@ func (g *LogicalGroupAgg) nodeName() string { return "LogicalGroupAgg" }
 type AggSpec struct {
 	Name string
 	Col  string
+	As   string
 }
 
 // WindowFuncSpec describes a window function specification

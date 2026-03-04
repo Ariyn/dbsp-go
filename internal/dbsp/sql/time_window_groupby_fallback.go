@@ -175,17 +175,7 @@ func extractAggAliasFromQuery(query string, agg AggCall) string {
 		if expr == "" {
 			continue
 		}
-		call, ok, err := parseAggCall(expr)
-		if err != nil {
-			continue
-		}
-		if !ok {
-			continue
-		}
-		if strings.ToUpper(call.Name) != strings.ToUpper(agg.Name) {
-			continue
-		}
-		if strings.TrimSpace(call.Col) != strings.TrimSpace(agg.Col) {
+		if !selectItemContainsAgg(expr, agg) {
 			continue
 		}
 

@@ -6,6 +6,7 @@ import (
 
 	"github.com/Ariyn/tree-sitter-duckdb/bindings/go/ast"
 	"github.com/ariyn/dbsp/internal/dbsp/ir"
+	"github.com/ariyn/dbsp/internal/dbsp/parse"
 )
 
 // extractSelectColumns collects plain column names from SELECT list for projection.
@@ -40,9 +41,10 @@ func extractSelectColumns(sel *ast.Select) ([]string, error) {
 // computed expressions (which require an alias).
 // Aggregates are ignored (handled separately).
 // If '*' is present, it returns (nil, nil, nil) meaning "no projection".
-func extractProjectionSpecs(sel *ast.Select) ([]string, []ir.ProjectExpr, error) {
+func extractProjectionSpecs(sel *ast.Select, query string) ([]string, []ir.ProjectExpr, error) {
 	var cols []string
 	var exprs []ir.ProjectExpr
+	groupedQuery := len(sel.GroupBy) > 0
 	for _, item := range sel.SelectList {
 		switch e := item.Expr.(type) {
 		case *ast.StarExpr:
@@ -52,8 +54,20 @@ func extractProjectionSpecs(sel *ast.Select) ([]string, []ir.ProjectExpr, error)
 			if e.Table != "" {
 				colName = e.Table + "." + e.Name
 			}
+			alias := strings.TrimSpace(item.As)
+			if groupedQuery && alias != "" {
+				cols = append(cols, alias)
+				continue
+			}
+			if alias != "" && alias != colName {
+				exprs = append(exprs, ir.ProjectExpr{ExprSQL: colName, As: alias})
+				continue
+			}
 			cols = append(cols, colName)
 		case *ast.FuncExpr:
+			funcName := strings.ToUpper(strings.TrimSpace(e.Name))
+			isAgg := ir.IsAggregate(funcName)
+
 			// If it's a window function or window aggregate, its output column should be projected.
 			// (Assuming the alias is provided or generated)
 			if e.Over != nil {
@@ -68,7 +82,58 @@ func extractProjectionSpecs(sel *ast.Select) ([]string, []ir.ProjectExpr, error)
 					colName = strings.ToLower(funcName) + "_" + argStr
 				}
 				cols = append(cols, colName)
+				continue
 			}
+
+			// For GROUP BY outputs, aggregate values are already materialized by GroupAgg/WindowAgg.
+			// Project the aggregate output column by alias instead of re-evaluating SQL expression.
+			if isAgg {
+				colName := strings.TrimSpace(item.As)
+				if colName == "" {
+					if groupedQuery {
+						switch funcName {
+						case "COUNT":
+							colName = "count_delta"
+						case "AVG":
+							colName = "avg_delta"
+						case "MIN":
+							colName = "min"
+						case "MAX":
+							colName = "max"
+						default:
+							colName = "agg_delta"
+						}
+					} else {
+						argStr := ""
+						if len(e.Args) > 0 {
+							argStr = e.Args[0].String()
+						}
+						colName = strings.ToLower(funcName) + "_" + sanitizeIdentifierForAlias(argStr)
+					}
+				}
+				cols = append(cols, colName)
+				continue
+			}
+
+			// In GROUP BY queries, non-aggregate function items in SELECT are often
+			// aliases of grouped expressions (e.g., TIME_BUCKET(...) AS bucket).
+			// The grouped value should already exist upstream as the alias column.
+			if groupedQuery {
+				colName := strings.TrimSpace(item.As)
+				if colName == "" {
+					return nil, nil, errors.New("unsupported grouped function expression without alias (use AS <name>)")
+				}
+				cols = append(cols, colName)
+				continue
+			}
+
+			if strings.TrimSpace(item.As) == "" {
+				return nil, nil, errors.New("unsupported function expression without alias (use AS <name>)")
+			}
+			exprSQL := strings.TrimSpace(item.Expr.String())
+			exprSQL = recoverMalformedExprByAlias(query, item.As, exprSQL)
+			exprSQL = normalizeQuotedIdentifierTokens(exprSQL)
+			exprs = append(exprs, ir.ProjectExpr{ExprSQL: exprSQL, As: item.As})
 			continue
 		default:
 			// Computed expression: require alias so output column is stable.
@@ -76,10 +141,44 @@ func extractProjectionSpecs(sel *ast.Select) ([]string, []ir.ProjectExpr, error)
 				return nil, nil, errors.New("unsupported SELECT expression without alias (use AS <name>)")
 			}
 			exprSQL := strings.TrimSpace(item.Expr.String())
+			exprSQL = recoverMalformedExprByAlias(query, item.As, exprSQL)
+			exprSQL = normalizeQuotedIdentifierTokens(exprSQL)
 			exprs = append(exprs, ir.ProjectExpr{ExprSQL: exprSQL, As: item.As})
 		}
 	}
 	return cols, exprs, nil
+}
+
+func sanitizeIdentifierForAlias(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "value"
+	}
+	replacer := strings.NewReplacer(
+		" ", "",
+		"\t", "",
+		"\n", "",
+		"\r", "",
+		"(", "",
+		")", "",
+		",", "_",
+		".", "_",
+		"-", "_",
+		"+", "_",
+		"*", "_",
+		"/", "_",
+		"'", "",
+		"\"", "",
+	)
+	s = replacer.Replace(s)
+	for strings.Contains(s, "__") {
+		s = strings.ReplaceAll(s, "__", "_")
+	}
+	s = strings.Trim(s, "_")
+	if s == "" {
+		return "value"
+	}
+	return s
 }
 
 // findSingleAggregate scans SELECT expressions and returns a single supported
@@ -107,7 +206,7 @@ func findSingleAggregate(selectList ast.SelectExprs) (string, string, error) {
 
 		// Ignore window functions such as TUMBLE here; we only care about
 		// true aggregates like SUM/COUNT/AVG/MIN/MAX.
-		if name != "SUM" && name != "COUNT" && name != "AVG" && name != "MIN" && name != "MAX" {
+		if !ir.IsAggregate(name) {
 			continue
 		}
 		if aggFunc != "" && name != "" {
@@ -140,10 +239,7 @@ func findSingleAggregate(selectList ast.SelectExprs) (string, string, error) {
 func findSingleAggregateFromQuery(query string) (string, string, error) {
 	queryUpper := strings.ToUpper(query)
 
-	// Look for aggregate functions: SUM(col), COUNT(col), AVG(col), MIN(col), MAX(col)
-	aggFuncs := []string{"SUM", "COUNT", "AVG", "MIN", "MAX"}
-
-	for _, funcName := range aggFuncs {
+	for funcName := range ir.KnownAggregates {
 		pattern := funcName + "("
 		idx := strings.Index(queryUpper, pattern)
 		if idx == -1 {
@@ -185,6 +281,64 @@ func findSingleAggregateFromQuery(query string) (string, string, error) {
 type AggCall struct {
 	Name string
 	Col  string
+	As   string
+}
+
+func findAggregatesFromSelect(sel *ast.Select) ([]AggCall, error) {
+	if sel == nil {
+		return nil, errors.New("select is nil")
+	}
+	out := make([]AggCall, 0)
+	for _, item := range sel.SelectList {
+		aggs := collectAggCallsFromExpr(item.Expr)
+		for _, agg := range aggs {
+			agg.As = strings.TrimSpace(item.As)
+			out = append(out, agg)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no aggregate function found")
+	}
+	return out, nil
+}
+
+func collectAggCallsFromExpr(expr ast.Expr) []AggCall {
+	switch e := expr.(type) {
+	case *ast.FuncExpr:
+		name := strings.ToUpper(strings.TrimSpace(e.Name))
+		if ir.IsAggregate(name) {
+			col := ""
+			if len(e.Args) > 0 {
+				col = normalizeQuotedIdentifierTokens(strings.TrimSpace(e.Args[0].String()))
+			} else {
+				col = "*"
+			}
+			return []AggCall{{Name: name, Col: col}}
+		}
+		out := make([]AggCall, 0)
+		for _, arg := range e.Args {
+			out = append(out, collectAggCallsFromExpr(arg)...)
+		}
+		return out
+	case *ast.BinaryExpr:
+		out := collectAggCallsFromExpr(e.Left)
+		out = append(out, collectAggCallsFromExpr(e.Right)...)
+		return out
+	case *ast.UnaryExpr:
+		return collectAggCallsFromExpr(e.Expr)
+	case *ast.CaseExpr:
+		out := make([]AggCall, 0)
+		for _, when := range e.Whens {
+			out = append(out, collectAggCallsFromExpr(when.Val)...)
+			out = append(out, collectAggCallsFromExpr(when.Cond)...)
+		}
+		if e.Else != nil {
+			out = append(out, collectAggCallsFromExpr(e.Else)...)
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 // findAggregatesFromQuery extracts all supported aggregate calls from the
@@ -196,38 +350,111 @@ type AggCall struct {
 // - Supports: SUM(col), COUNT(col)
 // - Rejects: COUNT(*) (handled by a separate TODO)
 func findAggregatesFromQuery(query string) ([]AggCall, error) {
-	selectClause, err := extractSelectClause(query)
+	selectClauses, err := extractSelectClauses(query)
 	if err != nil {
 		return nil, err
 	}
 
-	items := splitByCommaOutsideParens(selectClause)
 	var out []AggCall
-	for _, rawItem := range items {
-		expr := strings.TrimSpace(rawItem)
-		if expr == "" {
-			continue
-		}
-		// Ignore window functions / analytic aggregates here.
-		if strings.Contains(strings.ToUpper(expr), " OVER ") {
-			continue
-		}
+	for _, selectClause := range selectClauses {
+		items := splitByCommaOutsideParens(selectClause)
+		for _, rawItem := range items {
+			expr := strings.TrimSpace(rawItem)
+			if expr == "" {
+				continue
+			}
+			// Ignore window functions / analytic aggregates here.
+			if strings.Contains(strings.ToUpper(expr), " OVER ") {
+				continue
+			}
 
-		call, ok, err := parseAggCall(expr)
-		if err != nil {
-			return nil, err
+			call, ok, err := parseAggCall(expr)
+			if err != nil {
+				ok = false
+			}
+			if ok {
+				// COUNT(*) is allowed in general, but multi-aggregate support may
+				// disallow mixing it with other aggregates at a higher level.
+				out = append(out, call)
+				continue
+			}
+
+			nested, err := parseNestedAggCalls(expr)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, nested...)
 		}
-		if !ok {
-			continue
-		}
-		// COUNT(*) is allowed in general, but multi-aggregate support may
-		// disallow mixing it with other aggregates at a higher level.
-		out = append(out, call)
 	}
 	if len(out) == 0 {
 		return nil, errors.New("no aggregate function found")
 	}
 	return out, nil
+}
+
+func extractSelectClauses(query string) ([]string, error) {
+	upper := strings.ToUpper(query)
+	var clauses []string
+
+	for i := 0; i < len(query)-len("SELECT")+1; i++ {
+		if !hasKeywordAtWordBoundary(upper, i, "SELECT") {
+			continue
+		}
+
+		baseDepth := 0
+		for j := 0; j < i; j++ {
+			switch query[j] {
+			case '(':
+				baseDepth++
+			case ')':
+				if baseDepth > 0 {
+					baseDepth--
+				}
+			}
+		}
+
+		depth := baseDepth
+		fromIdx := -1
+		for j := i + len("SELECT"); j < len(query)-len("FROM")+1; j++ {
+			switch query[j] {
+			case '(':
+				depth++
+			case ')':
+				if depth > 0 {
+					depth--
+				}
+			}
+			if depth != baseDepth {
+				continue
+			}
+			if hasKeywordAtWordBoundary(upper, j, "FROM") {
+				fromIdx = j
+				break
+			}
+		}
+
+		if fromIdx == -1 {
+			for j := i + len("SELECT"); j < len(query)-len("FROM")+1; j++ {
+				if hasKeywordAtWordBoundary(upper, j, "FROM") {
+					fromIdx = j
+					break
+				}
+			}
+			if fromIdx == -1 {
+				continue
+			}
+		}
+
+		clause := strings.TrimSpace(query[i+len("SELECT") : fromIdx])
+		if clause != "" {
+			clauses = append(clauses, clause)
+		}
+	}
+
+	if len(clauses) == 0 {
+		return nil, errors.New("query must contain SELECT")
+	}
+	return clauses, nil
 }
 
 func extractSelectClause(query string) (string, error) {
@@ -258,59 +485,26 @@ func extractSelectClause(query string) (string, error) {
 		}
 	}
 	if fromIdx == -1 {
-		return "", errors.New("query must contain FROM")
+		for i := selectIdx + len("SELECT"); i < len(query)-3; i++ {
+			if hasKeywordAtWordBoundary(upper, i, "FROM") {
+				fromIdx = i
+				break
+			}
+		}
+		if fromIdx == -1 {
+			return "", errors.New("query must contain FROM")
+		}
 	}
 	clause := strings.TrimSpace(query[selectIdx+len("SELECT") : fromIdx])
 	return clause, nil
 }
 
 func splitByCommaOutsideParens(s string) []string {
-	var parts []string
-	depth := 0
-	start := 0
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '(':
-			depth++
-		case ')':
-			if depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 {
-				parts = append(parts, s[start:i])
-				start = i + 1
-			}
-		}
-	}
-	if start < len(s) {
-		parts = append(parts, s[start:])
-	}
-	return parts
+	return parse.SplitByComma(s)
 }
 
 func hasKeywordAtWordBoundary(upper string, i int, kw string) bool {
-	if i < 0 || i+len(kw) > len(upper) {
-		return false
-	}
-	if upper[i:i+len(kw)] != kw {
-		return false
-	}
-	// Left boundary
-	if i > 0 {
-		c := upper[i-1]
-		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
-			return false
-		}
-	}
-	// Right boundary
-	if i+len(kw) < len(upper) {
-		c := upper[i+len(kw)]
-		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
-			return false
-		}
-	}
-	return true
+	return parse.HasKeywordAtWordBoundary(upper, i, kw)
 }
 
 func parseAggCall(expr string) (AggCall, bool, error) {
@@ -345,14 +539,213 @@ func parseAggCall(expr string) (AggCall, bool, error) {
 	}
 	arg := strings.TrimSpace(expr[open+1 : close])
 	arg = strings.Trim(arg, "`\"'")
+	arg = normalizeQuotedIdentifierTokens(arg)
 	if arg == "" {
 		return AggCall{}, false, errors.New("empty aggregate argument")
 	}
 
 	// Only consider real aggregates.
-	if name != "SUM" && name != "COUNT" && name != "AVG" && name != "MIN" && name != "MAX" {
+	if !ir.IsAggregate(name) {
 		return AggCall{}, false, nil
 	}
 
 	return AggCall{Name: name, Col: arg}, true, nil
+}
+
+func parseNestedAggCalls(expr string) ([]AggCall, error) {
+	upper := strings.ToUpper(expr)
+	out := make([]AggCall, 0)
+
+	for i := 0; i < len(expr); i++ {
+		if !isAggNameStart(upper, i) {
+			continue
+		}
+
+		name, open, ok := parseAggNameAt(upper, i)
+		if !ok {
+			continue
+		}
+
+		close, err := findMatchingParen(expr, open)
+		if err != nil {
+			continue
+		}
+
+		arg := strings.TrimSpace(expr[open+1 : close])
+		arg = strings.Trim(arg, "`\"'")
+		arg = normalizeQuotedIdentifierTokens(arg)
+		if arg == "" {
+			continue
+		}
+
+		out = append(out, AggCall{Name: name, Col: arg})
+		i = close
+	}
+
+	return out, nil
+}
+
+func isAggNameStart(upper string, i int) bool {
+	for name := range ir.KnownAggregates {
+		if hasKeywordAtWordBoundary(upper, i, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseAggNameAt(upper string, i int) (string, int, bool) {
+	for name := range ir.KnownAggregates {
+		if !hasKeywordAtWordBoundary(upper, i, name) {
+			continue
+		}
+		j := i + len(name)
+		for j < len(upper) && (upper[j] == ' ' || upper[j] == '\t' || upper[j] == '\n' || upper[j] == '\r') {
+			j++
+		}
+		if j < len(upper) && upper[j] == '(' {
+			return name, j, true
+		}
+	}
+	return "", -1, false
+}
+
+func findMatchingParen(expr string, open int) (int, error) {
+	return parse.FindMatchingParen(expr, open)
+}
+
+func selectItemContainsAgg(expr string, agg AggCall) bool {
+	call, ok, err := parseAggCall(expr)
+	if err == nil && ok {
+		if strings.ToUpper(call.Name) == strings.ToUpper(agg.Name) && strings.TrimSpace(call.Col) == strings.TrimSpace(agg.Col) {
+			return true
+		}
+	}
+
+	nested, err := parseNestedAggCalls(expr)
+	if err != nil {
+		return false
+	}
+	for _, c := range nested {
+		if strings.ToUpper(c.Name) == strings.ToUpper(agg.Name) && strings.TrimSpace(c.Col) == strings.TrimSpace(agg.Col) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeQuotedIdentifierTokens(expr string) string {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return expr
+	}
+
+	var b strings.Builder
+	b.Grow(len(expr))
+
+	for i := 0; i < len(expr); {
+		if expr[i] != '\'' {
+			b.WriteByte(expr[i])
+			i++
+			continue
+		}
+
+		j := i + 1
+		for j < len(expr) && expr[j] != '\'' {
+			j++
+		}
+		if j >= len(expr) {
+			b.WriteString(expr[i:])
+			break
+		}
+
+		token := expr[i+1 : j]
+		if isIdentifierToken(token) {
+			b.WriteString(token)
+		} else {
+			b.WriteByte('\'')
+			b.WriteString(token)
+			b.WriteByte('\'')
+		}
+		i = j + 1
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+func recoverMalformedExprByAlias(query, alias, exprSQL string) string {
+	if strings.TrimSpace(alias) == "" {
+		return exprSQL
+	}
+	if !looksMalformedExprSQL(exprSQL) {
+		return exprSQL
+	}
+	recovered, ok := extractSelectExprByAlias(query, alias)
+	if !ok {
+		return exprSQL
+	}
+	return strings.TrimSpace(recovered)
+}
+
+func looksMalformedExprSQL(expr string) bool {
+	e := strings.TrimSpace(expr)
+	if e == "" {
+		return true
+	}
+	if strings.Contains(e, "'('") || strings.Contains(e, "')'") {
+		return true
+	}
+	if e == "('(' - ')')" {
+		return true
+	}
+	return false
+}
+
+func extractSelectExprByAlias(query, alias string) (string, bool) {
+	if strings.TrimSpace(query) == "" || strings.TrimSpace(alias) == "" {
+		return "", false
+	}
+	clause, err := extractSelectClause(query)
+	if err != nil {
+		return "", false
+	}
+	target := strings.ToUpper(strings.TrimSpace(alias))
+	items := splitByCommaOutsideParens(clause)
+	for _, raw := range items {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		up := strings.ToUpper(item)
+		asIdx := strings.LastIndex(up, " AS ")
+		if asIdx == -1 {
+			continue
+		}
+		aliasPart := strings.TrimSpace(item[asIdx+4:])
+		aliasPart = strings.Trim(aliasPart, "`\"'")
+		if strings.ToUpper(aliasPart) != target {
+			continue
+		}
+		exprPart := strings.TrimSpace(item[:asIdx])
+		if exprPart == "" {
+			continue
+		}
+		return exprPart, true
+	}
+	return "", false
+}
+
+func isIdentifierToken(token string) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		c := token[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }

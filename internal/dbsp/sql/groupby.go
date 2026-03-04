@@ -33,12 +33,18 @@ func parseGroupByWithTimeWindow(groupBy ast.GroupBy) ([]string, *ir.WindowSpec, 
 			if e.Table != "" {
 				colName = e.Table + "." + e.Name
 			}
+			if norm := normalizeGroupIdentifier(colName); norm != "" {
+				colName = norm
+			}
 			groupCols = append(groupCols, colName)
 			groupExprs = append(groupExprs, colName)
 		default:
 			// Try to handle as string expression (for window functions)
 			exprStr := e.String()
 			exprStr = strings.Trim(exprStr, "'\"")
+			if id := normalizeGroupIdentifier(exprStr); id != "" {
+				groupCols = append(groupCols, id)
+			}
 			groupExprs = append(groupExprs, exprStr)
 		}
 	}
@@ -55,4 +61,20 @@ func parseGroupByWithTimeWindow(groupBy ast.GroupBy) ([]string, *ir.WindowSpec, 
 	}
 
 	return groupCols, nil, nil, nil
+}
+
+func normalizeGroupIdentifier(expr string) string {
+	e := strings.TrimSpace(expr)
+	e = strings.Trim(e, "'\"")
+	if e == "" {
+		return ""
+	}
+	for i := 0; i < len(e); i++ {
+		c := e[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' {
+			continue
+		}
+		return ""
+	}
+	return e
 }

@@ -564,10 +564,8 @@ func mergePendingTupleDeltaLocal(pending map[any]*types.TupleDelta, key any, del
 		}
 	}
 
-	// If all numeric delta fields cancel to 0, drop the pending output.
-	if isAllNumericZeroLocal(ex.Tuple, skipCols) {
-		delete(pending, key)
-	}
+	// Keep merged deltas; higher-level consumers may rely on explicit zero/non-zero
+	// updates for grouped outputs in complex plans.
 }
 
 func addNumericLocal(a, b any) any {
@@ -855,6 +853,7 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 // changes in the "avg_delta" column.
 type AvgAgg struct {
 	ColName string
+	DeltaCol string
 	Expr    func(types.Tuple) (any, error)
 }
 
@@ -955,7 +954,11 @@ func (a *AvgAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 		return monoid, nil
 	}
 
-	outT := types.Tuple{"avg_delta": diff}
+	deltaCol := a.DeltaCol
+	if strings.TrimSpace(deltaCol) == "" {
+		deltaCol = "avg_delta"
+	}
+	outT := types.Tuple{deltaCol: diff}
 	out := &types.TupleDelta{Tuple: outT, Count: 1}
 	return monoid, out
 }

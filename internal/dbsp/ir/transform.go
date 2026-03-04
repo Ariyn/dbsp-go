@@ -3,12 +3,24 @@ package ir
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/ariyn/dbsp/internal/dbsp/op"
+	"github.com/ariyn/dbsp/internal/dbsp/parse"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
+
+var simpleColumnRefPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*$`)
+
+func isSimpleColumnRef(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	if expr == "" || expr == "*" {
+		return true
+	}
+	return simpleColumnRefPattern.MatchString(expr)
+}
 
 func buildGroupKeyFn(keys []string) func(types.Tuple) any {
 	if len(keys) == 0 {
@@ -181,77 +193,16 @@ func buildPredicateWithParens(predicateSQL string) func(types.Tuple) bool {
 	return buildComparisonFunc(predicateSQL)
 }
 
-// isBalancedAndOuter checks if the opening and closing parens are the outermost pair
 func isBalancedAndOuter(s string) bool {
-	if !strings.HasPrefix(s, "(") || !strings.HasSuffix(s, ")") {
-		return false
-	}
-
-	depth := 0
-	for i, ch := range s {
-		if ch == '(' {
-			depth++
-		} else if ch == ')' {
-			depth--
-			// If we hit zero before the end, the parens aren't outer
-			if depth == 0 && i < len(s)-1 {
-				return false
-			}
-		}
-	}
-	return depth == 0
+	return parse.IsBalancedAndOuter(s)
 }
 
-// containsKeywordOutsideParens checks if a keyword exists outside of parentheses
 func containsKeywordOutsideParens(s, keyword string) bool {
-	upper := strings.ToUpper(s)
-	keywordUpper := " " + strings.ToUpper(keyword) + " "
-
-	depth := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '(' {
-			depth++
-		} else if s[i] == ')' {
-			depth--
-		} else if depth == 0 {
-			// Check if keyword starts here
-			if i+len(keywordUpper) <= len(upper) && upper[i:i+len(keywordUpper)] == keywordUpper {
-				return true
-			}
-		}
-	}
-	return false
+	return parse.ContainsKeywordOutsideParens(s, keyword)
 }
 
-// splitByKeywordOutsideParens splits by keyword only when outside parentheses
 func splitByKeywordOutsideParens(s, keyword string) []string {
-	upper := strings.ToUpper(s)
-	keywordUpper := " " + strings.ToUpper(keyword) + " "
-
-	var parts []string
-	depth := 0
-	lastIdx := 0
-
-	for i := 0; i < len(s); i++ {
-		if s[i] == '(' {
-			depth++
-		} else if s[i] == ')' {
-			depth--
-		} else if depth == 0 {
-			// Check if keyword starts here
-			if i+len(keywordUpper) <= len(upper) && upper[i:i+len(keywordUpper)] == keywordUpper {
-				parts = append(parts, strings.TrimSpace(s[lastIdx:i]))
-				lastIdx = i + len(keywordUpper)
-				i = lastIdx - 1 // Will be incremented by loop
-			}
-		}
-	}
-
-	if lastIdx < len(s) {
-		parts = append(parts, strings.TrimSpace(s[lastIdx:]))
-	}
-
-	return parts
+	return parse.SplitByKeyword(s, keyword)
 }
 
 // buildComparisonFunc builds a predicate for a single comparison
@@ -328,148 +279,72 @@ func buildIsNotNullFunc(predicateSQL string) func(types.Tuple) bool {
 	}
 }
 
-// buildEqualFunc handles "column = value"
+// buildStringComparisonFunc builds a predicate for = and != operators.
+// The cmp function receives (tupleVal, rhsString) and returns whether they match.
+func buildStringComparisonFunc(predicateSQL, op string, cmp func(any, string) bool) func(types.Tuple) bool {
+	parts := strings.SplitN(predicateSQL, op, 2)
+	if len(parts) != 2 {
+		return func(types.Tuple) bool { return true }
+	}
+	leftExpr := strings.TrimSpace(parts[0])
+	val := strings.Trim(strings.TrimSpace(parts[1]), "'\"")
+	exprFn := BuildExprFunc(leftExpr)
+	return func(t types.Tuple) bool {
+		v, err := exprFn(t)
+		if err != nil || v == nil {
+			return false
+		}
+		return cmp(v, val)
+	}
+}
+
+// buildNumericComparisonFunc builds a predicate for >, >=, <, <= operators.
+// The cmp function receives (tupleVal, threshold) and returns whether the comparison holds.
+func buildNumericComparisonFunc(predicateSQL, op string, cmp func(float64, float64) bool) func(types.Tuple) bool {
+	parts := strings.SplitN(predicateSQL, op, 2)
+	if len(parts) != 2 {
+		return func(types.Tuple) bool { return true }
+	}
+	leftExpr := strings.TrimSpace(parts[0])
+	threshold, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		return func(types.Tuple) bool { return false }
+	}
+	exprFn := BuildExprFunc(leftExpr)
+	return func(t types.Tuple) bool {
+		v, err := exprFn(t)
+		if err != nil || v == nil {
+			return false
+		}
+		if f, ok := toFloat64Loose(v); ok {
+			return cmp(f, threshold)
+		}
+		return false
+	}
+}
+
 func buildEqualFunc(predicateSQL string) func(types.Tuple) bool {
-	parts := strings.Split(predicateSQL, "=")
-	if len(parts) != 2 {
-		return func(t types.Tuple) bool { return true }
-	}
-
-	leftExpr := strings.TrimSpace(parts[0])
-	val := strings.TrimSpace(parts[1])
-	val = strings.Trim(val, "'\"")
-	exprFn := BuildExprFunc(leftExpr)
-
-	return func(t types.Tuple) bool {
-		tupleVal, err := exprFn(t)
-		// NULL values should not match in equality comparisons
-		if err != nil || tupleVal == nil {
-			return false
-		}
-		return compareEqual(tupleVal, val)
-	}
+	return buildStringComparisonFunc(predicateSQL, "=", func(v any, s string) bool { return compareEqual(v, s) })
 }
 
-// buildNotEqualFunc handles "column != value"
 func buildNotEqualFunc(predicateSQL string) func(types.Tuple) bool {
-	parts := strings.Split(predicateSQL, "!=")
-	if len(parts) != 2 {
-		return func(t types.Tuple) bool { return true }
-	}
-
-	leftExpr := strings.TrimSpace(parts[0])
-	val := strings.TrimSpace(parts[1])
-	val = strings.Trim(val, "'\"")
-	exprFn := BuildExprFunc(leftExpr)
-
-	return func(t types.Tuple) bool {
-		tupleVal, err := exprFn(t)
-		// NULL values should not match in inequality comparisons
-		if err != nil || tupleVal == nil {
-			return false
-		}
-		return !compareEqual(tupleVal, val)
-	}
+	return buildStringComparisonFunc(predicateSQL, "!=", func(v any, s string) bool { return !compareEqual(v, s) })
 }
 
-// buildGreaterFunc handles "column > value"
 func buildGreaterFunc(predicateSQL string) func(types.Tuple) bool {
-	parts := strings.Split(predicateSQL, ">")
-	if len(parts) != 2 {
-		return func(t types.Tuple) bool { return true }
-	}
-
-	leftExpr := strings.TrimSpace(parts[0])
-	valStr := strings.TrimSpace(parts[1])
-	threshold, err := strconv.ParseFloat(valStr, 64)
-	if err != nil {
-		return func(t types.Tuple) bool { return false }
-	}
-	exprFn := BuildExprFunc(leftExpr)
-
-	return func(t types.Tuple) bool {
-		tupleVal, err := exprFn(t)
-		// NULL values should not match in comparisons
-		if err != nil || tupleVal == nil {
-			return false
-		}
-		return compareGreater(tupleVal, threshold)
-	}
+	return buildNumericComparisonFunc(predicateSQL, ">", func(v, t float64) bool { return v > t })
 }
 
-// buildGreaterEqualFunc handles "column >= value"
 func buildGreaterEqualFunc(predicateSQL string) func(types.Tuple) bool {
-	parts := strings.Split(predicateSQL, ">=")
-	if len(parts) != 2 {
-		return func(t types.Tuple) bool { return true }
-	}
-
-	leftExpr := strings.TrimSpace(parts[0])
-	valStr := strings.TrimSpace(parts[1])
-	threshold, err := strconv.ParseFloat(valStr, 64)
-	if err != nil {
-		return func(t types.Tuple) bool { return false }
-	}
-	exprFn := BuildExprFunc(leftExpr)
-
-	return func(t types.Tuple) bool {
-		tupleVal, err := exprFn(t)
-		// NULL values should not match in comparisons
-		if err != nil || tupleVal == nil {
-			return false
-		}
-		return compareGreaterOrEqual(tupleVal, threshold)
-	}
+	return buildNumericComparisonFunc(predicateSQL, ">=", func(v, t float64) bool { return v >= t })
 }
 
-// buildLessFunc handles "column < value"
 func buildLessFunc(predicateSQL string) func(types.Tuple) bool {
-	parts := strings.Split(predicateSQL, "<")
-	if len(parts) != 2 {
-		return func(t types.Tuple) bool { return true }
-	}
-
-	leftExpr := strings.TrimSpace(parts[0])
-	valStr := strings.TrimSpace(parts[1])
-	threshold, err := strconv.ParseFloat(valStr, 64)
-	if err != nil {
-		return func(t types.Tuple) bool { return false }
-	}
-	exprFn := BuildExprFunc(leftExpr)
-
-	return func(t types.Tuple) bool {
-		tupleVal, err := exprFn(t)
-		// NULL values should not match in comparisons
-		if err != nil || tupleVal == nil {
-			return false
-		}
-		return compareLess(tupleVal, threshold)
-	}
+	return buildNumericComparisonFunc(predicateSQL, "<", func(v, t float64) bool { return v < t })
 }
 
-// buildLessEqualFunc handles "column <= value"
 func buildLessEqualFunc(predicateSQL string) func(types.Tuple) bool {
-	parts := strings.Split(predicateSQL, "<=")
-	if len(parts) != 2 {
-		return func(t types.Tuple) bool { return true }
-	}
-
-	leftExpr := strings.TrimSpace(parts[0])
-	valStr := strings.TrimSpace(parts[1])
-	threshold, err := strconv.ParseFloat(valStr, 64)
-	if err != nil {
-		return func(t types.Tuple) bool { return false }
-	}
-	exprFn := BuildExprFunc(leftExpr)
-
-	return func(t types.Tuple) bool {
-		tupleVal, err := exprFn(t)
-		// NULL values should not match in comparisons
-		if err != nil || tupleVal == nil {
-			return false
-		}
-		return compareLessOrEqual(tupleVal, threshold)
-	}
+	return buildNumericComparisonFunc(predicateSQL, "<=", func(v, t float64) bool { return v <= t })
 }
 
 // Helper comparison functions
@@ -491,73 +366,137 @@ func toFloat64Loose(v any) (float64, bool) {
 	return types.ToFloat64Safe(v)
 }
 
-func compareGreater(tupleVal any, threshold float64) bool {
-	if v, ok := toFloat64Loose(tupleVal); ok {
-		return v > threshold
-	}
-	return false
-}
-
-func compareGreaterOrEqual(tupleVal any, threshold float64) bool {
-	if v, ok := toFloat64Loose(tupleVal); ok {
-		return v >= threshold
-	}
-	return false
-}
-
-func compareLess(tupleVal any, threshold float64) bool {
-	if v, ok := toFloat64Loose(tupleVal); ok {
-		return v < threshold
-	}
-	return false
-}
-
-func compareLessOrEqual(tupleVal any, threshold float64) bool {
-	if v, ok := toFloat64Loose(tupleVal); ok {
-		return v <= threshold
-	}
-	return false
-}
-
 // LogicalToDBSP transforms a LogicalNode into a runtime DBSP operator Node.
 // For Phase1 it supports LogicalScan -> LogicalFilter -> LogicalProject -> LogicalGroupAgg pattern.
 func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 	return logicalToDBSPWithContext(l, make(map[string]*op.Node))
 }
 
-// attachLogicalGroupAggInputWithContext handles input attachment for GroupAgg, supporting chaining and recursive transformation.
-func attachLogicalGroupAggInputWithContext(n *LogicalGroupAgg, aggOp op.Operator, ctes map[string]*op.Node) (*op.Node, error) {
-	if n == nil || n.Input == nil {
-		return &op.Node{Op: aggOp}, nil
+// logicalGroupAggToDBSPWithContext transforms LogicalGroupAgg to a GroupAgg or WindowAgg operator.
+func logicalGroupAggToDBSPWithContext(n *LogicalGroupAgg, ctes map[string]*op.Node) (*op.Node, error) {
+	keyFn := buildGroupKeyFn(n.Keys)
+
+	var aggOp op.Operator
+	if len(n.Aggs) > 0 {
+		aggSlots := make([]op.AggSlot, 0, len(n.Aggs))
+		for _, a := range n.Aggs {
+			name := strings.ToUpper(a.Name)
+			deltaCol := strings.TrimSpace(a.As)
+			slot, err := buildAggSlot(name, a.Col, deltaCol)
+			if err != nil {
+				return nil, fmt.Errorf("unsupported agg %s in multi-aggregate", a.Name)
+			}
+			aggSlots = append(aggSlots, slot)
+		}
+		g := op.NewGroupAggMultiOp(keyFn, aggSlots)
+		g.SetGroupKeyColNames(n.Keys)
+		aggOp = g
+	} else {
+		agg, aggInit, err := buildSingleAggFunc(strings.ToUpper(n.AggName), n.AggCol)
+		if err != nil {
+			return nil, err
+		}
+		if n.WindowSpec != nil {
+			ws := n.WindowSpec
+			aggOp = op.NewWindowAggOp(op.WindowSpecLite{TimeCol: ws.TimeCol, SizeMillis: ws.SizeMillis}, keyFn, n.Keys, aggInit, agg)
+		} else {
+			g := op.NewGroupAggOp(keyFn, aggInit, agg)
+			g.SetGroupKeyColNames(n.Keys)
+			aggOp = g
+		}
 	}
 
-	// Filter before GroupAgg: chain filter MapOp then the group agg op.
-	if f, ok := n.Input.(*LogicalFilter); ok {
-		predicateFn := BuildPredicateFunc(f.PredicateSQL)
-		filterOp := &op.MapOp{
-			F: func(td types.TupleDelta) []types.TupleDelta {
-				if predicateFn(td.Tuple) {
-					return []types.TupleDelta{td}
-				}
-				return nil
-			},
-		}
+	return attachLogicalGroupAggInputWithContext(n, aggOp, ctes)
+}
 
+// buildSingleAggFunc constructs an AggFunc and its init function for a single aggregate.
+func buildSingleAggFunc(name, col string) (op.AggFunc, func() any, error) {
+	switch name {
+	case "SUM":
+		s := &op.SumAgg{ColName: col}
+		if !isSimpleColumnRef(col) {
+			s.Expr = BuildExprFunc(col)
+		}
+		return s, func() any { return float64(0) }, nil
+	case "COUNT":
+		c := &op.CountAgg{ColName: col}
+		if col != "" && !isSimpleColumnRef(col) {
+			c.Expr = BuildExprFunc(col)
+		}
+		return c, func() any { return int64(0) }, nil
+	case "AVG":
+		av := &op.AvgAgg{ColName: col}
+		if !isSimpleColumnRef(col) {
+			av.Expr = BuildExprFunc(col)
+		}
+		return av, func() any { return nil }, nil
+	case "MIN":
+		return &op.MinAgg{ColName: col}, func() any { return op.NewSortedMultiset() }, nil
+	case "MAX":
+		return &op.MaxAgg{ColName: col}, func() any { return op.NewSortedMultiset() }, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported agg %s", name)
+	}
+}
+
+// buildAggSlot constructs an AggSlot for multi-aggregate operators.
+func buildAggSlot(name, col, deltaCol string) (op.AggSlot, error) {
+	switch name {
+	case "SUM":
+		s := &op.SumAgg{ColName: col, DeltaCol: deltaCol}
+		if !isSimpleColumnRef(col) {
+			s.Expr = BuildExprFunc(col)
+		}
+		return op.AggSlot{Init: func() any { return float64(0) }, Fn: s}, nil
+	case "AVG":
+		avg := &op.AvgAgg{ColName: col, DeltaCol: deltaCol}
+		if !isSimpleColumnRef(col) {
+			avg.Expr = BuildExprFunc(col)
+		}
+		return op.AggSlot{Init: func() any { return op.AvgMonoid{} }, Fn: avg}, nil
+	case "COUNT":
+		c := &op.CountAgg{ColName: col, DeltaCol: deltaCol}
+		if col != "" && !isSimpleColumnRef(col) {
+			c.Expr = BuildExprFunc(col)
+		}
+		return op.AggSlot{Init: func() any { return int64(0) }, Fn: c}, nil
+	default:
+		return op.AggSlot{}, fmt.Errorf("unsupported agg %s", name)
+	}
+}
+
+// attachInputToAgg attaches an input LogicalNode to an aggregate operator.
+// If the input is a LogicalFilter, the filter is chained before the aggregate.
+func attachInputToAgg(input LogicalNode, aggOp op.Operator, ctes map[string]*op.Node) (*op.Node, error) {
+	if input == nil {
+		return &op.Node{Op: aggOp}, nil
+	}
+	if f, ok := input.(*LogicalFilter); ok {
+		predicateFn := BuildPredicateFunc(f.PredicateSQL)
+		filterOp := &op.MapOp{F: func(td types.TupleDelta) []types.TupleDelta {
+			if predicateFn(td.Tuple) {
+				return []types.TupleDelta{td}
+			}
+			return nil
+		}}
 		inNode, err := logicalToDBSPWithContext(f.Input, ctes)
 		if err != nil {
 			return nil, err
 		}
-		chained := &op.ChainedOp{Ops: []op.Operator{filterOp, aggOp}}
-		return &op.Node{Op: chained, Inputs: []*op.Node{inNode}}, nil
+		return &op.Node{Op: &op.ChainedOp{Ops: []op.Operator{filterOp, aggOp}}, Inputs: []*op.Node{inNode}}, nil
 	}
-
-	// Normal recursive transform for input.
-	inNode, err := logicalToDBSPWithContext(n.Input, ctes)
+	inNode, err := logicalToDBSPWithContext(input, ctes)
 	if err != nil {
 		return nil, err
 	}
-
 	return &op.Node{Op: aggOp, Inputs: []*op.Node{inNode}}, nil
+}
+
+func attachLogicalGroupAggInputWithContext(n *LogicalGroupAgg, aggOp op.Operator, ctes map[string]*op.Node) (*op.Node, error) {
+	if n == nil {
+		return &op.Node{Op: aggOp}, nil
+	}
+	return attachInputToAgg(n.Input, aggOp, ctes)
 }
 
 func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node, error) {
@@ -602,7 +541,7 @@ func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node
 	case *LogicalProject:
 		columns := append([]string(nil), n.Columns...)
 		var projectOp op.Operator
-		if len(n.Exprs) == 0 {
+		if len(n.Exprs) == 0 && !n.KeepInput {
 			// Backward-compatible: keep simple projections as MapOp.
 			projectOp = &op.MapOp{
 				F: func(td types.TupleDelta) []types.TupleDelta {
@@ -621,7 +560,7 @@ func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node
 				fn := BuildExprFunc(e.ExprSQL)
 				exprs = append(exprs, op.ProjectExprFn{OutCol: e.As, Eval: fn})
 			}
-			projectOp = &op.ProjectOp{Columns: columns, Exprs: exprs}
+			projectOp = &op.ProjectOp{Columns: columns, Exprs: exprs, KeepInput: n.KeepInput}
 		}
 
 		// Check if input needs processing
@@ -656,103 +595,7 @@ func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node
 		return &op.Node{Op: mapOp}, nil
 
 	case *LogicalGroupAgg:
-		// 1. Prepare key function
-		keyFn := buildGroupKeyFn(n.Keys)
-
-		// 2. Determine aggregate operator type and initialize it
-		var aggOp op.Operator
-		if len(n.Aggs) > 0 {
-			// Multi-aggregate configuration
-			aggSlots := make([]op.AggSlot, 0, len(n.Aggs))
-			for _, a := range n.Aggs {
-				name := strings.ToUpper(a.Name)
-				switch name {
-				case "SUM":
-					s := &op.SumAgg{ColName: a.Col, DeltaCol: "agg_delta"}
-					if strings.ContainsAny(a.Col, "()->:") {
-						s.Expr = BuildExprFunc(a.Col)
-					}
-					aggSlots = append(aggSlots, op.AggSlot{
-						Init: func() any { return float64(0) },
-						Fn:   s,
-					})
-				case "AVG":
-					avg := &op.AvgAgg{ColName: a.Col}
-					if strings.ContainsAny(a.Col, "()->:") {
-						avg.Expr = BuildExprFunc(a.Col)
-					}
-					aggSlots = append(aggSlots, op.AggSlot{
-						Init: func() any { return op.AvgMonoid{} },
-						Fn:   avg,
-					})
-				case "COUNT":
-					c := &op.CountAgg{ColName: a.Col, DeltaCol: "count_delta"}
-					if a.Col != "" && strings.ContainsAny(a.Col, "()->:") {
-						c.Expr = BuildExprFunc(a.Col)
-					}
-					aggSlots = append(aggSlots, op.AggSlot{
-						Init: func() any { return int64(0) },
-						Fn:   c,
-					})
-				default:
-					return nil, fmt.Errorf("unsupported agg %s in multi-aggregate", a.Name)
-				}
-			}
-			g := op.NewGroupAggMultiOp(keyFn, aggSlots)
-			g.SetGroupKeyColNames(n.Keys)
-			aggOp = g
-		} else {
-			// Single aggregate configuration
-			var agg op.AggFunc
-			var aggInit func() any
-			switch strings.ToUpper(n.AggName) {
-			case "SUM":
-				s := &op.SumAgg{ColName: n.AggCol}
-				if strings.ContainsAny(n.AggCol, "()->:") {
-					s.Expr = BuildExprFunc(n.AggCol)
-				}
-				agg = s
-				aggInit = func() any { return float64(0) }
-			case "COUNT":
-				c := &op.CountAgg{ColName: n.AggCol}
-				if n.AggCol != "" && strings.ContainsAny(n.AggCol, "()->:") {
-					c.Expr = BuildExprFunc(n.AggCol)
-				}
-				agg = c
-				aggInit = func() any { return int64(0) }
-			case "AVG":
-				av := &op.AvgAgg{ColName: n.AggCol}
-				if strings.ContainsAny(n.AggCol, "()->:") {
-					av.Expr = BuildExprFunc(n.AggCol)
-				}
-				agg = av
-				aggInit = func() any { return nil }
-			case "MIN":
-				agg = &op.MinAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			case "MAX":
-				agg = &op.MaxAgg{ColName: n.AggCol}
-				aggInit = func() any { return op.NewSortedMultiset() }
-			default:
-				return nil, fmt.Errorf("unsupported agg %s", n.AggName)
-			}
-
-			if n.WindowSpec != nil {
-				ws := n.WindowSpec
-				waSpec := op.WindowSpecLite{
-					TimeCol:    ws.TimeCol,
-					SizeMillis: ws.SizeMillis,
-				}
-				aggOp = op.NewWindowAggOp(waSpec, keyFn, n.Keys, aggInit, agg)
-			} else {
-				g := op.NewGroupAggOp(keyFn, aggInit, agg)
-				g.SetGroupKeyColNames(n.Keys)
-				aggOp = g
-			}
-		}
-
-		// 3. Transform and attach input recursively
-		return attachLogicalGroupAggInputWithContext(n, aggOp, ctes)
+		return logicalGroupAggToDBSPWithContext(n, ctes)
 
 	case *LogicalWindowFunc:
 		// Transform window function to appropriate operator
@@ -779,6 +622,27 @@ func logicalToDBSPWithContext(l LogicalNode, ctes map[string]*op.Node) (*op.Node
 	}
 }
 
+// buildPartitionKeyFn builds a key function over cols for partitioned window operators.
+// Zero cols → global partition (nil key). One col → direct value. Multiple → composite string.
+func buildPartitionKeyFn(cols []string) func(types.Tuple) any {
+	switch len(cols) {
+	case 0:
+		return func(types.Tuple) any { return nil }
+	case 1:
+		col := cols[0]
+		return func(t types.Tuple) any { return t[col] }
+	default:
+		partCols := append([]string(nil), cols...)
+		return func(t types.Tuple) any {
+			key := make([]any, len(partCols))
+			for i, c := range partCols {
+				key[i] = t[c]
+			}
+			return fmt.Sprintf("%v", key)
+		}
+	}
+}
+
 // logicalWindowFuncToDBSP transforms LogicalWindowFunc to DBSP operators
 func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*op.Node) (*op.Node, error) {
 	if wf.Spec.FuncName != "LAG" {
@@ -790,27 +654,7 @@ func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*
 	}
 
 	lagCol := wf.Spec.Args[0]
-
-	// Determine partition key function
-	var keyFn func(types.Tuple) any
-	if len(wf.Spec.PartitionBy) == 0 {
-		// No partition - single global partition
-		keyFn = func(t types.Tuple) any { return nil }
-	} else if len(wf.Spec.PartitionBy) == 1 {
-		// Single partition column
-		keyCol := wf.Spec.PartitionBy[0]
-		keyFn = func(t types.Tuple) any { return t[keyCol] }
-	} else {
-		// Multiple partition columns - composite key
-		partCols := wf.Spec.PartitionBy
-		keyFn = func(t types.Tuple) any {
-			key := make([]any, len(partCols))
-			for i, col := range partCols {
-				key[i] = t[col]
-			}
-			return fmt.Sprintf("%v", key)
-		}
-	}
+	keyFn := buildPartitionKeyFn(wf.Spec.PartitionBy)
 
 	// Create LagAgg operator
 	lagAgg := &op.LagAgg{
@@ -849,60 +693,10 @@ func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*
 
 // logicalWindowAggToDBSP transforms LogicalWindowAgg (DuckDB standard window aggregate) to DBSP operators
 func logicalWindowAggToDBSPWithContext(wa *LogicalWindowAgg, ctes map[string]*op.Node) (*op.Node, error) {
-	// Determine partition key function
-	var keyFn func(types.Tuple) any
-	if len(wa.PartitionBy) == 0 {
-		// No partition - single global partition
-		keyFn = func(t types.Tuple) any { return nil }
-	} else if len(wa.PartitionBy) == 1 {
-		// Single partition column
-		keyCol := wa.PartitionBy[0]
-		keyFn = func(t types.Tuple) any { return t[keyCol] }
-	} else {
-		// Multiple partition columns - composite key
-		partCols := wa.PartitionBy
-		keyFn = func(t types.Tuple) any {
-			key := make([]any, len(partCols))
-			for i, col := range partCols {
-				key[i] = t[col]
-			}
-			return fmt.Sprintf("%v", key)
-		}
-	}
+	keyFn := buildPartitionKeyFn(wa.PartitionBy)
 
-	// Create appropriate aggregate function
-	var agg op.AggFunc
-	var aggInit func() any
-
-	switch wa.AggName {
-	case "SUM":
-		s := &op.SumAgg{ColName: wa.AggCol}
-		if strings.ContainsAny(wa.AggCol, "()->:") {
-			s.Expr = BuildExprFunc(wa.AggCol)
-		}
-		agg = s
-		aggInit = func() any { return float64(0) }
-	case "AVG":
-		av := &op.AvgAgg{ColName: wa.AggCol}
-		if strings.ContainsAny(wa.AggCol, "()->:") {
-			av.Expr = BuildExprFunc(wa.AggCol)
-		}
-		agg = av
-		aggInit = func() any { return op.AvgMonoid{} }
-	case "COUNT":
-		c := &op.CountAgg{ColName: wa.AggCol}
-		if wa.AggCol != "" && strings.ContainsAny(wa.AggCol, "()->:") {
-			c.Expr = BuildExprFunc(wa.AggCol)
-		}
-		agg = c
-		aggInit = func() any { return int64(0) }
-	case "MIN":
-		agg = &op.MinAgg{ColName: wa.AggCol}
-		aggInit = func() any { return op.NewSortedMultiset() }
-	case "MAX":
-		agg = &op.MaxAgg{ColName: wa.AggCol}
-		aggInit = func() any { return op.NewSortedMultiset() }
-	default:
+	agg, aggInit, err := buildSingleAggFunc(strings.ToUpper(wa.AggName), wa.AggCol)
+	if err != nil {
 		return nil, fmt.Errorf("unsupported window aggregate function: %s", wa.AggName)
 	}
 
@@ -936,23 +730,34 @@ func logicalWindowAggToDBSPWithContext(wa *LogicalWindowAgg, ctes map[string]*op
 		return attachLogicalWindowAggInputWithContext(wa, windowOp, ctes)
 	}
 
-	// For DuckDB window aggregates with ORDER BY and frame specification,
-	// use WindowAggOp for proper frame-based aggregation
-	if wa.OrderBy != "" && wa.FrameSpec != nil {
-		// Convert FrameSpec to op.FrameSpecLite
+	// For SQL window aggregates with ORDER BY, use frame-based WindowAggOp.
+	// If frame spec is omitted, default to cumulative frame:
+	// ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW.
+	if wa.OrderBy != "" {
 		frameSpec := &op.FrameSpecLite{
-			Type:       wa.FrameSpec.Type,
-			StartType:  wa.FrameSpec.StartType,
-			StartValue: wa.FrameSpec.StartValue,
-			EndType:    wa.FrameSpec.EndType,
-			EndValue:   wa.FrameSpec.EndValue,
+			Type:      "ROWS",
+			StartType: "UNBOUNDED PRECEDING",
+			EndType:   "CURRENT ROW",
+		}
+		if wa.FrameSpec != nil {
+			frameSpec = &op.FrameSpecLite{
+				Type:       wa.FrameSpec.Type,
+				StartType:  wa.FrameSpec.StartType,
+				StartValue: wa.FrameSpec.StartValue,
+				EndType:    wa.FrameSpec.EndType,
+				EndValue:   wa.FrameSpec.EndValue,
+			}
 		}
 
 		windowOp := op.NewWindowAggOp(op.WindowSpecLite{}, keyFn, wa.PartitionBy, aggInit, agg)
 		windowOp.OrderByCol = wa.OrderBy
 		windowOp.FrameSpec = frameSpec
 
-		return attachLogicalWindowAggInputWithContext(wa, windowOp, ctes)
+		node, err := attachLogicalWindowAggInputWithContext(wa, windowOp, ctes)
+		if err != nil {
+			return nil, err
+		}
+		return wrapWindowAggOutputAlias(node, wa.OutputCol), nil
 	}
 
 	// Fallback to GroupAggOp for simple aggregations without frame
@@ -961,39 +766,46 @@ func logicalWindowAggToDBSPWithContext(wa *LogicalWindowAgg, ctes map[string]*op
 		g.SetKeyColName(wa.PartitionBy[0])
 	}
 
-	return attachLogicalWindowAggInputWithContext(wa, g, ctes)
-}
-
-func attachLogicalWindowAggInputWithContext(wa *LogicalWindowAgg, aggOp op.Operator, ctes map[string]*op.Node) (*op.Node, error) {
-	if wa == nil || wa.Input == nil {
-		return &op.Node{Op: aggOp}, nil
-	}
-
-	// Filter before window agg: chain filter MapOp then the window agg op.
-	if f, ok := wa.Input.(*LogicalFilter); ok {
-		predicateFn := BuildPredicateFunc(f.PredicateSQL)
-		filterOp := &op.MapOp{F: func(td types.TupleDelta) []types.TupleDelta {
-			if predicateFn(td.Tuple) {
-				return []types.TupleDelta{td}
-			}
-			return nil
-		}}
-
-		inNode, err := logicalToDBSPWithContext(f.Input, ctes)
-		if err != nil {
-			return nil, err
-		}
-		chained := &op.ChainedOp{Ops: []op.Operator{filterOp, aggOp}}
-		return &op.Node{Op: chained, Inputs: []*op.Node{inNode}}, nil
-	}
-
-	// Normal recursive transform for input.
-	inNode, err := logicalToDBSPWithContext(wa.Input, ctes)
+	node, err := attachLogicalWindowAggInputWithContext(wa, g, ctes)
 	if err != nil {
 		return nil, err
 	}
+	return wrapWindowAggOutputAlias(node, wa.OutputCol), nil
+}
 
-	return &op.Node{Op: aggOp, Inputs: []*op.Node{inNode}}, nil
+func wrapWindowAggOutputAlias(node *op.Node, outputCol string) *op.Node {
+	if node == nil || strings.TrimSpace(outputCol) == "" {
+		return node
+	}
+	alias := strings.TrimSpace(outputCol)
+	aliasOp := &op.MapOp{F: func(td types.TupleDelta) []types.TupleDelta {
+		tuple := types.CloneTuple(td.Tuple)
+		if tuple == nil {
+			tuple = types.Tuple{}
+		}
+		if v, ok := tuple["agg_result"]; ok {
+			tuple[alias] = v
+		} else if v, ok := tuple["agg_delta"]; ok {
+			tuple[alias] = v
+		} else if v, ok := tuple["avg_delta"]; ok {
+			tuple[alias] = v
+		} else if v, ok := tuple["count_delta"]; ok {
+			tuple[alias] = v
+		} else if v, ok := tuple["min"]; ok {
+			tuple[alias] = v
+		} else if v, ok := tuple["max"]; ok {
+			tuple[alias] = v
+		}
+		return []types.TupleDelta{{Tuple: tuple, Count: td.Count}}
+	}}
+	return &op.Node{Op: &op.ChainedOp{Ops: []op.Operator{node.Op, aliasOp}}, Inputs: node.Inputs, Source: node.Source, PartitionBy: node.PartitionBy}
+}
+
+func attachLogicalWindowAggInputWithContext(wa *LogicalWindowAgg, aggOp op.Operator, ctes map[string]*op.Node) (*op.Node, error) {
+	if wa == nil {
+		return &op.Node{Op: aggOp}, nil
+	}
+	return attachInputToAgg(wa.Input, aggOp, ctes)
 }
 
 // logicalJoinToDBSP transforms LogicalJoin to BinaryOp (JoinOp)
