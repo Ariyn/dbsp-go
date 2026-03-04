@@ -6,7 +6,6 @@ import (
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
-	"github.com/ariyn/dbsp/cmd/dbsp/provider"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
@@ -63,35 +62,4 @@ func BuildArrowSchema(ps *config.ParquetSchema, includeCount bool) *arrow.Schema
 	}
 
 	return arrow.NewSchema(fields, nil)
-}
-
-// NoopCloseSink delegates writes while preventing shared sinks from being closed multiple times.
-type NoopCloseSink struct {
-	inner provider.Sink
-}
-
-func NewNoopCloseSink(inner provider.Sink) *NoopCloseSink {
-	return &NoopCloseSink{inner: inner}
-}
-
-func (s *NoopCloseSink) WriteBatch(batch types.Batch) error {
-	return s.inner.WriteBatch(batch)
-}
-
-func (s *NoopCloseSink) ReplayWriteBatch(batch types.Batch) error {
-	if rs, ok := s.inner.(provider.ReplaySink); ok {
-		return rs.ReplayWriteBatch(batch)
-	}
-	return s.inner.WriteBatch(batch)
-}
-
-func (s *NoopCloseSink) WriteBatchWithPartition(batch types.Batch, values map[string]string) error {
-	if ps, ok := s.inner.(PartitionedSink); ok {
-		return ps.WriteBatchWithPartition(batch, values)
-	}
-	return s.inner.WriteBatch(batch)
-}
-
-func (s *NoopCloseSink) Close() error {
-	return nil
 }

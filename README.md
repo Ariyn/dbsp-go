@@ -7,12 +7,12 @@ Go로 구현한 DBSP(DataBase Signal Processing) 기반 IVM(Incremental View Mai
 ## 빠른 시작 (CLI)
 
 ```bash
-# 바로 실행
-go run ./cmd/dbsp -config examples/config.yaml
+# 실행 (사용자 YAML 필요)
+go run ./cmd/dbsp -config ./your-config.yaml
 
 # 또는 바이너리로 빌드 후 실행
 go build -o dbsp ./cmd/dbsp
-./dbsp -config examples/config.yaml
+./dbsp -config ./your-config.yaml
 ```
 
 - CLI 플래그: `-config` (기본값 `config.yaml`)
@@ -28,7 +28,13 @@ go build -o dbsp ./cmd/dbsp
 - **GROUP BY + Aggregates**: `SUM`, `COUNT` (다중 GROUP BY 키 지원)
 - **JOIN**: 2-way equi-join 중심 (delete/retraction 포함 증분 전파 테스트 포함)
 - **시간 기반 윈도우 집계**: Tumbling / Sliding / Session
-- **TTL 설정 키 (옵션)**: `transform.ttl`을 설정하면 WAL 보존 기간으로 적용되어 오래된 WAL 배치/체크포인트를 정리합니다(논리 상태의 처리시간 만료에는 사용하지 않음).
+
+## 런타임 최소 계약
+
+- `source.type=http`
+- `sink.type=http_pull`
+- `transform.type=sql`
+- 아래 기능은 제거됨: `partition`, `wal/checkpoint`, `state_backend`, `transform.ttl`, `transform.watermark`, `DML(INSERT/UPDATE/DELETE)`
 
 ## 제한 사항(현재)
 

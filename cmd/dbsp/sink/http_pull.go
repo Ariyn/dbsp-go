@@ -6,11 +6,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
@@ -24,8 +22,7 @@ import (
 )
 
 type partitionEntry struct {
-	store      *op.ZSetStore
-	lastAccess time.Time
+	store *op.ZSetStore
 }
 
 type HTTPPullSink struct {
@@ -56,12 +53,6 @@ func NewHTTPPullSink(hcfg config.HTTPPullSinkConfig, partitionBy []string, schem
 		partitions:  make(map[string]*partitionEntry),
 	}
 
-	if hcfg.DiskSpillPath != "" {
-		if err := os.MkdirAll(hcfg.DiskSpillPath, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create disk spill path: %v", err)
-		}
-	}
-
 	as := BuildArrowSchema(schema, true)
 	s.arrowSchema = as
 
@@ -85,29 +76,7 @@ func NewHTTPPullSink(hcfg config.HTTPPullSinkConfig, partitionBy []string, schem
 		}
 	}()
 
-	if hcfg.PartitionTTLSeconds > 0 {
-		go s.runEvictionLoop(time.Duration(hcfg.PartitionTTLSeconds) * time.Second)
-	}
-
 	return s, nil
-}
-
-func (s *HTTPPullSink) runEvictionLoop(ttl time.Duration) {
-	ticker := time.NewTicker(ttl / 2)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		s.mu.Lock()
-		now := time.Now()
-		for k, entry := range s.partitions {
-			if now.Sub(entry.lastAccess) > ttl {
-				delete(s.partitions, k)
-				// Clean up spill files if necessary?
-				// For now just memory.
-			}
-		}
-		s.mu.Unlock()
-	}
 }
 
 func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
@@ -118,8 +87,6 @@ func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	affectedPartitions := make(map[string]*op.ZSetStore)
-	now := time.Now()
 	for _, td := range batch {
 		pk := s.getPartitionKey(td.Tuple)
 		entry, ok := s.partitions[pk]
@@ -129,117 +96,13 @@ func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
 			}
 			s.partitions[pk] = entry
 		}
-		entry.lastAccess = now
 
 		if err := entry.store.ApplyDelta(types.Batch{td}); err != nil {
 			return err
 		}
-		affectedPartitions[pk] = entry.store
-	}
-
-	if s.cfg.DiskSpillPath != "" {
-		for pk, store := range affectedPartitions {
-			if err := s.persistPartition(pk, store); err != nil {
-				return fmt.Errorf("failed to persist partition %s: %w", pk, err)
-			}
-		}
 	}
 
 	return nil
-}
-
-func (s *HTTPPullSink) ReplayWriteBatch(batch types.Batch) error {
-	return s.WriteBatch(batch)
-}
-
-func (s *HTTPPullSink) WriteBatchWithPartition(batch types.Batch, values map[string]string) error {
-	if len(batch) == 0 {
-		return nil
-	}
-
-	pk := s.partitionKeyFromValues(values)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := time.Now()
-	entry, ok := s.partitions[pk]
-	if !ok {
-		entry = &partitionEntry{
-			store: op.NewZSetStore(),
-		}
-		s.partitions[pk] = entry
-	}
-	entry.lastAccess = now
-
-	if err := entry.store.ApplyDelta(batch); err != nil {
-		return err
-	}
-
-	if s.cfg.DiskSpillPath != "" {
-		if err := s.persistPartition(pk, entry.store); err != nil {
-			return fmt.Errorf("failed to persist partition %s: %w", pk, err)
-		}
-	}
-
-	return nil
-}
-
-func (s *HTTPPullSink) persistPartition(pk string, store *op.ZSetStore) error {
-	path := s.partitionSpillPath(pk)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	batch := store.ToBatch()
-	if len(batch) == 0 {
-		_ = os.Remove(path)
-		return nil
-	}
-
-	props := parquet.NewWriterProperties()
-	arrowProps := pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema())
-
-	fw, err := pqarrow.NewFileWriter(s.arrowSchema, f, props, arrowProps)
-	if err != nil {
-		return err
-	}
-	defer fw.Close()
-
-	rec, err := s.batchToRecord(batch)
-	if err != nil {
-		return err
-	}
-	defer rec.Release()
-
-	return fw.Write(rec)
-}
-
-func (s *HTTPPullSink) partitionSpillPath(pk string) string {
-	if len(s.partitionBy) == 0 {
-		return filepath.Join(s.cfg.DiskSpillPath, "default.parquet")
-	}
-
-	values := make(map[string]string, len(s.partitionBy))
-	if len(s.partitionBy) == 1 {
-		values[s.partitionBy[0]] = pk
-	} else {
-		var parsed map[string]string
-		if err := json.Unmarshal([]byte(pk), &parsed); err == nil {
-			for _, key := range s.partitionBy {
-				values[key] = parsed[key]
-			}
-		}
-	}
-
-	baseFilePath := filepath.Join(s.cfg.DiskSpillPath, "snapshot.parquet")
-	return config.BuildHivePartitionPath(baseFilePath, s.partitionBy, values)
 }
 
 func (s *HTTPPullSink) getPartitionKey(t types.Tuple) string {
@@ -247,39 +110,16 @@ func (s *HTTPPullSink) getPartitionKey(t types.Tuple) string {
 		return "default"
 	}
 	if len(s.partitionBy) == 1 {
-		return config.SanitizeHivePathSegment(fmt.Sprintf("%v", t[s.partitionBy[0]]))
+		return sanitizeHivePathSegment(fmt.Sprintf("%v", t[s.partitionBy[0]]))
 	}
 
 	vals := make(map[string]string, len(s.partitionBy))
 	for _, col := range s.partitionBy {
-		vals[col] = config.SanitizeHivePathSegment(fmt.Sprintf("%v", t[col]))
+		vals[col] = sanitizeHivePathSegment(fmt.Sprintf("%v", t[col]))
 	}
 
 	b, _ := json.Marshal(vals)
 	return string(b)
-}
-
-func (s *HTTPPullSink) partitionKeyFromValues(values map[string]string) string {
-	if len(s.partitionBy) == 0 {
-		return "default"
-	}
-	if len(s.partitionBy) == 1 {
-		return normalizePartitionValue(values[s.partitionBy[0]])
-	}
-
-	vals := make(map[string]string, len(s.partitionBy))
-	for _, col := range s.partitionBy {
-		vals[col] = normalizePartitionValue(values[col])
-	}
-	b, _ := json.Marshal(vals)
-	return string(b)
-}
-
-func normalizePartitionValue(value string) string {
-	if strings.TrimSpace(value) == "" {
-		return "null"
-	}
-	return value
 }
 
 func (s *HTTPPullSink) Close() error {
@@ -295,12 +135,12 @@ func (s *HTTPPullSink) handlePull(w http.ResponseWriter, r *http.Request) {
 	if len(s.partitionBy) == 0 {
 		pk = "default"
 	} else if len(s.partitionBy) == 1 {
-		pk = config.SanitizeHivePathSegment(r.URL.Query().Get(s.partitionBy[0]))
+		pk = sanitizeHivePathSegment(r.URL.Query().Get(s.partitionBy[0]))
 	} else {
 		// Complex key: consistent with getPartitionKey
 		vals := make(map[string]string)
 		for _, col := range s.partitionBy {
-			vals[col] = config.SanitizeHivePathSegment(r.URL.Query().Get(col))
+			vals[col] = sanitizeHivePathSegment(r.URL.Query().Get(col))
 		}
 		b, _ := json.Marshal(vals)
 		pk = string(b)
@@ -308,37 +148,24 @@ func (s *HTTPPullSink) handlePull(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	entry, ok := s.partitions[pk]
-	if ok {
-		entry.lastAccess = time.Now()
-	}
 	s.mu.Unlock()
 
 	if !ok {
-		// If not in memory, check if we have a spill file.
-		spillPath := s.partitionSpillPath(pk)
-		if _, err := os.Stat(spillPath); os.IsNotExist(err) {
-			if len(s.partitions) > 0 {
-				fmt.Printf("HTTP Pull Warning: Partition '%s' not found. Available partitions (sanitized): ", pk)
-				i := 0
-				s.mu.RLock()
-				for k := range s.partitions {
-					fmt.Printf("%s ", k)
-					if i++; i > 10 {
-						fmt.Print("... ")
-						break
-					}
+		if len(s.partitions) > 0 {
+			fmt.Printf("HTTP Pull Warning: Partition '%s' not found. Available partitions (sanitized): ", pk)
+			i := 0
+			s.mu.RLock()
+			for k := range s.partitions {
+				fmt.Printf("%s ", k)
+				if i++; i > 10 {
+					fmt.Print("... ")
+					break
 				}
-				s.mu.RUnlock()
-				fmt.Println()
 			}
-			http.Error(w, "Partition not found", http.StatusNotFound)
-			return
+			s.mu.RUnlock()
+			fmt.Println()
 		}
-
-		// Serve from file if available.
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.parquet\"", pk))
-		http.ServeFile(w, r, spillPath)
+		http.Error(w, "Partition not found", http.StatusNotFound)
 		return
 	}
 
@@ -415,4 +242,15 @@ func (s *HTTPPullSink) batchToRecord(batch types.Batch) (arrow.Record, error) {
 	// Actually builders are released in defer, which is fine.
 
 	return rec, nil
+}
+
+func sanitizeHivePathSegment(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.ReplaceAll(v, string(filepath.Separator), "_")
+	v = strings.ReplaceAll(v, "=", "_")
+	v = strings.ReplaceAll(v, "..", "_")
+	if v == "" {
+		return "_"
+	}
+	return v
 }

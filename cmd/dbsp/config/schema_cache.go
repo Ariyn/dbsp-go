@@ -10,19 +10,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/ariyn/dbsp/internal/dbsp/ir"
-	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 	"gopkg.in/yaml.v3"
 )
 
-// ParquetSchema is a small, stable schema description used to build an Arrow schema
-// and to cache the inferred schema on disk.
-//
-// Type is a compact string enum: "string" | "int64" | "float64".
-// Unknown/unsupported runtime values are stringified.
-//
-// NOTE: This schema describes sink *rows*, not the input table schema.
-// It always includes "__count" which stores TupleDelta.Count.
 type ParquetSchema struct {
 	Version   int             `json:"version"`
 	QueryHash string          `json:"query_hash"`
@@ -34,100 +24,33 @@ type ParquetColumn struct {
 	Type string `json:"type"`
 }
 
+const parquetSchemaVersion = 2
+
 func InferOrLoadParquetSchema(query string, srcCfg SourceConfig, sinkCfg map[string]interface{}) (*ParquetSchema, error) {
 	queryHash := hashString(query)
-	var cachePath string
-
-	if pcfg, err := ParseParquetSinkConfig(sinkCfg); err == nil {
-		cachePath = strings.TrimSpace(pcfg.SchemaCachePath)
-		if cachePath == "" {
-			cachePath = defaultParquetSchemaCachePath(pcfg.Path)
-		}
-	} else if hcfg, err := ParseHTTPPullSinkConfig(sinkCfg); err == nil {
-		// For http_pull, optionally use a cache if configured, or default.
-		cachePath = "http_pull.schema.json"
-		if hcfg.DiskSpillPath != "" {
-			cachePath = filepath.Join(hcfg.DiskSpillPath, "schema.json")
-		}
-	} else {
-		return nil, fmt.Errorf("sink configuration must be either parquet or http_pull to use ParquetSchema")
+	if _, err := ParseHTTPPullSinkConfig(sinkCfg); err != nil {
+		return nil, fmt.Errorf("sink configuration must be http_pull: %w", err)
 	}
 
-	if st, err := os.Stat(cachePath); err == nil && !st.IsDir() {
-		b, err := os.ReadFile(cachePath)
-		if err != nil {
-			return nil, fmt.Errorf("read schema cache %s: %w", cachePath, err)
-		}
-		var s ParquetSchema
-		if err := json.Unmarshal(b, &s); err != nil {
-			return nil, fmt.Errorf("parse schema cache %s: %w", cachePath, err)
-		}
-		if s.Version == 0 {
-			s.Version = 1
-		}
-		if s.QueryHash != "" && s.QueryHash != queryHash {
-			// Query changed? We should re-infer.
-		} else if len(s.Columns) > 0 {
-			return &s, nil
-		}
+	cachePath := "http_pull.schema.json"
+
+	if loaded, err := tryLoadSchemaCache(cachePath, queryHash); err == nil && loaded != nil {
+		return loaded, nil
 	}
 
-	srcSchema, err := extractSourceSchemaHints(srcCfg)
+	hints, err := extractSourceSchemaHints(srcCfg)
 	if err != nil {
 		return nil, err
 	}
 
-	logical, err := sqlconv.ParseQueryToLogicalPlan(query)
-	if err != nil {
+	schema := buildSchemaFromHints(hints)
+	schema.Version = parquetSchemaVersion
+	schema.QueryHash = queryHash
+
+	if err := writeSchemaCache(cachePath, schema); err != nil {
 		return nil, err
 	}
-
-	s, err := inferParquetSchemaFromLogicalPlan(logical, srcSchema)
-	if err != nil {
-		return nil, err
-	}
-	s.Version = 1
-	s.QueryHash = queryHash
-
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
-		return nil, fmt.Errorf("mkdir schema cache dir: %w", err)
-	}
-	b, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal schema: %w", err)
-	}
-	if err := os.WriteFile(cachePath, b, 0644); err != nil {
-		return nil, fmt.Errorf("write schema cache %s: %w", cachePath, err)
-	}
-
-	return s, nil
-}
-
-func defaultParquetSchemaCachePath(outputPath string) string {
-	base := strings.TrimSpace(filepath.Base(outputPath))
-	if base == "" || base == "." || base == string(os.PathSeparator) {
-		base = "parquet"
-	}
-	dir := filepath.Dir(outputPath)
-	if dir == "." || dir == string(os.PathSeparator) {
-		dir = os.TempDir()
-	}
-	return filepath.Join(dir, base+".schema.json")
-}
-
-func ParseParquetSinkConfig(cfg map[string]interface{}) (*ParquetSinkConfig, error) {
-	yamlBytes, err := yaml.Marshal(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal parquet sink config: %w", err)
-	}
-	var out ParquetSinkConfig
-	if err := yaml.Unmarshal(yamlBytes, &out); err != nil {
-		return nil, fmt.Errorf("failed to parse parquet sink config: %w", err)
-	}
-	if strings.TrimSpace(out.Path) == "" {
-		return nil, fmt.Errorf("parquet sink path is required")
-	}
-	return &out, nil
+	return schema, nil
 }
 
 func ParseHTTPPullSinkConfig(cfg map[string]interface{}) (*HTTPPullSinkConfig, error) {
@@ -140,49 +63,15 @@ func ParseHTTPPullSinkConfig(cfg map[string]interface{}) (*HTTPPullSinkConfig, e
 		return nil, fmt.Errorf("failed to parse http_pull sink config: %w", err)
 	}
 	if out.Port <= 0 {
-		out.Port = 8080 // Default port
+		out.Port = 8080
 	}
 	if strings.TrimSpace(out.Path) == "" {
-		out.Path = "/snapshot" // Default path
+		out.Path = "/pull"
 	}
 	return &out, nil
 }
 
-func extractSourceSchemaHints(src SourceConfig) (map[string]string, error) {
-	// Supported sources with schema hints: http/chain.
-	schema := map[string]string{}
-
-	switch src.Type {
-	case "http":
-		var c HTTPSourceConfig
-		if err := decodeTo(src.Config, &c); err != nil {
-			return nil, err
-		}
-		for k, v := range c.Schema {
-			schema[k] = v
-		}
-	case "chain":
-		var c ChainSourceConfig
-		if err := decodeTo(src.Config, &c); err != nil {
-			return nil, err
-		}
-		for _, s := range c.Sources {
-			m, err := extractSourceSchemaHints(s)
-			if err != nil {
-				return nil, err
-			}
-			for k, v := range m {
-				schema[k] = v
-			}
-		}
-	default:
-		// Unknown source type: return empty hints.
-	}
-
-	return schema, nil
-}
-
-func decodeTo(in map[string]interface{}, out any) error {
+func DecodeTo(in map[string]interface{}, out any) error {
 	yamlBytes, err := yaml.Marshal(in)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
@@ -193,153 +82,84 @@ func decodeTo(in map[string]interface{}, out any) error {
 	return nil
 }
 
-// DecodeTo parses a generic config map into a typed struct.
-func DecodeTo(in map[string]interface{}, out any) error {
-	return decodeTo(in, out)
+func extractSourceSchemaHints(src SourceConfig) (map[string]string, error) {
+	schema := map[string]string{}
+	if strings.TrimSpace(src.Type) != "http" {
+		return schema, nil
+	}
+	var cfg HTTPSourceConfig
+	if err := DecodeTo(src.Config, &cfg); err != nil {
+		return nil, err
+	}
+	for key, typ := range cfg.Schema {
+		schema[key] = typ
+	}
+	return schema, nil
 }
 
-func inferParquetSchemaFromLogicalPlan(node any, sourceSchema map[string]string) (*ParquetSchema, error) {
-	// Walk the logical plan to determine output columns.
-	cols := make([]ParquetColumn, 0, 8)
-
-	addCol := func(name, typ string) {
-		if strings.TrimSpace(name) == "" {
-			return
-		}
-		for _, c := range cols {
-			if c.Name == name {
-				return
-			}
-		}
-		cols = append(cols, ParquetColumn{Name: name, Type: typ})
+func buildSchemaFromHints(hints map[string]string) *ParquetSchema {
+	keys := make([]string, 0, len(hints))
+	for key := range hints {
+		keys = append(keys, key)
 	}
+	sort.Strings(keys)
 
-	// Helper: map source type hint to parquet type.
-	inferTypeFromHint := func(col string) string {
-		h := strings.ToLower(strings.TrimSpace(sourceSchema[col]))
-		switch h {
-		case "int":
-			return "int64"
-		case "float":
-			return "float64"
-		case "string":
-			return "string"
-		case "bool":
-			return "string" // ParquetSchema version 1 uses string/int64/float64
-		case "timestamp":
-			return "int64"
-		case "json":
-			return "string"
-		default:
-			return "string"
-		}
+	cols := make([]ParquetColumn, 0, len(keys)+1)
+	for _, key := range keys {
+		cols = append(cols, ParquetColumn{Name: key, Type: normalizeHintType(hints[key])})
 	}
+	cols = append(cols, ParquetColumn{Name: "__count", Type: "int64"})
+	return &ParquetSchema{Columns: cols}
+}
 
-	addSourceSchemaCols := func() {
-		keys := make([]string, 0, len(sourceSchema))
-		for k := range sourceSchema {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			addCol(k, inferTypeFromHint(k))
-		}
-	}
-
-	// Prefer concrete logical plan types for schema inference.
-	switch n := node.(type) {
-	case *ir.LogicalGroupAgg:
-		for _, k := range n.Keys {
-			addCol(k, inferTypeFromHint(k))
-		}
-		if len(n.Aggs) > 0 {
-			for _, a := range n.Aggs {
-				switch strings.ToUpper(strings.TrimSpace(a.Name)) {
-				case "SUM":
-					addCol("agg_delta", "float64")
-				case "COUNT":
-					addCol("count_delta", "int64")
-				case "AVG":
-					addCol("avg_delta", "float64")
-				case "MIN":
-					addCol("min", "string")
-				case "MAX":
-					addCol("max", "string")
-				}
-			}
-		} else {
-			switch strings.ToUpper(strings.TrimSpace(n.AggName)) {
-			case "SUM":
-				addCol("agg_delta", "float64")
-			case "COUNT":
-				addCol("count_delta", "int64")
-			case "AVG":
-				addCol("avg_delta", "float64")
-			case "MIN":
-				addCol("min", "string")
-			case "MAX":
-				addCol("max", "string")
-			default:
-				return nil, fmt.Errorf("unsupported aggregate for parquet schema: %s", n.AggName)
-			}
-		}
-		addCol("__count", "int64")
-		return &ParquetSchema{Columns: cols}, nil
-	case *ir.LogicalWindowAgg:
-		// Window columns are always present in WindowAggOp outputs.
-		addCol("__window_start", "int64")
-		addCol("__window_end", "int64")
-		for _, k := range n.PartitionBy {
-			addCol(k, inferTypeFromHint(k))
-		}
-		switch strings.ToUpper(strings.TrimSpace(n.AggName)) {
-		case "SUM":
-			addCol("agg_delta", "float64")
-		case "COUNT":
-			addCol("count_delta", "int64")
-		case "AVG":
-			addCol("avg_delta", "float64")
-		case "MIN":
-			addCol("min", "string")
-		case "MAX":
-			addCol("max", "string")
-		default:
-			return nil, fmt.Errorf("unsupported window aggregate for parquet schema: %s", n.AggName)
-		}
-		// Session windows can emit agg_result tuples via session diff logic.
-		// Store it as float64 to keep schema stable.
-		addCol("agg_result", "float64")
-		addCol("__count", "int64")
-		return &ParquetSchema{Columns: cols}, nil
-	case *ir.LogicalProject:
-		for _, k := range n.Columns {
-			addCol(k, inferTypeFromHint(k))
-		}
-		for _, e := range n.Exprs {
-			addCol(e.As, "string")
-		}
-		addCol("__count", "int64")
-	case *ir.LogicalView:
-		return inferParquetSchemaFromLogicalPlan(n.Input, sourceSchema)
-	case *ir.LogicalFilter:
-		return inferParquetSchemaFromLogicalPlan(n.Input, sourceSchema)
-	case *ir.LogicalSort:
-		return inferParquetSchemaFromLogicalPlan(n.Input, sourceSchema)
-	case *ir.LogicalLimit:
-		return inferParquetSchemaFromLogicalPlan(n.Input, sourceSchema)
-	case *ir.LogicalWith:
-		return inferParquetSchemaFromLogicalPlan(n.Body, sourceSchema)
-	case *ir.LogicalScan:
-		addSourceSchemaCols()
-		addCol("__count", "int64")
+func normalizeHintType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "int", "int64", "timestamp":
+		return "int64"
+	case "float", "float64":
+		return "float64"
 	default:
-		addSourceSchemaCols()
-		addCol("__count", "int64")
+		return "string"
 	}
+}
 
-	// Keep deterministic order.
-	sort.Slice(cols, func(i, j int) bool { return cols[i].Name < cols[j].Name })
-	return &ParquetSchema{Columns: cols}, nil
+func tryLoadSchemaCache(path, queryHash string) (*ParquetSchema, error) {
+	st, err := os.Stat(path)
+	if err != nil || st.IsDir() {
+		return nil, err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var s ParquetSchema
+	if err := json.Unmarshal(b, &s); err != nil {
+		return nil, err
+	}
+	if len(s.Columns) == 0 {
+		return nil, fmt.Errorf("empty schema cache")
+	}
+	if s.Version == 0 {
+		s.Version = 1
+	}
+	if s.Version == parquetSchemaVersion && (s.QueryHash == "" || s.QueryHash == queryHash) {
+		return &s, nil
+	}
+	return nil, fmt.Errorf("schema cache mismatch")
+}
+
+func writeSchemaCache(path string, schema *ParquetSchema) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("mkdir schema cache dir: %w", err)
+	}
+	b, err := json.MarshalIndent(schema, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal schema: %w", err)
+	}
+	if err := os.WriteFile(path, b, 0644); err != nil {
+		return fmt.Errorf("write schema cache %s: %w", path, err)
+	}
+	return nil
 }
 
 func hashString(s string) string {

@@ -1,16 +1,10 @@
 package op
 
 import (
-	"bytes"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
-
-	"github.com/cockroachdb/pebble"
-	"go.etcd.io/bbolt"
 )
 
 type StateBatchOpType int
@@ -33,15 +27,15 @@ func (s StateBatchOp) MutationType() string {
 	return "put"
 }
 
-func StateBatchOpFromMutation(m_type string, key, value []byte) StateBatchOp {
+func StateBatchOpFromMutation(mType string, key, value []byte) StateBatchOp {
 	typ := StateBatchPut
-	if strings.EqualFold(strings.TrimSpace(m_type), "delete") {
+	if strings.EqualFold(strings.TrimSpace(mType), "delete") {
 		typ = StateBatchDelete
 	}
 	return StateBatchOp{
 		Type:  typ,
-		Key:   append([]byte(nil), key...),
-		Value: append([]byte(nil), value...),
+		Key:   cloneBytes(key),
+		Value: cloneBytes(value),
 	}
 }
 
@@ -155,249 +149,15 @@ func (m *MemoryStateBackend) Close() error {
 	return nil
 }
 
-type BoltStateBackend struct {
-	db     *bbolt.DB
-	bucket []byte
-}
-
-func NewBoltStateBackend(path string) (*BoltStateBackend, error) {
-	if strings.TrimSpace(path) == "" {
-		return nil, fmt.Errorf("state backend path is empty")
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("creating state backend dir: %w", err)
-	}
-	db, err := bbolt.Open(path, 0o600, nil)
-	if err != nil {
-		return nil, fmt.Errorf("opening bolt state backend: %w", err)
-	}
-	backend := &BoltStateBackend{db: db, bucket: []byte("state")}
-	if err := backend.db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(backend.bucket)
-		return err
-	}); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("initializing bolt bucket: %w", err)
-	}
-	return backend, nil
-}
-
-func (b *BoltStateBackend) Get(key []byte) ([]byte, bool, error) {
-	if b == nil || b.db == nil {
-		return nil, false, fmt.Errorf("bolt backend is nil")
-	}
-	var out []byte
-	err := b.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(b.bucket)
-		if bucket == nil {
-			return nil
-		}
-		v := bucket.Get(key)
-		if v == nil {
-			return nil
-		}
-		out = cloneBytes(v)
-		return nil
-	})
-	if err != nil {
-		return nil, false, err
-	}
-	if out == nil {
-		return nil, false, nil
-	}
-	return out, true, nil
-}
-
-func (b *BoltStateBackend) Put(key, value []byte) error {
-	return b.BatchWrite([]StateBatchOp{{Type: StateBatchPut, Key: key, Value: value}})
-}
-
-func (b *BoltStateBackend) Delete(key []byte) error {
-	return b.BatchWrite([]StateBatchOp{{Type: StateBatchDelete, Key: key}})
-}
-
-func (b *BoltStateBackend) IterPrefix(prefix []byte, visit func(key, value []byte) error) error {
-	if b == nil || b.db == nil {
-		return fmt.Errorf("bolt backend is nil")
-	}
-	if visit == nil {
-		return fmt.Errorf("visit callback is nil")
-	}
-	return b.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(b.bucket)
-		if bucket == nil {
-			return nil
-		}
-		cursor := bucket.Cursor()
-		for k, v := cursor.Seek(prefix); k != nil; k, v = cursor.Next() {
-			if !bytes.HasPrefix(k, prefix) {
-				break
-			}
-			if err := visit(cloneBytes(k), cloneBytes(v)); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-func (b *BoltStateBackend) BatchWrite(ops []StateBatchOp) error {
-	if b == nil || b.db == nil {
-		return fmt.Errorf("bolt backend is nil")
-	}
-	return b.db.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(b.bucket)
-		if bucket == nil {
-			return fmt.Errorf("state bucket missing")
-		}
-		for _, op := range ops {
-			switch op.Type {
-			case StateBatchPut:
-				if err := bucket.Put(op.Key, op.Value); err != nil {
-					return err
-				}
-			case StateBatchDelete:
-				if err := bucket.Delete(op.Key); err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("unknown batch op type: %d", op.Type)
-			}
-		}
-		return nil
-	})
-}
-
-func (b *BoltStateBackend) Close() error {
-	if b == nil || b.db == nil {
-		return nil
-	}
-	return b.db.Close()
-}
-
-type PebbleStateBackend struct {
-	db *pebble.DB
-}
-
-func NewPebbleStateBackend(path string) (*PebbleStateBackend, error) {
-	if strings.TrimSpace(path) == "" {
-		return nil, fmt.Errorf("state backend path is empty")
-	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		return nil, fmt.Errorf("creating state backend dir: %w", err)
-	}
-	db, err := pebble.Open(path, &pebble.Options{})
-	if err != nil {
-		return nil, fmt.Errorf("opening pebble state backend: %w", err)
-	}
-	return &PebbleStateBackend{db: db}, nil
-}
-
-func (p *PebbleStateBackend) Get(key []byte) ([]byte, bool, error) {
-	if p == nil || p.db == nil {
-		return nil, false, fmt.Errorf("pebble backend is nil")
-	}
-	value, closer, err := p.db.Get(key)
-	if err != nil {
-		if err == pebble.ErrNotFound {
-			return nil, false, nil
-		}
-		return nil, false, err
-	}
-	out := cloneBytes(value)
-	if err := closer.Close(); err != nil {
-		return nil, false, err
-	}
-	return out, true, nil
-}
-
-func (p *PebbleStateBackend) Put(key, value []byte) error {
-	if p == nil || p.db == nil {
-		return fmt.Errorf("pebble backend is nil")
-	}
-	return p.db.Set(key, value, pebble.Sync)
-}
-
-func (p *PebbleStateBackend) Delete(key []byte) error {
-	if p == nil || p.db == nil {
-		return fmt.Errorf("pebble backend is nil")
-	}
-	return p.db.Delete(key, pebble.Sync)
-}
-
-func (p *PebbleStateBackend) IterPrefix(prefix []byte, visit func(key, value []byte) error) error {
-	if p == nil || p.db == nil {
-		return fmt.Errorf("pebble backend is nil")
-	}
-	if visit == nil {
-		return fmt.Errorf("visit callback is nil")
-	}
-	iter, err := p.db.NewIter(&pebble.IterOptions{LowerBound: prefix})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-	for iter.First(); iter.Valid(); iter.Next() {
-		k := iter.Key()
-		if !bytes.HasPrefix(k, prefix) {
-			break
-		}
-		v := iter.Value()
-		if err := visit(cloneBytes(k), cloneBytes(v)); err != nil {
-			return err
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (p *PebbleStateBackend) BatchWrite(ops []StateBatchOp) error {
-	if p == nil || p.db == nil {
-		return fmt.Errorf("pebble backend is nil")
-	}
-	batch := p.db.NewBatch()
-	defer batch.Close()
-	for _, op := range ops {
-		switch op.Type {
-		case StateBatchPut:
-			if err := batch.Set(op.Key, op.Value, nil); err != nil {
-				return err
-			}
-		case StateBatchDelete:
-			if err := batch.Delete(op.Key, nil); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unknown batch op type: %d", op.Type)
-		}
-	}
-	return batch.Commit(pebble.Sync)
-}
-
-func (p *PebbleStateBackend) Close() error {
-	if p == nil || p.db == nil {
-		return nil
-	}
-	return p.db.Close()
-}
-
-func NewStateBackendFromConfig(enabled bool, backendType, path string) (StateBackend, error) {
+func NewStateBackendFromConfig(enabled bool, backendType, _ string) (StateBackend, error) {
 	if !enabled {
 		return nil, nil
 	}
 	switch strings.TrimSpace(strings.ToLower(backendType)) {
 	case "", "memory":
 		return NewMemoryStateBackend(), nil
-	case "kv", "bolt", "bbolt":
-		return NewBoltStateBackend(path)
-	case "lsm", "pebble":
-		return NewPebbleStateBackend(path)
-	case "sqlite":
-		return nil, fmt.Errorf("sqlite state backend is not implemented yet")
 	default:
-		return nil, fmt.Errorf("unsupported state backend type: %s", backendType)
+		return nil, fmt.Errorf("unsupported state backend type in minimal runtime: %s", backendType)
 	}
 }
 

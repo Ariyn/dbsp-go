@@ -14,7 +14,6 @@ func init() {
 	gob.Register(binarySnapshotV1{})
 	gob.Register(delaySnapshotV1{})
 	gob.Register(windowAggSnapshotV1{})
-	gob.Register(watermarkAwareSnapshotV1{})
 }
 
 // StatefulOperator can persist and restore its internal mutable state.
