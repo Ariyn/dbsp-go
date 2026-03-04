@@ -25,9 +25,9 @@ func TestHTTPPullSink_E2E(t *testing.T) {
 	// 1. Setup Sink
 	port := 9091
 	path := "/snapshot"
-	cfg := map[string]interface{}{
-		"port": port,
-		"path": path,
+	cfg := config.HTTPPullSinkConfig{
+		Port: port,
+		Path: path,
 	}
 	partitionBy := []string{"category"}
 	schema := &config.ParquetSchema{
@@ -137,10 +137,10 @@ func TestHTTPPullSink_DiskSpill(t *testing.T) {
 
 	port := 9092
 	path := "/snapshot"
-	cfg := map[string]interface{}{
-		"port":            port,
-		"path":            path,
-		"disk_spill_path": tmpDir,
+	cfg := config.HTTPPullSinkConfig{
+		Port:          port,
+		Path:          path,
+		DiskSpillPath: tmpDir,
 	}
 
 	partitionBy := []string{"id"}
@@ -199,10 +199,10 @@ func TestHTTPPullSink_DiskSpill_CompositeKeyHivePath(t *testing.T) {
 
 	port := 9096
 	path := "/snapshot"
-	cfg := map[string]interface{}{
-		"port":            port,
-		"path":            path,
-		"disk_spill_path": tmpDir,
+	cfg := config.HTTPPullSinkConfig{
+		Port:          port,
+		Path:          path,
+		DiskSpillPath: tmpDir,
 	}
 
 	partitionBy := []string{"tenant_id", "region"}
@@ -236,9 +236,9 @@ func TestHTTPPullSink_DiskSpill_CompositeKeyHivePath(t *testing.T) {
 func TestHTTPPullSink_CompositeKey(t *testing.T) {
 	port := 9093
 	path := "/snapshot"
-	cfg := map[string]interface{}{
-		"port": port,
-		"path": path,
+	cfg := config.HTTPPullSinkConfig{
+		Port: port,
+		Path: path,
 	}
 
 	partitionBy := []string{"tenant_id", "region"}
@@ -307,9 +307,9 @@ func TestHTTPPullSink_CompositeKey(t *testing.T) {
 func TestHTTPPullSink_EmptyAfterDelete(t *testing.T) {
 	port := 9094
 	path := "/snapshot"
-	cfg := map[string]interface{}{
-		"port": port,
-		"path": path,
+	cfg := config.HTTPPullSinkConfig{
+		Port: port,
+		Path: path,
 	}
 
 	partitionBy := []string{"category"}
@@ -351,9 +351,9 @@ func TestHTTPPullSink_EmptyAfterDelete(t *testing.T) {
 func TestHTTPPullSink_FailsFastOnPortConflict(t *testing.T) {
 	port := 9095
 	path := "/snapshot"
-	cfg := map[string]interface{}{
-		"port": port,
-		"path": path,
+	cfg := config.HTTPPullSinkConfig{
+		Port: port,
+		Path: path,
 	}
 
 	schema := &config.ParquetSchema{

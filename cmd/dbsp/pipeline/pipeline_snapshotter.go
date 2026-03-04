@@ -1,6 +1,11 @@
 package pipeline
 
-import walpkg "github.com/ariyn/dbsp/internal/dbsp/wal"
+import (
+	"strings"
+
+	"github.com/ariyn/dbsp/cmd/dbsp/config"
+	walpkg "github.com/ariyn/dbsp/internal/dbsp/wal"
+)
 
 type PipelineSnapshotterFunc struct {
 	SnapFunc                        func() ([]byte, error)
@@ -13,6 +18,26 @@ type PipelineSnapshotterFunc struct {
 	Mode                           string
 	FullSnapshotEveryBatches       int
 	MaxIncrementalMutationBytesVal int
+}
+
+func NewPipelineSnapshotter(
+	cfg *config.PipelineConfig,
+	snap func() ([]byte, error),
+	restore func([]byte) error,
+	drain func() []walpkg.CheckpointMutation,
+	apply func([]walpkg.CheckpointMutation) error,
+	rollback func([]walpkg.CheckpointMutation),
+) PipelineSnapshotterFunc {
+	return PipelineSnapshotterFunc{
+		SnapFunc:                        snap,
+		RestoreFunc:                     restore,
+		DrainCheckpointMutationsFunc:    drain,
+		ApplyCheckpointMutationsFunc:    apply,
+		RollbackCheckpointMutationsFunc: rollback,
+		Mode:                            strings.ToLower(strings.TrimSpace(cfg.Pipeline.State.CheckpointMode)),
+		FullSnapshotEveryBatches:        cfg.Pipeline.State.CheckpointEveryBatches,
+		MaxIncrementalMutationBytesVal:  cfg.Pipeline.State.MaxIncrementalMutationBytes,
+	}
 }
 
 func (p PipelineSnapshotterFunc) Snapshot() ([]byte, error) {

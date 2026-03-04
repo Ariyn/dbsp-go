@@ -63,7 +63,7 @@ func (i *IntegrateOp) Snapshot() (any, error) {
 		if e == nil || e.count == 0 {
 			continue
 		}
-		entries[k] = zsetEntryV1{Tuple: cloneTupleLocal(e.tuple), Count: e.count}
+		entries[k] = zsetEntryV1{Tuple: types.CloneTuple(e.tuple), Count: e.count}
 	}
 	return integrateSnapshotV1{Entries: entries}, nil
 }
@@ -87,7 +87,7 @@ func (i *IntegrateOp) Restore(state any) error {
 		}
 	}
 	for k, e := range s.Entries {
-		i.store.entries[k] = &zsetEntry{tuple: cloneTupleLocal(e.Tuple), count: e.Count}
+		i.store.entries[k] = &zsetEntry{tuple: types.CloneTuple(e.Tuple), count: e.Count}
 	}
 	return nil
 }

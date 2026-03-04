@@ -4,81 +4,53 @@ import (
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
-// JoinDeltaValueOp computes (ΔR ⋈ S_value) where left is a delta batch and right is a value snapshot.
-// The right input is expected to be a materialized Z-set snapshot encoded as Batch (tuple,count).
-// Output is a delta batch.
-type JoinDeltaValueOp struct {
+type ExplicitJoinMode int
+
+const (
+	JoinDeltaValue ExplicitJoinMode = iota
+	JoinValueDelta
+	JoinDeltaDelta
+)
+
+// ExplicitJoinOp computes joins between two batches.
+// Depending on Mode, one or both inputs may be treated as delta batches or value snapshots.
+type ExplicitJoinOp struct {
+	Mode       ExplicitJoinMode
 	LeftKeyFn  func(types.Tuple) any
 	RightKeyFn func(types.Tuple) any
 	CombineFn  func(l, r types.Tuple) types.Tuple
 }
 
-func NewJoinDeltaValueOp(
+func NewExplicitJoinOp(
+	mode ExplicitJoinMode,
 	leftKeyFn func(types.Tuple) any,
 	rightKeyFn func(types.Tuple) any,
 	combineFn func(l, r types.Tuple) types.Tuple,
-) *JoinDeltaValueOp {
-	return &JoinDeltaValueOp{LeftKeyFn: leftKeyFn, RightKeyFn: rightKeyFn, CombineFn: combineFn}
+) *ExplicitJoinOp {
+	return &ExplicitJoinOp{
+		Mode:       mode,
+		LeftKeyFn:  leftKeyFn,
+		RightKeyFn: rightKeyFn,
+		CombineFn:  combineFn,
+	}
 }
 
-func (j *JoinDeltaValueOp) Apply(batch types.Batch) (types.Batch, error) {
+func (j *ExplicitJoinOp) Apply(batch types.Batch) (types.Batch, error) {
 	_ = batch
-	return nil, nil
+	return nil, nil // Join expects two inputs via Apply2
 }
 
-func (j *JoinDeltaValueOp) Apply2(leftDelta, rightValue types.Batch) (types.Batch, error) {
-	return joinDeltaValue(leftDelta, rightValue, j.LeftKeyFn, j.RightKeyFn, j.CombineFn), nil
-}
-
-// JoinValueDeltaOp computes (R_value ⋈ ΔS) where left is a value snapshot and right is a delta batch.
-// Output is a delta batch.
-type JoinValueDeltaOp struct {
-	LeftKeyFn  func(types.Tuple) any
-	RightKeyFn func(types.Tuple) any
-	CombineFn  func(l, r types.Tuple) types.Tuple
-}
-
-func NewJoinValueDeltaOp(
-	leftKeyFn func(types.Tuple) any,
-	rightKeyFn func(types.Tuple) any,
-	combineFn func(l, r types.Tuple) types.Tuple,
-) *JoinValueDeltaOp {
-	return &JoinValueDeltaOp{LeftKeyFn: leftKeyFn, RightKeyFn: rightKeyFn, CombineFn: combineFn}
-}
-
-func (j *JoinValueDeltaOp) Apply(batch types.Batch) (types.Batch, error) {
-	_ = batch
-	return nil, nil
-}
-
-func (j *JoinValueDeltaOp) Apply2(leftValue, rightDelta types.Batch) (types.Batch, error) {
-	// Symmetric implementation: treat rightDelta as delta and leftValue as value.
-	return joinValueDelta(leftValue, rightDelta, j.LeftKeyFn, j.RightKeyFn, j.CombineFn), nil
-}
-
-// JoinDeltaDeltaOp computes (ΔR ⋈ ΔS) for two delta batches.
-// Output is a delta batch.
-type JoinDeltaDeltaOp struct {
-	LeftKeyFn  func(types.Tuple) any
-	RightKeyFn func(types.Tuple) any
-	CombineFn  func(l, r types.Tuple) types.Tuple
-}
-
-func NewJoinDeltaDeltaOp(
-	leftKeyFn func(types.Tuple) any,
-	rightKeyFn func(types.Tuple) any,
-	combineFn func(l, r types.Tuple) types.Tuple,
-) *JoinDeltaDeltaOp {
-	return &JoinDeltaDeltaOp{LeftKeyFn: leftKeyFn, RightKeyFn: rightKeyFn, CombineFn: combineFn}
-}
-
-func (j *JoinDeltaDeltaOp) Apply(batch types.Batch) (types.Batch, error) {
-	_ = batch
-	return nil, nil
-}
-
-func (j *JoinDeltaDeltaOp) Apply2(leftDelta, rightDelta types.Batch) (types.Batch, error) {
-	return joinDeltaDelta(leftDelta, rightDelta, j.LeftKeyFn, j.RightKeyFn, j.CombineFn), nil
+func (j *ExplicitJoinOp) Apply2(left, right types.Batch) (types.Batch, error) {
+	switch j.Mode {
+	case JoinDeltaValue:
+		return joinDeltaValue(left, right, j.LeftKeyFn, j.RightKeyFn, j.CombineFn), nil
+	case JoinValueDelta:
+		return joinValueDelta(left, right, j.LeftKeyFn, j.RightKeyFn, j.CombineFn), nil
+	case JoinDeltaDelta:
+		return joinDeltaDelta(left, right, j.LeftKeyFn, j.RightKeyFn, j.CombineFn), nil
+	default:
+		return nil, nil
+	}
 }
 
 func indexByKey(batch types.Batch, keyFn func(types.Tuple) any) map[any][]types.TupleDelta {

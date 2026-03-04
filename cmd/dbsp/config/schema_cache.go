@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ariyn/dbsp/internal/dbsp/ir"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 	"gopkg.in/yaml.v3"
 )
@@ -40,7 +41,7 @@ func InferOrLoadParquetSchema(query string, srcCfg SourceConfig, sinkCfg map[str
 	if pcfg, err := ParseParquetSinkConfig(sinkCfg); err == nil {
 		cachePath = strings.TrimSpace(pcfg.SchemaCachePath)
 		if cachePath == "" {
-			cachePath = pcfg.Path + ".schema.json"
+			cachePath = defaultParquetSchemaCachePath(pcfg.Path)
 		}
 	} else if hcfg, err := ParseHTTPPullSinkConfig(sinkCfg); err == nil {
 		// For http_pull, optionally use a cache if configured, or default.
@@ -102,6 +103,18 @@ func InferOrLoadParquetSchema(query string, srcCfg SourceConfig, sinkCfg map[str
 	return s, nil
 }
 
+func defaultParquetSchemaCachePath(outputPath string) string {
+	base := strings.TrimSpace(filepath.Base(outputPath))
+	if base == "" || base == "." || base == string(os.PathSeparator) {
+		base = "parquet"
+	}
+	dir := filepath.Dir(outputPath)
+	if dir == "." || dir == string(os.PathSeparator) {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, base+".schema.json")
+}
+
 func ParseParquetSinkConfig(cfg map[string]interface{}) (*ParquetSinkConfig, error) {
 	yamlBytes, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -136,18 +149,10 @@ func ParseHTTPPullSinkConfig(cfg map[string]interface{}) (*HTTPPullSinkConfig, e
 }
 
 func extractSourceSchemaHints(src SourceConfig) (map[string]string, error) {
-	// Supported sources with schema hints: csv/http/chain.
+	// Supported sources with schema hints: http/chain.
 	schema := map[string]string{}
 
 	switch src.Type {
-	case "csv":
-		var c CSVSourceConfig
-		if err := decodeTo(src.Config, &c); err != nil {
-			return nil, err
-		}
-		for k, v := range c.Schema {
-			schema[k] = v
-		}
 	case "http":
 		var c HTTPSourceConfig
 		if err := decodeTo(src.Config, &c); err != nil {
@@ -188,6 +193,11 @@ func decodeTo(in map[string]interface{}, out any) error {
 	return nil
 }
 
+// DecodeTo parses a generic config map into a typed struct.
+func DecodeTo(in map[string]interface{}, out any) error {
+	return decodeTo(in, out)
+}
+
 func inferParquetSchemaFromLogicalPlan(node any, sourceSchema map[string]string) (*ParquetSchema, error) {
 	// Walk the logical plan to determine output columns.
 	cols := make([]ParquetColumn, 0, 8)
@@ -225,28 +235,25 @@ func inferParquetSchemaFromLogicalPlan(node any, sourceSchema map[string]string)
 		}
 	}
 
-	// Recognize logical plan types without importing ir directly here.
-	// We key off concrete type names since sqlconv.ParseQueryToLogicalPlan returns ir.LogicalNode.
-	typeName := fmt.Sprintf("%T", node)
-
-	// GroupAgg
-	if strings.HasSuffix(typeName, ".LogicalGroupAgg") {
-		// Use JSON marshal/unmarshal to avoid depending on internal struct fields here.
-		// We only need Keys and AggName/Aggs.
-		b, _ := json.Marshal(node)
-		var tmp struct {
-			Keys    []string                     `json:"Keys"`
-			Aggs    []struct{ Name, Col string } `json:"Aggs"`
-			AggName string                       `json:"AggName"`
+	addSourceSchemaCols := func() {
+		keys := make([]string, 0, len(sourceSchema))
+		for k := range sourceSchema {
+			keys = append(keys, k)
 		}
-		_ = json.Unmarshal(b, &tmp)
-
-		for _, k := range tmp.Keys {
+		sort.Strings(keys)
+		for _, k := range keys {
 			addCol(k, inferTypeFromHint(k))
 		}
+	}
 
-		if len(tmp.Aggs) > 0 {
-			for _, a := range tmp.Aggs {
+	// Prefer concrete logical plan types for schema inference.
+	switch n := node.(type) {
+	case *ir.LogicalGroupAgg:
+		for _, k := range n.Keys {
+			addCol(k, inferTypeFromHint(k))
+		}
+		if len(n.Aggs) > 0 {
+			for _, a := range n.Aggs {
 				switch strings.ToUpper(strings.TrimSpace(a.Name)) {
 				case "SUM":
 					addCol("agg_delta", "float64")
@@ -258,12 +265,10 @@ func inferParquetSchemaFromLogicalPlan(node any, sourceSchema map[string]string)
 					addCol("min", "string")
 				case "MAX":
 					addCol("max", "string")
-				default:
-					// ignore
 				}
 			}
 		} else {
-			switch strings.ToUpper(strings.TrimSpace(tmp.AggName)) {
+			switch strings.ToUpper(strings.TrimSpace(n.AggName)) {
 			case "SUM":
 				addCol("agg_delta", "float64")
 			case "COUNT":
@@ -275,33 +280,19 @@ func inferParquetSchemaFromLogicalPlan(node any, sourceSchema map[string]string)
 			case "MAX":
 				addCol("max", "string")
 			default:
-				return nil, fmt.Errorf("unsupported aggregate for parquet schema: %s", tmp.AggName)
+				return nil, fmt.Errorf("unsupported aggregate for parquet schema: %s", n.AggName)
 			}
 		}
-
 		addCol("__count", "int64")
 		return &ParquetSchema{Columns: cols}, nil
-	}
-
-	// WindowAgg (event-time window GROUP BY).
-	if strings.HasSuffix(typeName, ".LogicalWindowAgg") {
-		b, _ := json.Marshal(node)
-		var tmp struct {
-			AggName        string    `json:"AggName"`
-			PartitionBy    []string  `json:"PartitionBy"`
-			TimeWindowSpec *struct{} `json:"TimeWindowSpec"`
-		}
-		_ = json.Unmarshal(b, &tmp)
-
+	case *ir.LogicalWindowAgg:
 		// Window columns are always present in WindowAggOp outputs.
 		addCol("__window_start", "int64")
 		addCol("__window_end", "int64")
-
-		for _, k := range tmp.PartitionBy {
+		for _, k := range n.PartitionBy {
 			addCol(k, inferTypeFromHint(k))
 		}
-
-		switch strings.ToUpper(strings.TrimSpace(tmp.AggName)) {
+		switch strings.ToUpper(strings.TrimSpace(n.AggName)) {
 		case "SUM":
 			addCol("agg_delta", "float64")
 		case "COUNT":
@@ -313,19 +304,38 @@ func inferParquetSchemaFromLogicalPlan(node any, sourceSchema map[string]string)
 		case "MAX":
 			addCol("max", "string")
 		default:
-			return nil, fmt.Errorf("unsupported window aggregate for parquet schema: %s", tmp.AggName)
+			return nil, fmt.Errorf("unsupported window aggregate for parquet schema: %s", n.AggName)
 		}
-
 		// Session windows can emit agg_result tuples via session diff logic.
 		// Store it as float64 to keep schema stable.
 		addCol("agg_result", "float64")
-
 		addCol("__count", "int64")
 		return &ParquetSchema{Columns: cols}, nil
+	case *ir.LogicalProject:
+		for _, k := range n.Columns {
+			addCol(k, inferTypeFromHint(k))
+		}
+		for _, e := range n.Exprs {
+			addCol(e.As, "string")
+		}
+		addCol("__count", "int64")
+	case *ir.LogicalView:
+		return inferParquetSchemaFromLogicalPlan(n.Input, sourceSchema)
+	case *ir.LogicalFilter:
+		return inferParquetSchemaFromLogicalPlan(n.Input, sourceSchema)
+	case *ir.LogicalSort:
+		return inferParquetSchemaFromLogicalPlan(n.Input, sourceSchema)
+	case *ir.LogicalLimit:
+		return inferParquetSchemaFromLogicalPlan(n.Input, sourceSchema)
+	case *ir.LogicalWith:
+		return inferParquetSchemaFromLogicalPlan(n.Body, sourceSchema)
+	case *ir.LogicalScan:
+		addSourceSchemaCols()
+		addCol("__count", "int64")
+	default:
+		addSourceSchemaCols()
+		addCol("__count", "int64")
 	}
-
-	// Fallback: try to include just __count.
-	addCol("__count", "int64")
 
 	// Keep deterministic order.
 	sort.Slice(cols, func(i, j int) bool { return cols[i].Name < cols[j].Name })

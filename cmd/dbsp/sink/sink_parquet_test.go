@@ -27,11 +27,11 @@ func TestParquetSink_WritesAndRotatesByBatches(t *testing.T) {
 		{Name: "__count", Type: "int64"},
 	}}
 
-	cfg := map[string]interface{}{
-		"path":                 prefix,
-		"compression":          "uncompressed",
-		"row_group_size":       2,
-		"rotate_every_batches": 1,
+	cfg := config.ParquetSinkConfig{
+		Path:               prefix,
+		Compression:        "uncompressed",
+		RowGroupSize:       2,
+		RotateEveryBatches: 1,
 	}
 
 	ps, err := NewParquetSink(cfg, schema)
@@ -122,6 +122,48 @@ func TestInferOrLoadParquetSchema_CachesAndReuses(t *testing.T) {
 	}
 	if cols["agg_delta"] != "float64" {
 		t.Fatalf("expected agg_delta=float64, got %q", cols["agg_delta"])
+	}
+	if cols["__count"] != "int64" {
+		t.Fatalf("expected __count=int64, got %q", cols["__count"])
+	}
+}
+
+func TestInferOrLoadParquetSchema_DefaultCacheUsesTempForRootPath(t *testing.T) {
+	query := "SELECT k, SUM(v) FROM t GROUP BY k"
+	src := config.SourceConfig{Type: "csv", Config: map[string]interface{}{"path": "ignored.csv", "schema": map[string]string{"k": "string", "v": "float"}}}
+	sinkCfg := map[string]interface{}{"path": filepath.Join(string(os.PathSeparator), "pull")}
+
+	_, err := config.InferOrLoadParquetSchema(query, src, sinkCfg)
+	if err != nil {
+		t.Fatalf("config.InferOrLoadParquetSchema: %v", err)
+	}
+
+	expected := filepath.Join(os.TempDir(), "pull.schema.json")
+	if _, err := os.Stat(expected); err != nil {
+		t.Fatalf("expected schema cache file in temp dir: %v", err)
+	}
+	_ = os.Remove(expected)
+}
+
+func TestInferOrLoadParquetSchema_ProjectUsesSourceSchemaHints(t *testing.T) {
+	query := "SELECT id, name FROM t"
+	src := config.SourceConfig{Type: "http", Config: map[string]interface{}{"schema": map[string]string{"id": "int", "name": "string"}}}
+	sinkCfg := map[string]interface{}{"path": "out"}
+
+	s, err := config.InferOrLoadParquetSchema(query, src, sinkCfg)
+	if err != nil {
+		t.Fatalf("config.InferOrLoadParquetSchema: %v", err)
+	}
+
+	cols := map[string]string{}
+	for _, c := range s.Columns {
+		cols[c.Name] = c.Type
+	}
+	if cols["id"] != "int64" {
+		t.Fatalf("expected id=int64, got %q", cols["id"])
+	}
+	if cols["name"] != "string" {
+		t.Fatalf("expected name=string, got %q", cols["name"])
 	}
 	if cols["__count"] != "int64" {
 		t.Fatalf("expected __count=int64, got %q", cols["__count"])

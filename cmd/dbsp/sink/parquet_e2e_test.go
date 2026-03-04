@@ -18,10 +18,10 @@ import (
 	"github.com/apache/arrow/go/v15/parquet/pqarrow"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
-	"github.com/ariyn/dbsp/internal/dbsp/testutil"
 	"github.com/ariyn/dbsp/cmd/dbsp/pipeline"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
+	"github.com/ariyn/dbsp/internal/dbsp/testutil"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
@@ -46,11 +46,11 @@ func TestE2E_Parquet_FinalSnapshotEqualsExpected_GroupByMultiAgg(t *testing.T) {
 		{Name: "count_delta", Type: "int64"},
 		{Name: "__count", Type: "int64"},
 	}}
-	cfg := map[string]interface{}{
-		"path":                 prefix,
-		"compression":          "uncompressed",
-		"row_group_size":       2,
-		"rotate_every_batches": 1,
+	cfg := config.ParquetSinkConfig{
+		Path:               prefix,
+		Compression:        "uncompressed",
+		RowGroupSize:       2,
+		RotateEveryBatches: 1,
 	}
 	pqSink, err := NewParquetSink(cfg, schema)
 	if err != nil {
@@ -118,11 +118,11 @@ func TestE2E_JoinGroupBy_FinalSnapshotEqualsExpected_ExecuteTick(t *testing.T) {
 		{Name: "count_delta", Type: "int64"},
 		{Name: "__count", Type: "int64"},
 	}}
-	cfg := map[string]interface{}{
-		"path":                 prefix,
-		"compression":          "uncompressed",
-		"row_group_size":       2,
-		"rotate_every_batches": 1,
+	cfg := config.ParquetSinkConfig{
+		Path:               prefix,
+		Compression:        "uncompressed",
+		RowGroupSize:       2,
+		RotateEveryBatches: 1,
 	}
 	ps, err := NewParquetSink(cfg, schema)
 	if err != nil {
@@ -199,11 +199,11 @@ func TestE2E_JoinGroupBy_CompositeKeys_FinalSnapshotEqualsExpected_ExecuteTick(t
 		{Name: "count_delta", Type: "int64"},
 		{Name: "__count", Type: "int64"},
 	}}
-	cfg := map[string]interface{}{
-		"path":                 prefix,
-		"compression":          "uncompressed",
-		"row_group_size":       2,
-		"rotate_every_batches": 1,
+	cfg := config.ParquetSinkConfig{
+		Path:               prefix,
+		Compression:        "uncompressed",
+		RowGroupSize:       2,
+		RotateEveryBatches: 1,
 	}
 	ps, err := NewParquetSink(cfg, schema)
 	if err != nil {

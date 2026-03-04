@@ -204,6 +204,14 @@ func (f *failingCheckpointWAL) LoadLatestCheckpoint(ctx context.Context) (*wal.C
 	return f.inner.LoadLatestCheckpoint(ctx)
 }
 
+func (f *failingCheckpointWAL) LoadLatestFullCheckpointBefore(ctx context.Context, upToSeq int64) (*wal.Checkpoint, error) {
+	return f.inner.LoadLatestFullCheckpointBefore(ctx, upToSeq)
+}
+
+func (f *failingCheckpointWAL) ResolveCheckpointSnapshotWithMutations(ctx context.Context, cp *wal.Checkpoint) ([]byte, int64, []wal.CheckpointMutation, error) {
+	return f.inner.ResolveCheckpointSnapshotWithMutations(ctx, cp)
+}
+
 func (f *failingCheckpointWAL) SaveCheckpoint(ctx context.Context, cp wal.Checkpoint) error {
 	if f.fail {
 		return fmt.Errorf("injected checkpoint save failure")

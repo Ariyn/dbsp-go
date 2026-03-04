@@ -62,7 +62,7 @@ func BuildHivePartitionPath(basePath string, keys []string, values map[string]st
 
 	partDirs := make([]string, 0, len(keys))
 	for _, key := range keys {
-		partDirs = append(partDirs, fmt.Sprintf("%s=%s", sanitizeHivePathSegment(key), sanitizeHivePathSegment(values[key])))
+		partDirs = append(partDirs, fmt.Sprintf("%s=%s", SanitizeHivePathSegment(key), SanitizeHivePathSegment(values[key])))
 	}
 
 	// Keep filename for file-like paths, otherwise treat as prefix/directory.
@@ -78,7 +78,7 @@ func BuildHivePartitionPath(basePath string, keys []string, values map[string]st
 	}
 }
 
-func sanitizeHivePathSegment(v string) string {
+func SanitizeHivePathSegment(v string) string {
 	v = strings.TrimSpace(v)
 	v = strings.ReplaceAll(v, string(filepath.Separator), "_")
 	v = strings.ReplaceAll(v, "=", "_")

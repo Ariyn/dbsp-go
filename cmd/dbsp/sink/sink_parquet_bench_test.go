@@ -19,10 +19,10 @@ func BenchmarkParquetSink_WriteBatch(b *testing.B) {
 		{Name: "__count", Type: "int64"},
 	}}
 
-	cfg := map[string]interface{}{
-		"path":           prefix,
-		"compression":    "uncompressed",
-		"row_group_size": 65536,
+	cfg := config.ParquetSinkConfig{
+		Path:         prefix,
+		Compression:  "uncompressed",
+		RowGroupSize: 65536,
 	}
 
 	ps, err := NewParquetSink(cfg, schema)

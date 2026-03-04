@@ -151,40 +151,14 @@ func buildCastExprFunc(exprSQL string) func(types.Tuple) (any, error) {
 }
 
 func toFloat64(v any) float64 {
-	switch x := v.(type) {
-	case float64:
-		return x
-	case float32:
-		return float64(x)
-	case int:
-		return float64(x)
-	case int64:
-		return float64(x)
-	case string:
-		f, _ := strconv.ParseFloat(x, 64)
-		return f
-	default:
-		return 0
-	}
+	return types.ToFloat64(v)
 }
 
 func toInt64(v any) int64 {
-	switch x := v.(type) {
-	case int64:
-		return x
-	case int:
-		return int64(x)
-	case float64:
-		return int64(x)
-	case string:
-		i, _ := strconv.ParseInt(x, 10, 64)
-		return i
-	default:
-		return 0
-	}
+	return types.ToInt64(v)
 }
 
-// --- arithmetic parser ---
+// --- parser/AST ---
 
 type tokenKind int
 
@@ -325,7 +299,17 @@ func (p *exprParser) parsePrimary() (exprNode, error) {
 	switch p.cur.kind {
 	case tokIdent:
 		ident := p.cur.text
+		upperIdent := strings.ToUpper(ident)
 		p.cur = p.nextToken()
+		if upperIdent == "TRUE" {
+			return &literalNode{v: true}, nil
+		}
+		if upperIdent == "FALSE" {
+			return &literalNode{v: false}, nil
+		}
+		if upperIdent == "NULL" {
+			return &literalNode{v: nil}, nil
+		}
 		// Check for function call
 		if p.cur.kind == tokLParen {
 			p.cur = p.nextToken()
@@ -629,7 +613,7 @@ func (n *jsonAccessNode) eval(t types.Tuple) (any, error) {
 		m = x
 	case string:
 		if err := json.Unmarshal([]byte(x), &m); err != nil {
-			return nil, nil // or return error
+			return nil, nil
 		}
 	case []byte:
 		if err := json.Unmarshal(x, &m); err != nil {
@@ -709,9 +693,11 @@ type intervalNode struct {
 	unit string
 }
 
-func (n *intervalNode) eval(t types.Tuple) (any, error) {
+func (n *intervalNode) eval(types.Tuple) (any, error) {
 	return n.val + " " + n.unit, nil
 }
+
+// --- time helpers ---
 
 func evalTimeBucket(interval any, ts any) (any, error) {
 	dur, err := parseInterval(interval)

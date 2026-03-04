@@ -150,9 +150,9 @@ func DifferentiateGraphV2(root *op.Node) (*op.Node, error) {
 				leftOld := &op.Node{Op: op.NewDelayOp(nil), Inputs: []*op.Node{leftInt}}
 				rightOld := &op.Node{Op: op.NewDelayOp(nil), Inputs: []*op.Node{rightInt}}
 
-				term1 := &op.Node{Op: op.NewJoinDeltaValueOp(bin.LeftKeyFn, bin.RightKeyFn, bin.CombineFn), Inputs: []*op.Node{leftDelta, rightOld}}
-				term2 := &op.Node{Op: op.NewJoinValueDeltaOp(bin.LeftKeyFn, bin.RightKeyFn, bin.CombineFn), Inputs: []*op.Node{leftOld, rightDelta}}
-				term3 := &op.Node{Op: op.NewJoinDeltaDeltaOp(bin.LeftKeyFn, bin.RightKeyFn, bin.CombineFn), Inputs: []*op.Node{leftDelta, rightDelta}}
+				term1 := &op.Node{Op: op.NewExplicitJoinOp(op.JoinDeltaValue, bin.LeftKeyFn, bin.RightKeyFn, bin.CombineFn), Inputs: []*op.Node{leftDelta, rightOld}}
+				term2 := &op.Node{Op: op.NewExplicitJoinOp(op.JoinValueDelta, bin.LeftKeyFn, bin.RightKeyFn, bin.CombineFn), Inputs: []*op.Node{leftOld, rightDelta}}
+				term3 := &op.Node{Op: op.NewExplicitJoinOp(op.JoinDeltaDelta, bin.LeftKeyFn, bin.RightKeyFn, bin.CombineFn), Inputs: []*op.Node{leftDelta, rightDelta}}
 
 				u12 := &op.Node{Op: op.NewUnionOp(), Inputs: []*op.Node{term1, term2}}
 				out := &op.Node{Op: op.NewUnionOp(), Inputs: []*op.Node{u12, term3}}

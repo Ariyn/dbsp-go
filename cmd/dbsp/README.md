@@ -41,8 +41,9 @@ pipeline:
     config: {}
   state_backend:
     enabled: false
-    type: memory | kv
+    type: memory | kv | lsm
     path: /tmp/dbsp-state.db
+    memory_limit: "1GiB"
     checkpoint_mode: full | incremental
     checkpoint_every_batches: 100
     max_incremental_mutation_bytes: 1048576
@@ -60,6 +61,7 @@ pipeline:
   - `busy_timeout_ms`: busy timeout(ms)
   - `extra_pragmas`: 추가 pragma map
 - `state_backend.max_incremental_mutation_bytes`(선택, 기본 1048576): incremental checkpoint에서 drain된 mutation payload가 임계치를 넘으면 자동 full checkpoint로 승격
+- `state_backend.memory_limit`(선택, 기본 `1GiB`): Go GC soft limit. 비어있거나 0이면 기본값 적용
 - `partition.enabled`(선택, 기본 false): 파티션 fan-out 실행 모드
 - `partition.keys`(필수 when enabled): Hive 경로 키 순서 (예: `[plant_id, local_date]`)
 

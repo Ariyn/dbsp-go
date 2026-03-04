@@ -7,7 +7,8 @@ import (
 )
 
 func TestJoinDeltaValue_ValueCountsMultiply(t *testing.T) {
-	op := NewJoinDeltaValueOp(
+	op := NewExplicitJoinOp(
+		JoinDeltaValue,
 		func(t types.Tuple) any { return t["k"] },
 		func(t types.Tuple) any { return t["k"] },
 		func(l, r types.Tuple) types.Tuple {

@@ -6,7 +6,6 @@ import (
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/cmd/dbsp/provider"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
-	"gopkg.in/yaml.v3"
 )
 
 type ChainSource struct {
@@ -22,26 +21,7 @@ const (
 	chainOnErrorSkip chainOnErrorPolicy = "skip"
 )
 
-type sourceFactory func(config map[string]interface{}) (provider.Source, error)
-
-func NewChainSource(cfg map[string]interface{}) (*ChainSource, error) {
-	factories := map[string]sourceFactory{
-		"csv":  func(c map[string]interface{}) (provider.Source, error) { return NewCSVSource(c) },
-		"http": func(c map[string]interface{}) (provider.Source, error) { return NewHTTPSource(c) },
-	}
-	return newChainSourceWithFactories(cfg, factories)
-}
-
-func newChainSourceWithFactories(cfg map[string]interface{}, factories map[string]sourceFactory) (*ChainSource, error) {
-	yamlBytes, err := yaml.Marshal(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal config: %w", err)
-	}
-	var chainConfig config.ChainSourceConfig
-	if err := yaml.Unmarshal(yamlBytes, &chainConfig); err != nil {
-		return nil, fmt.Errorf("failed to parse chain config: %w", err)
-	}
-
+func NewChainSource(chainConfig config.ChainSourceConfig) (*ChainSource, error) {
 	onError := chainOnErrorPolicy(chainConfig.OnError)
 	if onError == "" {
 		onError = chainOnErrorStop
@@ -55,17 +35,19 @@ func newChainSourceWithFactories(cfg map[string]interface{}, factories map[strin
 
 	var sources []provider.Source
 	for _, srcConfig := range chainConfig.Sources {
-		factory, ok := factories[srcConfig.Type]
-		if !ok {
-			err = fmt.Errorf("unsupported source type in chain: %s", srcConfig.Type)
-			// Clean up already created sources
-			for _, created := range sources {
-				created.Close()
+		var s provider.Source
+		var err error
+		switch srcConfig.Type {
+		case "http":
+			var httpCfg config.HTTPSourceConfig
+			if err := config.DecodeTo(srcConfig.Config, &httpCfg); err != nil {
+				return nil, fmt.Errorf("failed to decode http source config in chain: %w", err)
 			}
-			return nil, err
+			s, err = NewHTTPSource(httpCfg)
+		default:
+			err = fmt.Errorf("unsupported source type in chain: %s", srcConfig.Type)
 		}
 
-		s, err := factory(srcConfig.Config)
 		if err != nil {
 			// Clean up already created sources
 			for _, created := range sources {

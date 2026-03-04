@@ -39,9 +39,9 @@ func (d *DelayOp) Snapshot() (any, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return delaySnapshotV1{
-		Seed:        cloneBatch(d.seed),
-		Prev:        cloneBatch(d.prev),
-		Next:        cloneBatch(d.next),
+		Seed:        types.CloneBatch(d.seed),
+		Prev:        types.CloneBatch(d.prev),
+		Next:        types.CloneBatch(d.next),
 		Initialized: d.initialized,
 	}, nil
 }
@@ -56,45 +56,45 @@ func (d *DelayOp) Restore(state any) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.seed = cloneBatch(s.Seed)
-	d.prev = cloneBatch(s.Prev)
-	d.next = cloneBatch(s.Next)
+	d.seed = types.CloneBatch(s.Seed)
+	d.prev = types.CloneBatch(s.Prev)
+	d.next = types.CloneBatch(s.Next)
 	d.initialized = s.Initialized
 	return nil
 }
 
 func NewDelayOp(seed types.Batch) *DelayOp {
-	return &DelayOp{seed: cloneBatch(seed)}
+	return &DelayOp{seed: types.CloneBatch(seed)}
 }
 
 func (d *DelayOp) Prev() types.Batch {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.initialized {
-		d.prev = cloneBatch(d.seed)
+		d.prev = types.CloneBatch(d.seed)
 		d.initialized = true
 	}
-	return cloneBatch(d.prev)
+	return types.CloneBatch(d.prev)
 }
 
 func (d *DelayOp) SetNext(next types.Batch) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.initialized {
-		d.prev = cloneBatch(d.seed)
+		d.prev = types.CloneBatch(d.seed)
 		d.initialized = true
 	}
-	d.next = cloneBatch(next)
+	d.next = types.CloneBatch(next)
 }
 
 func (d *DelayOp) Commit() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.initialized {
-		d.prev = cloneBatch(d.seed)
+		d.prev = types.CloneBatch(d.seed)
 		d.initialized = true
 	}
-	d.prev = cloneBatch(d.next)
+	d.prev = types.CloneBatch(d.next)
 	d.next = nil
 }
 
@@ -105,26 +105,4 @@ func (d *DelayOp) Apply(batch types.Batch) (types.Batch, error) {
 	// The cyclic executor will call SetNext + Commit explicitly.
 	d.SetNext(batch)
 	return d.Prev(), nil
-}
-
-func cloneBatch(b types.Batch) types.Batch {
-	if b == nil {
-		return nil
-	}
-	out := make(types.Batch, 0, len(b))
-	for _, td := range b {
-		out = append(out, types.TupleDelta{Tuple: cloneTuple(td.Tuple), Count: td.Count})
-	}
-	return out
-}
-
-func cloneTuple(t types.Tuple) types.Tuple {
-	if t == nil {
-		return nil
-	}
-	out := make(types.Tuple, len(t))
-	for k, v := range t {
-		out[k] = v
-	}
-	return out
 }

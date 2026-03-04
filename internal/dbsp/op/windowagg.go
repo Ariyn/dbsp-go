@@ -731,11 +731,11 @@ func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
 					if _, ok := delta.Tuple["agg_delta"]; ok {
 						ex := pending[k]
 						if ex == nil {
-							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+							pending[k] = &types.TupleDelta{Tuple: types.CloneTuple(delta.Tuple), Count: 1}
 						} else {
-							ex.Tuple["agg_delta"] = toFloat64Local(ex.Tuple["agg_delta"]) + toFloat64Local(delta.Tuple["agg_delta"])
+							ex.Tuple["agg_delta"] = types.ToFloat64(ex.Tuple["agg_delta"]) + types.ToFloat64(delta.Tuple["agg_delta"])
 						}
-						if ex := pending[k]; ex != nil && toFloat64Local(ex.Tuple["agg_delta"]) == 0 {
+						if ex := pending[k]; ex != nil && types.ToFloat64(ex.Tuple["agg_delta"]) == 0 {
 							delete(pending, k)
 						}
 						continue
@@ -743,11 +743,11 @@ func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
 					if _, ok := delta.Tuple["avg_delta"]; ok {
 						ex := pending[k]
 						if ex == nil {
-							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+							pending[k] = &types.TupleDelta{Tuple: types.CloneTuple(delta.Tuple), Count: 1}
 						} else {
-							ex.Tuple["avg_delta"] = toFloat64Local(ex.Tuple["avg_delta"]) + toFloat64Local(delta.Tuple["avg_delta"])
+							ex.Tuple["avg_delta"] = types.ToFloat64(ex.Tuple["avg_delta"]) + types.ToFloat64(delta.Tuple["avg_delta"])
 						}
-						if ex := pending[k]; ex != nil && toFloat64Local(ex.Tuple["avg_delta"]) == 0 {
+						if ex := pending[k]; ex != nil && types.ToFloat64(ex.Tuple["avg_delta"]) == 0 {
 							delete(pending, k)
 						}
 						continue
@@ -755,11 +755,11 @@ func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
 					if _, ok := delta.Tuple["count_delta"]; ok {
 						ex := pending[k]
 						if ex == nil {
-							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+							pending[k] = &types.TupleDelta{Tuple: types.CloneTuple(delta.Tuple), Count: 1}
 						} else {
-							ex.Tuple["count_delta"] = toInt64Local(ex.Tuple["count_delta"]) + toInt64Local(delta.Tuple["count_delta"])
+							ex.Tuple["count_delta"] = types.ToInt64(ex.Tuple["count_delta"]) + types.ToInt64(delta.Tuple["count_delta"])
 						}
-						if ex := pending[k]; ex != nil && toInt64Local(ex.Tuple["count_delta"]) == 0 {
+						if ex := pending[k]; ex != nil && types.ToInt64(ex.Tuple["count_delta"]) == 0 {
 							delete(pending, k)
 						}
 						continue
@@ -884,11 +884,11 @@ func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 					if _, ok := delta.Tuple["agg_delta"]; ok {
 						ex := pending[k]
 						if ex == nil {
-							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+							pending[k] = &types.TupleDelta{Tuple: types.CloneTuple(delta.Tuple), Count: 1}
 						} else {
-							ex.Tuple["agg_delta"] = toFloat64Local(ex.Tuple["agg_delta"]) + toFloat64Local(delta.Tuple["agg_delta"])
+							ex.Tuple["agg_delta"] = types.ToFloat64(ex.Tuple["agg_delta"]) + types.ToFloat64(delta.Tuple["agg_delta"])
 						}
-						if ex := pending[k]; ex != nil && toFloat64Local(ex.Tuple["agg_delta"]) == 0 {
+						if ex := pending[k]; ex != nil && types.ToFloat64(ex.Tuple["agg_delta"]) == 0 {
 							delete(pending, k)
 						}
 						continue
@@ -896,11 +896,11 @@ func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 					if _, ok := delta.Tuple["avg_delta"]; ok {
 						ex := pending[k]
 						if ex == nil {
-							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+							pending[k] = &types.TupleDelta{Tuple: types.CloneTuple(delta.Tuple), Count: 1}
 						} else {
-							ex.Tuple["avg_delta"] = toFloat64Local(ex.Tuple["avg_delta"]) + toFloat64Local(delta.Tuple["avg_delta"])
+							ex.Tuple["avg_delta"] = types.ToFloat64(ex.Tuple["avg_delta"]) + types.ToFloat64(delta.Tuple["avg_delta"])
 						}
-						if ex := pending[k]; ex != nil && toFloat64Local(ex.Tuple["avg_delta"]) == 0 {
+						if ex := pending[k]; ex != nil && types.ToFloat64(ex.Tuple["avg_delta"]) == 0 {
 							delete(pending, k)
 						}
 						continue
@@ -908,11 +908,11 @@ func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 					if _, ok := delta.Tuple["count_delta"]; ok {
 						ex := pending[k]
 						if ex == nil {
-							pending[k] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+							pending[k] = &types.TupleDelta{Tuple: types.CloneTuple(delta.Tuple), Count: 1}
 						} else {
-							ex.Tuple["count_delta"] = toInt64Local(ex.Tuple["count_delta"]) + toInt64Local(delta.Tuple["count_delta"])
+							ex.Tuple["count_delta"] = types.ToInt64(ex.Tuple["count_delta"]) + types.ToInt64(delta.Tuple["count_delta"])
 						}
-						if ex := pending[k]; ex != nil && toInt64Local(ex.Tuple["count_delta"]) == 0 {
+						if ex := pending[k]; ex != nil && types.ToInt64(ex.Tuple["count_delta"]) == 0 {
 							delete(pending, k)
 						}
 						continue

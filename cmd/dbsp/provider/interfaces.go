@@ -15,3 +15,9 @@ type Sink interface {
 	WriteBatch(types.Batch) error
 	Close() error
 }
+
+// ReplaySink is an optional interface for sinks that need WAL replay outputs.
+// Implementations should be idempotent or safe to rebuild state during replay.
+type ReplaySink interface {
+	ReplayWriteBatch(types.Batch) error
+}

@@ -122,12 +122,60 @@ func TestBoltStateBackend_PersistAndPrefix(t *testing.T) {
 	}
 }
 
+func TestPebbleStateBackend_PersistAndPrefix(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "pebble")
+
+	backend, err := NewPebbleStateBackend(path)
+	if err != nil {
+		t.Fatalf("NewPebbleStateBackend failed: %v", err)
+	}
+	if err := backend.BatchWrite([]StateBatchOp{
+		{Type: StateBatchPut, Key: []byte("join/left/1"), Value: []byte("L1")},
+		{Type: StateBatchPut, Key: []byte("join/right/1"), Value: []byte("R1")},
+	}); err != nil {
+		t.Fatalf("BatchWrite failed: %v", err)
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := NewPebbleStateBackend(path)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+
+	v, ok, err := reopened.Get([]byte("join/left/1"))
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !ok || string(v) != "L1" {
+		t.Fatalf("unexpected persisted value: ok=%v val=%q", ok, string(v))
+	}
+
+	count := 0
+	err = reopened.IterPrefix([]byte("join/"), func(_, _ []byte) error {
+		count++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("IterPrefix failed: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 prefix keys, got %d", count)
+	}
+}
+
 func TestNewStateBackendFromConfig(t *testing.T) {
 	if backend, err := NewStateBackendFromConfig(false, "kv", "/tmp/x"); err != nil || backend != nil {
 		t.Fatalf("disabled backend should return nil,nil got backend=%v err=%v", backend, err)
 	}
 	if backend, err := NewStateBackendFromConfig(true, "memory", ""); err != nil || backend == nil {
 		t.Fatalf("memory backend init failed backend=%v err=%v", backend, err)
+	}
+	if backend, err := NewStateBackendFromConfig(true, "pebble", t.TempDir()); err != nil || backend == nil {
+		t.Fatalf("pebble backend init failed backend=%v err=%v", backend, err)
 	}
 	if _, err := NewStateBackendFromConfig(true, "sqlite", "/tmp/x"); err == nil {
 		t.Fatalf("sqlite backend should be not implemented")

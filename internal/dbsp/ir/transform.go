@@ -488,38 +488,7 @@ func compareEqual(tupleVal any, val string) bool {
 }
 
 func toFloat64Loose(v any) (float64, bool) {
-	switch x := v.(type) {
-	case float64:
-		return x, true
-	case float32:
-		return float64(x), true
-	case int:
-		return float64(x), true
-	case int64:
-		return float64(x), true
-	case int32:
-		return float64(x), true
-	case uint:
-		return float64(x), true
-	case uint64:
-		return float64(x), true
-	case uint32:
-		return float64(x), true
-	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
-		if err != nil {
-			return 0, false
-		}
-		return f, true
-	case json.Number:
-		f, err := x.Float64()
-		if err != nil {
-			return 0, false
-		}
-		return f, true
-	default:
-		return 0, false
-	}
+	return types.ToFloat64Safe(v)
 }
 
 func compareGreater(tupleVal any, threshold float64) bool {

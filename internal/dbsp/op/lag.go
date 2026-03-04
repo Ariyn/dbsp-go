@@ -308,7 +308,7 @@ func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	entry := monoid.Buffer.GetEntry(insertPos)
 	if entry != nil && td.Count > 0 {
 		lagValue := monoid.Buffer.GetLagValue(insertPos, offset, lagCol, l.LagExpr)
-		outTuple := copyTuple(entry.Tuple)
+		outTuple := types.CloneTuple(entry.Tuple)
 		outTuple[l.getOutputCol()] = lagValue
 		outDeltas = append(outDeltas, types.TupleDelta{
 			Tuple: outTuple,
@@ -333,7 +333,7 @@ func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 
 		if !types.EqualAny(oldLagValue, newLagValue) {
 			// Emit delta: cancel old value, add new value
-			outTuple := copyTuple(entry.Tuple)
+			outTuple := types.CloneTuple(entry.Tuple)
 
 			// Cancel old LAG value
 			if oldLagValue != nil {
@@ -371,12 +371,4 @@ func (l *LagAgg) getOutputCol() string {
 		return l.OutputCol
 	}
 	return "lag_" + l.LagCol
-}
-
-func copyTuple(t types.Tuple) types.Tuple {
-	result := make(types.Tuple, len(t))
-	for k, v := range t {
-		result[k] = v
-	}
-	return result
 }

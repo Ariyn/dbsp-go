@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
@@ -12,10 +13,10 @@ type ConsoleSink struct {
 	format string
 }
 
-func NewConsoleSink(cfg map[string]interface{}) (*ConsoleSink, error) {
+func NewConsoleSink(cfg config.ConsoleSinkConfig) (*ConsoleSink, error) {
 	format := "json"
-	if f, ok := cfg["format"].(string); ok {
-		format = f
+	if cfg.Format != "" {
+		format = cfg.Format
 	}
 	return &ConsoleSink{format: format}, nil
 }

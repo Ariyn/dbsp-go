@@ -84,7 +84,7 @@ func (b *BinaryOp) Snapshot() (any, error) {
 			if e == nil {
 				continue
 			}
-			m[tk] = binaryJoinEntryV1{Tuple: cloneTupleLocal(e.tuple), Count: e.count, ExpiresAt: e.expiresAt}
+			m[tk] = binaryJoinEntryV1{Tuple: types.CloneTuple(e.tuple), Count: e.count, ExpiresAt: e.expiresAt}
 		}
 		if len(m) > 0 {
 			bs.Left[k] = m
@@ -96,7 +96,7 @@ func (b *BinaryOp) Snapshot() (any, error) {
 			if e == nil {
 				continue
 			}
-			m[tk] = binaryJoinEntryV1{Tuple: cloneTupleLocal(e.tuple), Count: e.count, ExpiresAt: e.expiresAt}
+			m[tk] = binaryJoinEntryV1{Tuple: types.CloneTuple(e.tuple), Count: e.count, ExpiresAt: e.expiresAt}
 		}
 		if len(m) > 0 {
 			bs.Right[k] = m
@@ -134,7 +134,7 @@ func (b *BinaryOp) Restore(state any) error {
 	for k, bucket := range bs.Left {
 		jb := make(joinBucket, len(bucket))
 		for tk, e := range bucket {
-			jb[tk] = &joinEntry{tuple: cloneTupleLocal(e.Tuple), count: e.Count, expiresAt: e.ExpiresAt}
+			jb[tk] = &joinEntry{tuple: types.CloneTuple(e.Tuple), count: e.Count, expiresAt: e.ExpiresAt}
 		}
 		if len(jb) > 0 {
 			b.leftState[k] = jb
@@ -143,7 +143,7 @@ func (b *BinaryOp) Restore(state any) error {
 	for k, bucket := range bs.Right {
 		jb := make(joinBucket, len(bucket))
 		for tk, e := range bucket {
-			jb[tk] = &joinEntry{tuple: cloneTupleLocal(e.Tuple), count: e.Count, expiresAt: e.ExpiresAt}
+			jb[tk] = &joinEntry{tuple: types.CloneTuple(e.Tuple), count: e.Count, expiresAt: e.ExpiresAt}
 		}
 		if len(jb) > 0 {
 			b.rightState[k] = jb
@@ -354,7 +354,7 @@ func encodeJoinBucket(bucket joinBucket) ([]byte, error) {
 		if entry == nil {
 			continue
 		}
-		m[tk] = binaryJoinEntryV1{Tuple: cloneTupleLocal(entry.tuple), Count: entry.count, ExpiresAt: entry.expiresAt}
+		m[tk] = binaryJoinEntryV1{Tuple: types.CloneTuple(entry.tuple), Count: entry.count, ExpiresAt: entry.expiresAt}
 	}
 	return json.Marshal(m)
 }
@@ -369,7 +369,7 @@ func decodeJoinBucket(payload []byte) (joinBucket, error) {
 	}
 	bucket := make(joinBucket, len(m))
 	for tk, entry := range m {
-		bucket[tk] = &joinEntry{tuple: cloneTupleLocal(entry.Tuple), count: entry.Count, expiresAt: entry.ExpiresAt}
+		bucket[tk] = &joinEntry{tuple: types.CloneTuple(entry.Tuple), count: entry.Count, expiresAt: entry.ExpiresAt}
 	}
 	return bucket, nil
 }

@@ -11,20 +11,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
 func TestHTTPSource(t *testing.T) {
-	config := map[string]interface{}{
-		"port": 8081, // Use different port for testing
-		"path": "/test",
-		"schema": map[string]string{
+	cfg := config.HTTPSourceConfig{
+		Port: 8081,
+		Path: "/test",
+		Schema: map[string]string{
 			"id":    "int",
 			"value": "float",
 		},
 	}
 
-	source, err := NewHTTPSource(config)
+	source, err := NewHTTPSource(cfg)
 	if err != nil {
 		t.Fatalf("NewHTTPSource failed: %v", err)
 	}
@@ -72,12 +73,12 @@ func checkTupleGeneric(t *testing.T, td types.TupleDelta, k1 string, v1 interfac
 }
 
 func TestHTTPAutoConvert(t *testing.T) {
-	config := map[string]interface{}{
-		"port":           8082,
-		"path":           "/ingest",
-		"auto_convert":   true,
-		"timestamp_unit": "auto",
-		"schema": map[string]string{
+	cfg := config.HTTPSourceConfig{
+		Port:          8082,
+		Path:          "/ingest",
+		AutoConvert:   true,
+		TimestampUnit: "auto",
+		Schema: map[string]string{
 			"id":        "int",
 			"active":    "bool",
 			"state":     "json",
@@ -85,7 +86,7 @@ func TestHTTPAutoConvert(t *testing.T) {
 		},
 	}
 
-	source, err := NewHTTPSource(config)
+	source, err := NewHTTPSource(cfg)
 	if err != nil {
 		t.Fatalf("NewHTTPSource failed: %v", err)
 	}
@@ -335,8 +336,7 @@ func TestParseTimestamp_UnitsAndFallback(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				s := &HTTPSource{timestampUnit: tc.unit}
-				ts, err := s.parseTimestamp(tc.in)
+				ts, err := parseTimestampValue(tc.in, tc.unit)
 				if err != nil {
 					t.Fatalf("parseTimestamp error: %v", err)
 				}
@@ -348,7 +348,6 @@ func TestParseTimestamp_UnitsAndFallback(t *testing.T) {
 	})
 
 	t.Run("auto detect", func(t *testing.T) {
-		s := &HTTPSource{timestampUnit: "auto"}
 		checks := []struct {
 			in   int64
 			unix int64
@@ -359,7 +358,7 @@ func TestParseTimestamp_UnitsAndFallback(t *testing.T) {
 			{in: 1771963200000000000, unix: 1771963200},
 		}
 		for _, c := range checks {
-			ts, err := s.parseTimestamp(c.in)
+			ts, err := parseTimestampValue(c.in, "auto")
 			if err != nil {
 				t.Fatalf("parseTimestamp error: %v", err)
 			}
@@ -370,8 +369,7 @@ func TestParseTimestamp_UnitsAndFallback(t *testing.T) {
 	})
 
 	t.Run("invalid unit fallback to seconds", func(t *testing.T) {
-		s := &HTTPSource{timestampUnit: "bogus"}
-		ts, err := s.parseTimestamp(1771963200)
+		ts, err := parseTimestampValue(1771963200, "bogus")
 		if err != nil {
 			t.Fatalf("parseTimestamp error: %v", err)
 		}
@@ -389,10 +387,10 @@ func TestNewHTTPSource_DefaultsAndClose(t *testing.T) {
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
 
-	cfg := map[string]interface{}{
-		"port": port,
-		"path": "",
-		"schema": map[string]string{
+	cfg := config.HTTPSourceConfig{
+		Port: port,
+		Path: "",
+		Schema: map[string]string{
 			"id":        "int",
 			"timestamp": "timestamp",
 		},

@@ -7,26 +7,24 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
-	"gopkg.in/yaml.v3"
 )
 
 type HTTPSource struct {
-	server   *http.Server
-	buffer   chan bufferedBatch
-	pending  types.Batch
+	server      *http.Server
+	buffer      chan bufferedBatch
+	pending     types.Batch
 	pendingSize int64
-	schema   map[string]string
-	done     chan struct{}
-	doneOnce sync.Once
+	schema      map[string]string
+	done        chan struct{}
+	doneOnce    sync.Once
 
-	maxBatchSize  int
-	maxBatchDelay time.Duration
+	maxBatchSize    int
+	maxBatchDelay   time.Duration
 	maxRequestBytes int64
 	maxBufferBytes  int64
 	bufferedBytes   int64
@@ -41,17 +39,7 @@ type bufferedBatch struct {
 	sizeBytes int64
 }
 
-func NewHTTPSource(cfg map[string]interface{}) (*HTTPSource, error) {
-	// Parse config
-	yamlBytes, err := yaml.Marshal(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal config: %w", err)
-	}
-	var httpConfig config.HTTPSourceConfig
-	if err := yaml.Unmarshal(yamlBytes, &httpConfig); err != nil {
-		return nil, fmt.Errorf("failed to parse http config: %w", err)
-	}
-
+func NewHTTPSource(httpConfig config.HTTPSourceConfig) (*HTTPSource, error) {
 	// Set defaults
 	if httpConfig.Port == 0 {
 		httpConfig.Port = 8080
@@ -79,15 +67,15 @@ func NewHTTPSource(cfg map[string]interface{}) (*HTTPSource, error) {
 	}
 
 	s := &HTTPSource{
-		buffer:        make(chan bufferedBatch, httpConfig.BufferSize),
-		schema:        httpConfig.Schema,
-		done:          make(chan struct{}),
-		maxBatchSize:  httpConfig.MaxBatchSize,
-		maxBatchDelay: time.Duration(httpConfig.MaxBatchDelayMS) * time.Millisecond,
+		buffer:          make(chan bufferedBatch, httpConfig.BufferSize),
+		schema:          httpConfig.Schema,
+		done:            make(chan struct{}),
+		maxBatchSize:    httpConfig.MaxBatchSize,
+		maxBatchDelay:   time.Duration(httpConfig.MaxBatchDelayMS) * time.Millisecond,
 		maxRequestBytes: httpConfig.MaxRequestBytes,
 		maxBufferBytes:  httpConfig.MaxBufferBytes,
-		autoConvert:   httpConfig.AutoConvert,
-		timestampUnit: httpConfig.TimestampUnit,
+		autoConvert:     httpConfig.AutoConvert,
+		timestampUnit:   httpConfig.TimestampUnit,
 	}
 
 	mux := http.NewServeMux()
@@ -165,6 +153,7 @@ func (s *HTTPSource) handleIngest(w http.ResponseWriter, r *http.Request) {
 			if typeName, ok := s.schema[k]; ok {
 				val, err := s.parseValue(v, typeName)
 				if err != nil {
+					fmt.Printf("Ingest dropped: schema mismatch for field %s (expected %s, got %v): %v\n", k, typeName, v, err)
 					http.Error(w, fmt.Sprintf("Invalid value for field %s: %v", k, err), http.StatusBadRequest)
 					return
 				}
@@ -180,8 +169,14 @@ func (s *HTTPSource) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(deltas) > 0 {
-		s.buffer <- bufferedBatch{batch: deltas, sizeBytes: int64(len(body))}
-		enqueued = true
+		select {
+		case s.buffer <- bufferedBatch{batch: deltas, sizeBytes: int64(len(body))}:
+			enqueued = true
+		default:
+			fmt.Printf("Ingest dropped: source buffer full (%d records)\n", len(deltas))
+			http.Error(w, "Source buffer full", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -211,8 +206,8 @@ func (s *HTTPSource) NextBatch() (types.Batch, error) {
 		case <-s.done:
 			return nil, nil
 		case incoming := <-s.buffer:
-				s.releaseBuffer(incoming.sizeBytes)
-				batch = s.appendIncoming(batch, incoming.batch, incoming.sizeBytes, maxSize)
+			s.releaseBuffer(incoming.sizeBytes)
+			batch = s.appendIncoming(batch, incoming.batch, incoming.sizeBytes, maxSize)
 			if len(batch) >= maxSize {
 				return batch, nil
 			}
@@ -376,89 +371,5 @@ func (s *HTTPSource) signalDone() {
 }
 
 func (s *HTTPSource) parseValue(v interface{}, colType string) (any, error) {
-	switch colType {
-	case "int":
-		switch val := v.(type) {
-		case float64:
-			return int(val), nil
-		case string:
-			return strconv.Atoi(val)
-		default:
-			return nil, fmt.Errorf("expected int, got %T", v)
-		}
-	case "float":
-		switch val := v.(type) {
-		case float64:
-			return val, nil
-		case string:
-			return strconv.ParseFloat(val, 64)
-		default:
-			return nil, fmt.Errorf("expected float, got %T", v)
-		}
-	case "bool":
-		switch val := v.(type) {
-		case bool:
-			return val, nil
-		case float64:
-			if val == 1 {
-				return true, nil
-			} else if val == 0 {
-				return false, nil
-			}
-			return nil, fmt.Errorf("expected bool (0/1), got %v", val)
-		case string:
-			return strconv.ParseBool(val)
-		default:
-			return nil, fmt.Errorf("expected bool, got %T", v)
-		}
-	case "json":
-		return v, nil // passthrough
-	case "timestamp":
-		switch val := v.(type) {
-		case string:
-			t, err := time.Parse(time.RFC3339, val)
-			if err != nil {
-				return nil, fmt.Errorf("invalid RFC3339 timestamp: %w", err)
-			}
-			return t, nil
-		case float64:
-			return s.parseTimestamp(int64(val))
-		default:
-			return nil, fmt.Errorf("expected timestamp (string or number), got %T", v)
-		}
-	case "string":
-		return fmt.Sprintf("%v", v), nil
-	default:
-		return v, nil
-	}
-}
-
-func (s *HTTPSource) parseTimestamp(val int64) (time.Time, error) {
-	unit := s.timestampUnit
-	if unit == "" || unit == "auto" {
-		// Auto detection
-		switch {
-		case val > 1e16: // ns
-			unit = "ns"
-		case val > 1e14: // us
-			unit = "us"
-		case val > 1e11: // ms
-			unit = "ms"
-		default: // s
-			unit = "s"
-		}
-	}
-
-	switch unit {
-	case "s":
-		return time.Unix(val, 0), nil
-	case "ms":
-		return time.Unix(0, val*1e6), nil
-	case "us":
-		return time.Unix(0, val*1e3), nil
-	case "ns":
-		return time.Unix(0, val), nil
-	default:
-		return time.Unix(val, 0), nil
-	}
+	return parseValueByType(v, colType, s.timestampUnit)
 }

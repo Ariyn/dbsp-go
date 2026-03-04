@@ -31,26 +31,18 @@ func BuildWatermarkConfig(cfg config.WatermarkYAMLConfig) (op.WatermarkConfig, e
 	}
 
 	if cfg.MaxOutOfOrderness != "" {
-		if d, err := time.ParseDuration(cfg.MaxOutOfOrderness); err == nil {
-			wm.MaxOutOfOrderness = int64(d / time.Millisecond)
-		} else {
-			iv, err := types.ParseInterval(cfg.MaxOutOfOrderness)
-			if err != nil {
-				return op.WatermarkConfig{}, err
-			}
-			wm.MaxOutOfOrderness = iv.Millis
+		d, err := types.ParseFlexibleDuration(cfg.MaxOutOfOrderness)
+		if err != nil {
+			return op.WatermarkConfig{}, err
 		}
+		wm.MaxOutOfOrderness = int64(d / time.Millisecond)
 	}
 	if cfg.AllowedLateness != "" {
-		if d, err := time.ParseDuration(cfg.AllowedLateness); err == nil {
-			wm.AllowedLateness = int64(d / time.Millisecond)
-		} else {
-			iv, err := types.ParseInterval(cfg.AllowedLateness)
-			if err != nil {
-				return op.WatermarkConfig{}, err
-			}
-			wm.AllowedLateness = iv.Millis
+		d, err := types.ParseFlexibleDuration(cfg.AllowedLateness)
+		if err != nil {
+			return op.WatermarkConfig{}, err
 		}
+		wm.AllowedLateness = int64(d / time.Millisecond)
 	}
 
 	policy, err := parseWatermarkPolicy(cfg.Policy)

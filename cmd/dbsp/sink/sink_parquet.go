@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,11 +42,7 @@ type ParquetSink struct {
 	mu sync.Mutex
 }
 
-func NewParquetSink(cfg map[string]interface{}, schema *config.ParquetSchema) (*ParquetSink, error) {
-	parquetCfg, err := config.ParseParquetSinkConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
+func NewParquetSink(parquetCfg config.ParquetSinkConfig, schema *config.ParquetSchema) (*ParquetSink, error) {
 	if schema == nil || len(schema.Columns) == 0 {
 		return nil, fmt.Errorf("parquet sink requires a non-empty inferred schema")
 	}
@@ -64,18 +59,14 @@ func NewParquetSink(cfg map[string]interface{}, schema *config.ParquetSchema) (*
 	}
 
 	ps := &ParquetSink{
-		cfg:                *parquetCfg,
+		cfg:                parquetCfg,
 		schema:             schema,
 		mem:                memory.NewGoAllocator(),
 		rotateEvery:        rotateEvery,
 		rotateEveryBatches: parquetCfg.RotateEveryBatches,
 	}
 
-	as, err := ps.buildArrowSchema(schema)
-	if err != nil {
-		return nil, err
-	}
-	ps.arrowSchema = as
+	ps.arrowSchema = BuildArrowSchema(schema, false)
 
 	if err := ps.openNewFileLocked(time.Now()); err != nil {
 		return nil, err
@@ -113,14 +104,15 @@ func (s *ParquetSink) WriteBatch(batch types.Batch) error {
 	// Count this batch in the currently-open file.
 	s.batchesInFile++
 
-	for _, td := range batch {
-		if err := s.appendRowLocked(td); err != nil {
+	s.initBuildersLocked()
+	if err := AppendTupleDeltasToArrowBuilders(s.arrowSchema, s.builders, batch); err != nil {
+		return err
+	}
+	s.bufRows += len(batch)
+
+	if s.bufRows >= s.cfg.RowGroupSize {
+		if err := s.flushLocked(); err != nil {
 			return err
-		}
-		if s.bufRows >= s.cfg.RowGroupSize {
-			if err := s.flushLocked(); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -138,104 +130,14 @@ func (s *ParquetSink) Close() error {
 	return s.closeCurrentLocked()
 }
 
-func (s *ParquetSink) buildArrowSchema(schema *config.ParquetSchema) (*arrow.Schema, error) {
-	fields := make([]arrow.Field, 0, len(schema.Columns))
-	for _, c := range schema.Columns {
-		switch c.Type {
-		case "string":
-			fields = append(fields, arrow.Field{Name: c.Name, Type: arrow.BinaryTypes.String, Nullable: true})
-		case "int64":
-			fields = append(fields, arrow.Field{Name: c.Name, Type: arrow.PrimitiveTypes.Int64, Nullable: true})
-		case "float64":
-			fields = append(fields, arrow.Field{Name: c.Name, Type: arrow.PrimitiveTypes.Float64, Nullable: true})
-		default:
-			// Unknown -> store as string.
-			fields = append(fields, arrow.Field{Name: c.Name, Type: arrow.BinaryTypes.String, Nullable: true})
-		}
-	}
-	return arrow.NewSchema(fields, nil), nil
-}
-
 func (s *ParquetSink) initBuildersLocked() {
 	if s.builders != nil {
 		return
 	}
-	s.builders = make([]array.Builder, 0, len(s.schema.Columns))
-	for _, c := range s.schema.Columns {
-		switch c.Type {
-		case "string":
-			s.builders = append(s.builders, array.NewStringBuilder(s.mem))
-		case "int64":
-			s.builders = append(s.builders, array.NewInt64Builder(s.mem))
-		case "float64":
-			s.builders = append(s.builders, array.NewFloat64Builder(s.mem))
-		default:
-			s.builders = append(s.builders, array.NewStringBuilder(s.mem))
-		}
+	s.builders = make([]array.Builder, len(s.arrowSchema.Fields()))
+	for i, f := range s.arrowSchema.Fields() {
+		s.builders[i] = array.NewBuilder(s.mem, f.Type)
 	}
-}
-
-func (s *ParquetSink) appendRowLocked(td types.TupleDelta) error {
-	s.initBuildersLocked()
-
-	for i, col := range s.schema.Columns {
-		name := col.Name
-		switch col.Type {
-		case "int64":
-			b := s.builders[i].(*array.Int64Builder)
-			if name == "__count" {
-				b.Append(td.Count)
-				continue
-			}
-			v, ok := td.Tuple[name]
-			if !ok || v == nil {
-				b.AppendNull()
-				continue
-			}
-			iv, ok := coerceInt64(v)
-			if !ok {
-				b.AppendNull()
-				continue
-			}
-			b.Append(iv)
-
-		case "float64":
-			b := s.builders[i].(*array.Float64Builder)
-			v, ok := td.Tuple[name]
-			if !ok || v == nil {
-				b.AppendNull()
-				continue
-			}
-			fv, ok := coerceFloat64(v)
-			if !ok {
-				b.AppendNull()
-				continue
-			}
-			b.Append(fv)
-
-		case "string":
-			b := s.builders[i].(*array.StringBuilder)
-			v, ok := td.Tuple[name]
-			if !ok || v == nil {
-				b.AppendNull()
-				continue
-			}
-			b.Append(fmt.Sprintf("%v", v))
-
-		default:
-			// Unknown types are stringified.
-			b := s.builders[i].(*array.StringBuilder)
-			v, ok := td.Tuple[name]
-			if !ok || v == nil {
-				b.AppendNull()
-				continue
-			}
-			b.Append(fmt.Sprintf("%v", v))
-		}
-	}
-
-	s.bufRows++
-	return nil
 }
 
 func (s *ParquetSink) flushLocked() error {
@@ -250,6 +152,7 @@ func (s *ParquetSink) flushLocked() error {
 	for _, b := range s.builders {
 		arr := b.NewArray()
 		cols = append(cols, arr)
+		b.Release()
 	}
 	rec := array.NewRecord(s.arrowSchema, cols, int64(s.bufRows))
 	defer rec.Release()
@@ -262,9 +165,6 @@ func (s *ParquetSink) flushLocked() error {
 	}
 
 	// Reset builders.
-	for _, b := range s.builders {
-		b.Release()
-	}
 	s.builders = nil
 	s.bufRows = 0
 	return nil
@@ -379,57 +279,13 @@ func parseCompression(s string) compress.Compression {
 }
 
 func parseRotationDuration(s string) (time.Duration, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, nil
-	}
-	if d, err := time.ParseDuration(s); err == nil {
-		return d, nil
-	}
-	// Match ttl / watermark style: "5 minutes".
-	iv, err := types.ParseInterval(s)
-	if err != nil {
-		return 0, fmt.Errorf("invalid rotate_every %q: %w", s, err)
-	}
-	return time.Duration(iv.Millis) * time.Millisecond, nil
+	return types.ParseFlexibleDuration(s)
 }
 
 func coerceInt64(v any) (int64, bool) {
-	switch x := v.(type) {
-	case int:
-		return int64(x), true
-	case int64:
-		return x, true
-	case float64:
-		return int64(x), true
-	case string:
-		i, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		return i, true
-	default:
-		return 0, false
-	}
+	return types.ToInt64Safe(v)
 }
 
 func coerceFloat64(v any) (float64, bool) {
-	switch x := v.(type) {
-	case float64:
-		return x, true
-	case float32:
-		return float64(x), true
-	case int:
-		return float64(x), true
-	case int64:
-		return float64(x), true
-	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
-		if err != nil {
-			return 0, false
-		}
-		return f, true
-	default:
-		return 0, false
-	}
+	return types.ToFloat64Safe(v)
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
@@ -22,6 +23,11 @@ import (
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
+type partitionEntry struct {
+	store      *op.ZSetStore
+	lastAccess time.Time
+}
+
 type HTTPPullSink struct {
 	cfg         *config.HTTPPullSinkConfig
 	partitionBy []string
@@ -29,30 +35,25 @@ type HTTPPullSink struct {
 	arrowSchema *arrow.Schema
 	mem         memory.Allocator
 
-	// Map of partition key -> ZSetStore
+	// Map of partition key -> partitionEntry
 	// For simplicity, we use string representation of partition key.
-	partitions map[string]*op.ZSetStore
+	partitions map[string]*partitionEntry
 	mu         sync.RWMutex
 
 	server *http.Server
 }
 
-func NewHTTPPullSink(cfg map[string]interface{}, partitionBy []string, schema *config.ParquetSchema) (*HTTPPullSink, error) {
-	hcfg, err := config.ParseHTTPPullSinkConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-
+func NewHTTPPullSink(hcfg config.HTTPPullSinkConfig, partitionBy []string, schema *config.ParquetSchema) (*HTTPPullSink, error) {
 	if schema == nil {
 		return nil, fmt.Errorf("http_pull sink requires a parquet schema")
 	}
 
 	s := &HTTPPullSink{
-		cfg:         hcfg,
+		cfg:         &hcfg,
 		partitionBy: partitionBy,
 		schema:      schema,
 		mem:         memory.NewGoAllocator(),
-		partitions:  make(map[string]*op.ZSetStore),
+		partitions:  make(map[string]*partitionEntry),
 	}
 
 	if hcfg.DiskSpillPath != "" {
@@ -61,10 +62,7 @@ func NewHTTPPullSink(cfg map[string]interface{}, partitionBy []string, schema *c
 		}
 	}
 
-	as, err := s.buildArrowSchema(schema)
-	if err != nil {
-		return nil, err
-	}
+	as := BuildArrowSchema(schema, true)
 	s.arrowSchema = as
 
 	// Start HTTP server in background
@@ -87,7 +85,29 @@ func NewHTTPPullSink(cfg map[string]interface{}, partitionBy []string, schema *c
 		}
 	}()
 
+	if hcfg.PartitionTTLSeconds > 0 {
+		go s.runEvictionLoop(time.Duration(hcfg.PartitionTTLSeconds) * time.Second)
+	}
+
 	return s, nil
+}
+
+func (s *HTTPPullSink) runEvictionLoop(ttl time.Duration) {
+	ticker := time.NewTicker(ttl / 2)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.mu.Lock()
+		now := time.Now()
+		for k, entry := range s.partitions {
+			if now.Sub(entry.lastAccess) > ttl {
+				delete(s.partitions, k)
+				// Clean up spill files if necessary?
+				// For now just memory.
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
@@ -99,29 +119,37 @@ func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
 	defer s.mu.Unlock()
 
 	affectedPartitions := make(map[string]*op.ZSetStore)
+	now := time.Now()
 	for _, td := range batch {
 		pk := s.getPartitionKey(td.Tuple)
-		store, ok := s.partitions[pk]
+		entry, ok := s.partitions[pk]
 		if !ok {
-			store = op.NewZSetStore()
-			s.partitions[pk] = store
+			entry = &partitionEntry{
+				store: op.NewZSetStore(),
+			}
+			s.partitions[pk] = entry
 		}
-		if err := store.ApplyDelta(types.Batch{td}); err != nil {
+		entry.lastAccess = now
+
+		if err := entry.store.ApplyDelta(types.Batch{td}); err != nil {
 			return err
 		}
-		affectedPartitions[pk] = store
+		affectedPartitions[pk] = entry.store
 	}
 
 	if s.cfg.DiskSpillPath != "" {
 		for pk, store := range affectedPartitions {
 			if err := s.persistPartition(pk, store); err != nil {
-				// We log or error. For now, log.
-				fmt.Printf("failed to persist partition %s: %v\n", pk, err)
+				return fmt.Errorf("failed to persist partition %s: %w", pk, err)
 			}
 		}
 	}
 
 	return nil
+}
+
+func (s *HTTPPullSink) ReplayWriteBatch(batch types.Batch) error {
+	return s.WriteBatch(batch)
 }
 
 func (s *HTTPPullSink) WriteBatchWithPartition(batch types.Batch, values map[string]string) error {
@@ -134,18 +162,23 @@ func (s *HTTPPullSink) WriteBatchWithPartition(batch types.Batch, values map[str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	store, ok := s.partitions[pk]
+	now := time.Now()
+	entry, ok := s.partitions[pk]
 	if !ok {
-		store = op.NewZSetStore()
-		s.partitions[pk] = store
+		entry = &partitionEntry{
+			store: op.NewZSetStore(),
+		}
+		s.partitions[pk] = entry
 	}
-	if err := store.ApplyDelta(batch); err != nil {
+	entry.lastAccess = now
+
+	if err := entry.store.ApplyDelta(batch); err != nil {
 		return err
 	}
 
 	if s.cfg.DiskSpillPath != "" {
-		if err := s.persistPartition(pk, store); err != nil {
-			fmt.Printf("failed to persist partition %s: %v\n", pk, err)
+		if err := s.persistPartition(pk, entry.store); err != nil {
+			return fmt.Errorf("failed to persist partition %s: %w", pk, err)
 		}
 	}
 
@@ -214,14 +247,14 @@ func (s *HTTPPullSink) getPartitionKey(t types.Tuple) string {
 		return "default"
 	}
 	if len(s.partitionBy) == 1 {
-		return fmt.Sprintf("%v", t[s.partitionBy[0]])
+		return config.SanitizeHivePathSegment(fmt.Sprintf("%v", t[s.partitionBy[0]]))
 	}
 
-	// Composite key: consistent with handlePull (string-based JSON)
-	vals := make(map[string]string)
+	vals := make(map[string]string, len(s.partitionBy))
 	for _, col := range s.partitionBy {
-		vals[col] = fmt.Sprintf("%v", t[col])
+		vals[col] = config.SanitizeHivePathSegment(fmt.Sprintf("%v", t[col]))
 	}
+
 	b, _ := json.Marshal(vals)
 	return string(b)
 }
@@ -256,56 +289,63 @@ func (s *HTTPPullSink) Close() error {
 	return nil
 }
 
-func (s *HTTPPullSink) buildArrowSchema(ps *config.ParquetSchema) (*arrow.Schema, error) {
-	fields := make([]arrow.Field, 0, len(ps.Columns)+1)
-	for _, c := range ps.Columns {
-		var dt arrow.DataType
-		switch c.Type {
-		case "int64":
-			dt = arrow.PrimitiveTypes.Int64
-		case "float64":
-			dt = arrow.PrimitiveTypes.Float64
-		case "string":
-			dt = arrow.BinaryTypes.String
-		default:
-			dt = arrow.BinaryTypes.String
-		}
-		fields = append(fields, arrow.Field{Name: c.Name, Type: dt, Nullable: true})
-	}
-	// Always include __count for Z-set multiplicity
-	fields = append(fields, arrow.Field{Name: "__count", Type: arrow.PrimitiveTypes.Int64, Nullable: false})
-
-	return arrow.NewSchema(fields, nil), nil
-}
-
 func (s *HTTPPullSink) handlePull(w http.ResponseWriter, r *http.Request) {
 	// 1. Determine partition from query params
 	pk := ""
 	if len(s.partitionBy) == 0 {
 		pk = "default"
 	} else if len(s.partitionBy) == 1 {
-		pk = r.URL.Query().Get(s.partitionBy[0])
+		pk = config.SanitizeHivePathSegment(r.URL.Query().Get(s.partitionBy[0]))
 	} else {
 		// Complex key: consistent with getPartitionKey
 		vals := make(map[string]string)
 		for _, col := range s.partitionBy {
-			vals[col] = r.URL.Query().Get(col)
+			vals[col] = config.SanitizeHivePathSegment(r.URL.Query().Get(col))
 		}
 		b, _ := json.Marshal(vals)
 		pk = string(b)
 	}
 
-	s.mu.RLock()
-	store, ok := s.partitions[pk]
+	s.mu.Lock()
+	entry, ok := s.partitions[pk]
+	if ok {
+		entry.lastAccess = time.Now()
+	}
+	s.mu.Unlock()
+
 	if !ok {
-		s.mu.RUnlock()
-		http.Error(w, "Partition not found", http.StatusNotFound)
+		// If not in memory, check if we have a spill file.
+		spillPath := s.partitionSpillPath(pk)
+		if _, err := os.Stat(spillPath); os.IsNotExist(err) {
+			if len(s.partitions) > 0 {
+				fmt.Printf("HTTP Pull Warning: Partition '%s' not found. Available partitions (sanitized): ", pk)
+				i := 0
+				s.mu.RLock()
+				for k := range s.partitions {
+					fmt.Printf("%s ", k)
+					if i++; i > 10 {
+						fmt.Print("... ")
+						break
+					}
+				}
+				s.mu.RUnlock()
+				fmt.Println()
+			}
+			http.Error(w, "Partition not found", http.StatusNotFound)
+			return
+		}
+
+		// Serve from file if available.
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.parquet\"", pk))
+		http.ServeFile(w, r, spillPath)
 		return
 	}
 
 	// 2. Materialize to Arrow Record
 	// We create a temporary batch from the store.
-	batch := store.ToBatch()
+	s.mu.RLock()
+	batch := entry.store.ToBatch()
 	s.mu.RUnlock()
 
 	if len(batch) == 0 {
@@ -354,32 +394,8 @@ func (s *HTTPPullSink) batchToRecord(batch types.Batch) (arrow.Record, error) {
 		}
 	}()
 
-	for _, td := range batch {
-		for i, f := range s.arrowSchema.Fields() {
-			if f.Name == "__count" {
-				builders[i].(*array.Int64Builder).Append(td.Count)
-				continue
-			}
-
-			val, ok := td.Tuple[f.Name]
-			if !ok || val == nil {
-				builders[i].AppendNull()
-				continue
-			}
-
-			switch f.Type.ID() {
-			case arrow.INT64:
-				iv, _ := coerceInt64(val)
-				builders[i].(*array.Int64Builder).Append(iv)
-			case arrow.FLOAT64:
-				fv, _ := coerceFloat64(val)
-				builders[i].(*array.Float64Builder).Append(fv)
-			case arrow.STRING:
-				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
-			default:
-				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
-			}
-		}
+	if err := AppendTupleDeltasToArrowBuilders(s.arrowSchema, builders, batch); err != nil {
+		return nil, err
 	}
 
 	cols := make([]arrow.Array, len(builders))

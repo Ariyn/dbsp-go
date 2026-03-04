@@ -421,12 +421,12 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 				if _, ok := outDelta.Tuple["agg_delta"]; ok {
 					existing := pending[key]
 					if existing == nil {
-						cpy := &types.TupleDelta{Tuple: cloneTupleLocal(outDelta.Tuple), Count: 1}
+						cpy := &types.TupleDelta{Tuple: types.CloneTuple(outDelta.Tuple), Count: 1}
 						pending[key] = cpy
 					} else {
-						existing.Tuple["agg_delta"] = toFloat64Local(existing.Tuple["agg_delta"]) + toFloat64Local(outDelta.Tuple["agg_delta"])
+						existing.Tuple["agg_delta"] = types.ToFloat64(existing.Tuple["agg_delta"]) + types.ToFloat64(outDelta.Tuple["agg_delta"])
 					}
-					if existing := pending[key]; existing != nil && toFloat64Local(existing.Tuple["agg_delta"]) == 0 {
+					if existing := pending[key]; existing != nil && types.ToFloat64(existing.Tuple["agg_delta"]) == 0 {
 						delete(pending, key)
 					}
 					continue
@@ -434,12 +434,12 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 				if _, ok := outDelta.Tuple["avg_delta"]; ok {
 					existing := pending[key]
 					if existing == nil {
-						cpy := &types.TupleDelta{Tuple: cloneTupleLocal(outDelta.Tuple), Count: 1}
+						cpy := &types.TupleDelta{Tuple: types.CloneTuple(outDelta.Tuple), Count: 1}
 						pending[key] = cpy
 					} else {
-						existing.Tuple["avg_delta"] = toFloat64Local(existing.Tuple["avg_delta"]) + toFloat64Local(outDelta.Tuple["avg_delta"])
+						existing.Tuple["avg_delta"] = types.ToFloat64(existing.Tuple["avg_delta"]) + types.ToFloat64(outDelta.Tuple["avg_delta"])
 					}
-					if existing := pending[key]; existing != nil && toFloat64Local(existing.Tuple["avg_delta"]) == 0 {
+					if existing := pending[key]; existing != nil && types.ToFloat64(existing.Tuple["avg_delta"]) == 0 {
 						delete(pending, key)
 					}
 					continue
@@ -447,12 +447,12 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 				if _, ok := outDelta.Tuple["count_delta"]; ok {
 					existing := pending[key]
 					if existing == nil {
-						cpy := &types.TupleDelta{Tuple: cloneTupleLocal(outDelta.Tuple), Count: 1}
+						cpy := &types.TupleDelta{Tuple: types.CloneTuple(outDelta.Tuple), Count: 1}
 						pending[key] = cpy
 					} else {
-						existing.Tuple["count_delta"] = toInt64Local(existing.Tuple["count_delta"]) + toInt64Local(outDelta.Tuple["count_delta"])
+						existing.Tuple["count_delta"] = types.ToInt64(existing.Tuple["count_delta"]) + types.ToInt64(outDelta.Tuple["count_delta"])
 					}
-					if existing := pending[key]; existing != nil && toInt64Local(existing.Tuple["count_delta"]) == 0 {
+					if existing := pending[key]; existing != nil && types.ToInt64(existing.Tuple["count_delta"]) == 0 {
 						delete(pending, key)
 					}
 					continue
@@ -549,7 +549,7 @@ func mergePendingTupleDeltaLocal(pending map[any]*types.TupleDelta, key any, del
 
 	ex := pending[key]
 	if ex == nil {
-		pending[key] = &types.TupleDelta{Tuple: cloneTupleLocal(delta.Tuple), Count: 1}
+		pending[key] = &types.TupleDelta{Tuple: types.CloneTuple(delta.Tuple), Count: 1}
 		ex = pending[key]
 	} else {
 		for k, v := range delta.Tuple {
@@ -621,37 +621,11 @@ func isAllNumericZeroLocal(t types.Tuple, skipCols map[string]struct{}) bool {
 }
 
 func toFloat64Local(v any) float64 {
-	switch x := v.(type) {
-	case float64:
-		return x
-	case float32:
-		return float64(x)
-	case int:
-		return float64(x)
-	case int64:
-		return float64(x)
-	case uint64:
-		return float64(x)
-	default:
-		return 0
-	}
+	return types.ToFloat64(v)
 }
 
 func toInt64Local(v any) int64 {
-	switch x := v.(type) {
-	case int64:
-		return x
-	case int:
-		return int64(x)
-	case uint64:
-		return int64(x)
-	case float64:
-		return int64(x)
-	case float32:
-		return int64(x)
-	default:
-		return 0
-	}
+	return types.ToInt64(v)
 }
 
 // State returns a copy of the internal aggregate state (for testing/inspection).

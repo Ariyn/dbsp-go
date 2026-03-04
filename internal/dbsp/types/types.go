@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Tuple represents a row as a map from column name to value.
@@ -91,6 +92,23 @@ func (i Interval) String() string {
 	return fmt.Sprintf("%d millisecond(s)", ms)
 }
 
+// ParseFlexibleDuration parses human-readable duration strings like "5m", "1h", "1 hour", "30 seconds".
+// It tries time.ParseDuration first (e.g. "5m", "1h30m"), then falls back to ParseInterval.
+func ParseFlexibleDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return d, nil
+	}
+	iv, err := ParseInterval(s)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(iv.Millis) * time.Millisecond, nil
+}
+
 // EqualAny compares two values safely.
 //
 // It avoids panics on uncomparable values, compares maps/slices structurally,
@@ -98,6 +116,127 @@ func (i Interval) String() string {
 // int/uint/float and json.Number.
 func EqualAny(a, b any) bool {
 	return equalValue(reflect.ValueOf(a), reflect.ValueOf(b))
+}
+
+// CloneTuple returns a shallow copy of the tuple.
+func CloneTuple(t Tuple) Tuple {
+	if t == nil {
+		return nil
+	}
+	out := make(Tuple, len(t))
+	for k, v := range t {
+		out[k] = v
+	}
+	return out
+}
+
+// CloneConfigMap returns a shallow copy of a configuration map.
+func CloneConfigMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// CloneBatch returns a shallow copy of the batch.
+func CloneBatch(b Batch) Batch {
+	if b == nil {
+		return nil
+	}
+	out := make(Batch, 0, len(b))
+	for _, td := range b {
+		out = append(out, TupleDelta{Tuple: CloneTuple(td.Tuple), Count: td.Count})
+	}
+	return out
+}
+
+// ToFloat64 attempts to coerce any numeric or string value to float64.
+// ToFloat64 attempts to coerce any numeric or string value to float64.
+func ToFloat64(v any) float64 {
+	f, _ := ToFloat64Safe(v)
+	return f
+}
+
+// ToFloat64Safe attempts to coerce any numeric or string value to float64, returning success.
+func ToFloat64Safe(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case float32:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case int32:
+		return float64(x), true
+	case uint:
+		return float64(x), true
+	case uint64:
+		return float64(x), true
+	case uint32:
+		return float64(x), true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case json.Number:
+		f, err := x.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	default:
+		return 0, false
+	}
+}
+
+// ToInt64 attempts to coerce any numeric or string value to int64.
+func ToInt64(v any) int64 {
+	i, _ := ToInt64Safe(v)
+	return i
+}
+
+// ToInt64Safe attempts to coerce any numeric or string value to int64, returning success.
+func ToInt64Safe(v any) (int64, bool) {
+	switch x := v.(type) {
+	case int64:
+		return x, true
+	case int:
+		return int64(x), true
+	case int32:
+		return int64(x), true
+	case uint:
+		return int64(x), true
+	case uint64:
+		return int64(x), true
+	case uint32:
+		return int64(x), true
+	case float64:
+		return int64(x), true
+	case float32:
+		return int64(x), true
+	case string:
+		i, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return i, true
+	case json.Number:
+		i, err := x.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return i, true
+	default:
+		return 0, false
+	}
 }
 
 // TuplesEqual compares two tuples using EqualAny for values.

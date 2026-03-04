@@ -60,7 +60,7 @@ func (t *Table) ApplyBatch(batch types.Batch) error {
 	for _, td := range batch {
 		if td.Count > 0 {
 			for i := int64(0); i < td.Count; i++ {
-				t.rows = append(t.rows, copyTuple(td.Tuple))
+				t.rows = append(t.rows, types.CloneTuple(td.Tuple))
 			}
 		} else if td.Count < 0 {
 			for i := int64(0); i < -td.Count; i++ {
@@ -94,7 +94,7 @@ func (t *Table) Select(predicate func(types.Tuple) bool) []types.Tuple {
 	var result []types.Tuple
 	for _, row := range t.rows {
 		if predicate == nil || predicate(row) {
-			result = append(result, copyTuple(row))
+			result = append(result, types.CloneTuple(row))
 		}
 	}
 	return result
@@ -111,7 +111,7 @@ func (t *Table) Delete(predicate func(types.Tuple) bool) types.Batch {
 	for _, row := range t.rows {
 		if predicate(row) {
 			batch = append(batch, types.TupleDelta{
-				Tuple: copyTuple(row),
+				Tuple: types.CloneTuple(row),
 				Count: -1,
 			})
 		} else {
@@ -133,11 +133,11 @@ func (t *Table) Update(predicate func(types.Tuple) bool, updates map[string]any)
 	for i, row := range t.rows {
 		if predicate(row) {
 			batch = append(batch, types.TupleDelta{
-				Tuple: copyTuple(row),
+				Tuple: types.CloneTuple(row),
 				Count: -1,
 			})
 
-			newTuple := copyTuple(row)
+			newTuple := types.CloneTuple(row)
 			for k, v := range updates {
 				newTuple[k] = v
 			}
@@ -164,14 +164,6 @@ func (t *Table) Count() int {
 // GetAll returns all tuples
 func (t *Table) GetAll() []types.Tuple {
 	return t.Select(nil)
-}
-
-func copyTuple(t types.Tuple) types.Tuple {
-	copy := make(types.Tuple, len(t))
-	for k, v := range t {
-		copy[k] = v
-	}
-	return copy
 }
 
 func tuplesEqual(a, b types.Tuple) bool {

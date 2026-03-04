@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/cmd/dbsp/provider"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
-	"gopkg.in/yaml.v3"
 )
 
 // PartitionedSink supports writing batches with fixed partition values.
@@ -32,12 +32,8 @@ func WrapSinkWithBatchingIfConfigured(cfg map[string]interface{}, sink provider.
 		return sink, nil
 	}
 
-	yamlBytes, err := yaml.Marshal(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal sink config: %w", err)
-	}
 	var wrapperCfg SinkBatchingWrapperConfig
-	if err := yaml.Unmarshal(yamlBytes, &wrapperCfg); err != nil {
+	if err := config.DecodeTo(cfg, &wrapperCfg); err != nil {
 		return nil, fmt.Errorf("failed to parse sink batching config: %w", err)
 	}
 
@@ -77,6 +73,13 @@ func NewBatchSink(inner provider.Sink, maxBatchSize int, maxBatchDelay time.Dura
 		maxBatchSize:  maxBatchSize,
 		maxBatchDelay: maxBatchDelay,
 	}
+}
+
+func (s *BatchSink) ReplayWriteBatch(batch types.Batch) error {
+	if rs, ok := s.inner.(provider.ReplaySink); ok {
+		return rs.ReplayWriteBatch(batch)
+	}
+	return s.inner.WriteBatch(batch)
 }
 
 func (s *BatchSink) WriteBatch(batch types.Batch) error {

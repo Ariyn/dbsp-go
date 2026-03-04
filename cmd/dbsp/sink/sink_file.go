@@ -13,7 +13,6 @@ import (
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
-	"gopkg.in/yaml.v3"
 )
 
 type FileSink struct {
@@ -27,17 +26,7 @@ type FileSink struct {
 	mu             sync.Mutex
 }
 
-func NewFileSink(cfg map[string]interface{}) (*FileSink, error) {
-	// Parse config
-	yamlBytes, err := yaml.Marshal(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal config: %w", err)
-	}
-	var fileConfig config.FileSinkConfig
-	if err := yaml.Unmarshal(yamlBytes, &fileConfig); err != nil {
-		return nil, fmt.Errorf("failed to parse file sink config: %w", err)
-	}
-
+func NewFileSink(fileConfig config.FileSinkConfig) (*FileSink, error) {
 	if fileConfig.Path == "" {
 		return nil, fmt.Errorf("file path is required")
 	}

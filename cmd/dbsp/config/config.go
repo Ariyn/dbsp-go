@@ -1,5 +1,15 @@
 package config
 
+import (
+	"bytes"
+	"fmt"
+	"runtime/debug"
+	"strings"
+
+	"github.com/dustin/go-humanize"
+	"gopkg.in/yaml.v3"
+)
+
 // PipelineConfig defines the structure of the configuration file
 type PipelineConfig struct {
 	Pipeline struct {
@@ -12,13 +22,58 @@ type PipelineConfig struct {
 	} `yaml:"pipeline"`
 }
 
+func ParsePipelineConfig(configFile []byte) (PipelineConfig, error) {
+	var cfg PipelineConfig
+	dec := yaml.NewDecoder(bytes.NewReader(configFile))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
+		return PipelineConfig{}, err
+	}
+	return cfg, nil
+}
+
+func ApplyMemoryLimit(raw string) error {
+	limit := strings.TrimSpace(raw)
+	if limit == "" {
+		limit = "1GiB"
+	}
+	bytes, err := parseHumanBytes(limit)
+	if err != nil {
+		return err
+	}
+	if bytes <= 0 {
+		bytes, err = parseHumanBytes("1GiB")
+		if err != nil {
+			return err
+		}
+		limit = "1GiB"
+	}
+	debug.SetMemoryLimit(bytes)
+	fmt.Printf("Applied Go memory limit: %s (%d bytes)\n", limit, bytes)
+	return nil
+}
+
+func ParseHumanBytes(raw string) (int64, error) {
+	b, err := humanize.ParseBytes(raw)
+	return int64(b), err
+}
+
+func parseHumanBytes(raw string) (int64, error) {
+	b, err := humanize.ParseBytes(raw)
+	return int64(b), err
+}
+
 // StateBackendConfig controls operator-state storage backend.
 //
 // Default behavior remains in-memory when Enabled=false.
 type StateBackendConfig struct {
 	Enabled bool   `yaml:"enabled"`
-	Type    string `yaml:"type"` // memory|kv|sqlite
+	Type    string `yaml:"type"` // memory|kv|lsm|sqlite
 	Path    string `yaml:"path"`
+
+	// MemoryLimit caps Go heap usage (GC soft limit). Human-size string like "1GiB".
+	// Empty or zero uses the default limit.
+	MemoryLimit string `yaml:"memory_limit"`
 
 	// CacheMaxEntries is reserved for future hot-cache tuning.
 	CacheMaxEntries int `yaml:"cache_max_entries"`
@@ -86,8 +141,8 @@ type WALSQLitePragmaConfig struct {
 
 // SourceConfig defines the configuration for the data source
 type SourceConfig struct {
-	Type   string                 `yaml:"type"` // e.g., "csv"
-	Config map[string]interface{} `yaml:"config"`
+	Type   string         `yaml:"type"` // e.g., "csv"
+	Config map[string]any `yaml:"config"`
 }
 
 // TransformConfig defines the configuration for the transformation (SQL)
@@ -110,18 +165,18 @@ type WatermarkYAMLConfig struct {
 	MaxBufferSize     int    `yaml:"max_buffer_size"`
 }
 
+// ConsoleSinkConfig defines the configuration for the console sink
+type ConsoleSinkConfig struct {
+	Format string `yaml:"format"` // "json" or "text"
+}
+
 // SinkConfig defines the configuration for the data sink
 type SinkConfig struct {
-	Type   string                 `yaml:"type"` // e.g., "console"
-	Config map[string]interface{} `yaml:"config"`
+	Type   string         `yaml:"type"` // e.g., "console"
+	Config map[string]any `yaml:"config"`
 }
 
-// CSVSourceConfig is a helper struct to parse the specific config for CSV source
-type CSVSourceConfig struct {
-	Path   string            `yaml:"path"`
-	Schema map[string]string `yaml:"schema"` // column name -> type (int, float, string)
-}
-
+// HTTPSourceConfig defines the configuration for the HTTP source.
 type HTTPSourceConfig struct {
 	Port   int               `yaml:"port"`
 	Path   string            `yaml:"path"`
@@ -189,4 +244,7 @@ type HTTPPullSinkConfig struct {
 
 	// DiskSpillPath is the directory where partitioned snapshots are stored.
 	DiskSpillPath string `yaml:"disk_spill_path"`
+
+	// PartitionTTLSeconds is the time in seconds after which an idle partition is evicted from memory.
+	PartitionTTLSeconds int `yaml:"partition_ttl_seconds"`
 }

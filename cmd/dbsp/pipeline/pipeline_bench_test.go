@@ -1,10 +1,11 @@
 package pipeline
 
 import (
-	"github.com/ariyn/dbsp/cmd/dbsp/config"
-	"github.com/ariyn/dbsp/cmd/dbsp/sink"
 	"path/filepath"
 	"testing"
+
+	"github.com/ariyn/dbsp/cmd/dbsp/config"
+	"github.com/ariyn/dbsp/cmd/dbsp/sink"
 
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
@@ -44,10 +45,10 @@ func BenchmarkPipeline_ExecutePlusParquetSink_GroupAgg(b *testing.B) {
 		{Name: "__count", Type: "int64"},
 	}}
 
-	cfg := map[string]interface{}{
-		"path":           filepath.Join(b.TempDir(), "pipe"),
-		"compression":    "uncompressed",
-		"row_group_size": 65536,
+	cfg := config.ParquetSinkConfig{
+		Path:         filepath.Join(b.TempDir(), "pipe"),
+		Compression:  "uncompressed",
+		RowGroupSize: 65536,
 	}
 	ps, err := sink.NewParquetSink(cfg, schema)
 	if err != nil {
