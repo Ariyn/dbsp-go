@@ -52,3 +52,17 @@ func TestCollectorSetObserveOperatorBatch(t *testing.T) {
 		t.Fatalf("expected 2 append misses, got %v", got)
 	}
 }
+
+func TestCollectorSetObserveOperatorState(t *testing.T) {
+	collectors := newCollectorSet(prometheus.NewRegistry())
+	collectors.observeOperatorState("WindowAggOp", 17)
+
+	if got := testutil.ToFloat64(collectors.operatorStateEntries.WithLabelValues("WindowAggOp")); got != 17 {
+		t.Fatalf("expected 17 state entries, got %v", got)
+	}
+
+	collectors.observeOperatorState("WindowAggOp", -3)
+	if got := testutil.ToFloat64(collectors.operatorStateEntries.WithLabelValues("WindowAggOp")); got != 0 {
+		t.Fatalf("expected negative state entries to clamp to 0, got %v", got)
+	}
+}

@@ -144,6 +144,10 @@ type StateBackendConfig struct {
 	// StateTTL expires operator state entries after this duration (e.g., "1h").
 	StateTTL string `yaml:"state_ttl"`
 
+	// OnlyLastLag keeps only the latest retained row for offset-1 LAG state.
+	// Default false preserves the full ordered state required for general updates.
+	OnlyLastLag bool `yaml:"only_last_lag"`
+
 	// CacheMaxEntries is reserved for future hot-cache tuning.
 	CacheMaxEntries int `yaml:"cache_max_entries"`
 

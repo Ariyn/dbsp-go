@@ -44,8 +44,11 @@ type GroupAggOp struct {
 	TimeWindowSpec WindowSpecLite
 
 	// StateTTL evicts per-key aggregate state based on processing-time inactivity.
-	StateTTL    time.Duration
-	lastTouched map[any]time.Time
+	StateTTL         time.Duration
+	lastTouched      map[any]time.Time
+	ttlCheckInterval time.Duration
+	nextTTLCheck     time.Time
+	ttlExpiry        ttlExpiryQueue
 
 	stateBackend StateBackend
 	statePrefix  string
@@ -92,36 +95,32 @@ func (g *GroupAggOp) touchKey(now time.Time, key any) {
 		g.lastTouched = make(map[any]time.Time)
 	}
 	g.lastTouched[key] = now
+	g.ttlExpiry.touch(stableAnyKey(key), now.Add(g.StateTTL))
 }
 
 func (g *GroupAggOp) evictExpired(now time.Time) error {
-	if g.StateTTL <= 0 || len(g.lastTouched) == 0 {
+	if g.StateTTL <= 0 {
 		return nil
 	}
-	for key, touched := range g.lastTouched {
-		if now.Sub(touched) <= g.StateTTL {
-			continue
+	return g.ttlExpiry.popExpired(now, func(id string) error {
+		key, err := decodeAnyKey(id)
+		if err != nil {
+			key = id
 		}
 		delete(g.lastTouched, key)
 		if g.backendEnabled() {
 			if len(g.Aggs) > 0 {
-				if err := g.stateBackend.Delete(g.multiStateKey(key)); err != nil {
-					return err
-				}
-			} else {
-				if err := g.stateBackend.Delete(g.singleStateKey(key)); err != nil {
-					return err
-				}
+				return g.stateBackend.Delete(g.multiStateKey(key))
 			}
-			continue
+			return g.stateBackend.Delete(g.singleStateKey(key))
 		}
 		if len(g.Aggs) > 0 {
 			delete(g.multiState, key)
 		} else {
 			delete(g.state, key)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (g *GroupAggOp) backendEnabled() bool {
@@ -447,8 +446,10 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	}
 
 	now := time.Now()
-	if err := g.evictExpired(now); err != nil {
-		return nil, err
+	if shouldRunTTLCheck(&g.nextTTLCheck, now, g.StateTTL, g.ttlCheckInterval) {
+		if err := g.evictExpired(now); err != nil {
+			return nil, err
+		}
 	}
 
 	var out types.Batch
@@ -457,7 +458,8 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	}
 	if g.EmitValue {
 		for _, td := range batch {
-			key := g.KeyFn(td.Tuple)
+			inputTuple := td.EnsureTuple()
+			key := g.KeyFn(inputTuple)
 			prev, ok, err := g.getSingleState(key)
 			if err != nil {
 				return nil, err
@@ -480,13 +482,13 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 			}
 			colName := aggOutputColumnName(g.AggFn)
 			if ok && oldVal != nil {
-				out = append(out, types.TupleDelta{Tuple: g.buildSingleValueTuple(td, key, colName, oldVal), Count: -1})
+				out = append(out, g.buildSingleValueDelta(td, inputTuple, key, colName, oldVal, -1))
 			}
 			if newVal != nil {
-				out = append(out, types.TupleDelta{Tuple: g.buildSingleValueTuple(td, key, colName, newVal), Count: 1})
+				out = append(out, g.buildSingleValueDelta(td, inputTuple, key, colName, newVal, 1))
 			}
 		}
-		g.profile.observeBatch(len(batch), out, 0, 0)
+		g.profile.observeBatch(len(batch), out, 0, 0, g.stateEntryCount())
 		return out, nil
 	}
 
@@ -494,7 +496,8 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	// the batch so that net-zero changes don't emit output.
 	pending := make(map[any]*types.TupleDelta)
 	for _, td := range batch {
-		key := g.KeyFn(td.Tuple)
+		inputTuple := td.EnsureTuple()
+		key := g.KeyFn(inputTuple)
 		prev, ok, err := g.getSingleState(key)
 		if err != nil {
 			return nil, err
@@ -521,7 +524,7 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 				}
 				if len(g.GroupKeyColNames) > 0 {
 					for _, col := range g.GroupKeyColNames {
-						ld.Tuple[col] = td.Tuple[col]
+						ld.Tuple[col] = inputTuple[col]
 					}
 				} else if g.KeyColName != "" {
 					ld.Tuple[g.KeyColName] = key
@@ -541,7 +544,7 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 
 			if len(g.GroupKeyColNames) > 0 {
 				for _, col := range g.GroupKeyColNames {
-					outDelta.Tuple[col] = td.Tuple[col]
+					outDelta.Tuple[col] = inputTuple[col]
 				}
 			} else if g.KeyColName != "" {
 				// Legacy single-key mode.
@@ -596,7 +599,7 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	for _, td := range pending {
 		out = append(out, *td)
 	}
-	g.profile.observeBatch(len(batch), out, 0, 0)
+	g.profile.observeBatch(len(batch), out, 0, 0, g.stateEntryCount())
 	return out, nil
 }
 
@@ -605,15 +608,18 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
 
 	now := time.Now()
-	if err := g.evictExpired(now); err != nil {
-		return nil, err
+	if shouldRunTTLCheck(&g.nextTTLCheck, now, g.StateTTL, g.ttlCheckInterval) {
+		if err := g.evictExpired(now); err != nil {
+			return nil, err
+		}
 	}
 	if g.EmitValue {
 		if g.multiState == nil {
 			g.multiState = make(map[any][]any)
 		}
 		for _, td := range batch {
-			key := g.KeyFn(td.Tuple)
+			inputTuple := td.EnsureTuple()
+			key := g.KeyFn(inputTuple)
 			states, ok, err := g.getMultiState(key)
 			if err != nil {
 				return nil, err
@@ -652,11 +658,11 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 				continue
 			}
 			if ok {
-				out = append(out, types.TupleDelta{Tuple: g.buildMultiValueTuple(td, key, g.Aggs, oldVals), Count: -1})
+				out = append(out, g.buildMultiValueDelta(td, inputTuple, key, g.Aggs, oldVals, -1))
 			}
-			out = append(out, types.TupleDelta{Tuple: g.buildMultiValueTuple(td, key, g.Aggs, newVals), Count: 1})
+			out = append(out, g.buildMultiValueDelta(td, inputTuple, key, g.Aggs, newVals, 1))
 		}
-		g.profile.observeBatch(len(batch), out, 0, 0)
+		g.profile.observeBatch(len(batch), out, 0, 0, g.stateEntryCount())
 		return out, nil
 	}
 	// Compact additive deltas per group key within the batch so that net-zero
@@ -677,7 +683,8 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 	}
 
 	for _, td := range batch {
-		key := g.KeyFn(td.Tuple)
+		inputTuple := td.EnsureTuple()
+		key := g.KeyFn(inputTuple)
 		states, ok, err := g.getMultiState(key)
 		if err != nil {
 			return nil, err
@@ -702,7 +709,7 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 			}
 			if len(g.GroupKeyColNames) > 0 {
 				for _, col := range g.GroupKeyColNames {
-					outDelta.Tuple[col] = td.Tuple[col]
+					outDelta.Tuple[col] = inputTuple[col]
 				}
 			} else if g.KeyColName != "" {
 				outDelta.Tuple[g.KeyColName] = key
@@ -720,7 +727,7 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 	for _, td := range pending {
 		out = append(out, *td)
 	}
-	g.profile.observeBatch(len(batch), out, 0, 0)
+	g.profile.observeBatch(len(batch), out, 0, 0, g.stateEntryCount())
 	return out, nil
 }
 
@@ -883,6 +890,13 @@ func (g *GroupAggOp) buildSingleValueTuple(td types.TupleDelta, key any, col str
 	return out
 }
 
+func (g *GroupAggOp) buildSingleValueDelta(td types.TupleDelta, inputTuple types.Tuple, key any, col string, value any, count int64) types.TupleDelta {
+	if packed := g.buildPackedValueTuple(td, key, types.Tuple{col: value}); packed != nil {
+		return types.TupleDelta{Packed: packed, Count: count}
+	}
+	return types.TupleDelta{Tuple: g.buildSingleValueTuple(types.TupleDelta{Tuple: inputTuple}, key, col, value), Count: count}
+}
+
 func (g *GroupAggOp) buildMultiValueTuple(td types.TupleDelta, key any, aggs []AggSlot, vals []any) types.Tuple {
 	baseCapacity := len(aggs)
 	if len(g.GroupKeyColNames) > 0 {
@@ -905,6 +919,44 @@ func (g *GroupAggOp) buildMultiValueTuple(td types.TupleDelta, key any, aggs []A
 		out[aggOutputColumnName(agg.Fn)] = vals[idx]
 	}
 	return out
+}
+
+func (g *GroupAggOp) buildMultiValueDelta(td types.TupleDelta, inputTuple types.Tuple, key any, aggs []AggSlot, vals []any, count int64) types.TupleDelta {
+	if packed := g.buildPackedValueTuple(td, key, aggValueMap(aggs, vals)); packed != nil {
+		return types.TupleDelta{Packed: packed, Count: count}
+	}
+	return types.TupleDelta{Tuple: g.buildMultiValueTuple(types.TupleDelta{Tuple: inputTuple}, key, aggs, vals), Count: count}
+}
+
+func (g *GroupAggOp) buildPackedValueTuple(td types.TupleDelta, key any, values types.Tuple) *types.PackedTuple {
+	if td.Packed == nil {
+		return nil
+	}
+	base := g.packedValueBase(td.Packed)
+	if base == nil {
+		return nil
+	}
+	if len(values) == 0 && g.KeyColName == "" {
+		return base
+	}
+	extras := make(types.Tuple, len(values)+1)
+	for name, value := range values {
+		extras[name] = value
+	}
+	if len(g.GroupKeyColNames) == 0 && g.KeyColName != "" {
+		extras[g.KeyColName] = key
+	}
+	return base.WithExtras(extras)
+}
+
+func (g *GroupAggOp) packedValueBase(packed *types.PackedTuple) *types.PackedTuple {
+	if packed == nil {
+		return nil
+	}
+	if len(g.GroupKeyColNames) > 0 {
+		return packed.Project(g.GroupKeyColNames)
+	}
+	return &types.PackedTuple{}
 }
 
 func aggValueMap(aggs []AggSlot, vals []any) map[string]any {
@@ -1035,6 +1087,28 @@ func (g *GroupAggOp) State() map[any]any {
 		copy[k] = v
 	}
 	return copy
+}
+
+func (g *GroupAggOp) stateEntryCount() int {
+	if g == nil {
+		return 0
+	}
+	if g.backendEnabled() {
+		prefix := []byte(fmt.Sprintf("%s/single/", g.statePrefix))
+		if len(g.Aggs) > 0 {
+			prefix = []byte(fmt.Sprintf("%s/multi/", g.statePrefix))
+		}
+		count := 0
+		_ = g.stateBackend.IterPrefix(prefix, func(_, _ []byte) error {
+			count++
+			return nil
+		})
+		return count
+	}
+	if len(g.Aggs) > 0 {
+		return len(g.multiState)
+	}
+	return len(g.state)
 }
 
 // SumAgg is a simple AggFunc that sums a numeric field multiplied by Count.

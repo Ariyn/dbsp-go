@@ -92,10 +92,14 @@ type WindowAggOp struct {
 	StateTTL             time.Duration
 	lastTouchedWindow    map[WindowID]time.Time
 	lastTouchedPartition map[any]time.Time
+	ttlCheckInterval     time.Duration
+	nextTTLCheck         time.Time
+	windowTTLExpiry      ttlExpiryQueue
+	partitionTTLExpiry   ttlExpiryQueue
 
-	stateBackend  StateBackend
-	statePrefix   string
-	backendLoaded bool
+	stateBackend        StateBackend
+	statePrefix         string
+	backendLoaded       bool
 	profileAppendHits   int
 	profileAppendMisses int
 }
@@ -173,14 +177,15 @@ func (w *WindowAggOp) Restore(state any) error {
 // PartitionBuffer maintains ordered rows within a partition for frame-based aggregation
 type PartitionBuffer struct {
 	Rows     []RowWithOrder // sorted by ORDER BY column
-	rowIndex map[string]int
+	rowIndex map[uint64][]int
 }
 
 // RowWithOrder represents a row with its order value and multiplicity
 type RowWithOrder struct {
 	OrderValue any
 	Tuple      types.Tuple
-	TupleKey   string
+	Packed     *types.PackedTuple
+	RowHash    uint64
 	Count      int64
 }
 
@@ -230,6 +235,7 @@ func (w *WindowAggOp) touchWindow(now time.Time, wid WindowID) {
 		w.lastTouchedWindow = make(map[WindowID]time.Time)
 	}
 	w.lastTouchedWindow[wid] = now
+	w.windowTTLExpiry.touch(encodeWindowIDKey(wid), now.Add(w.StateTTL))
 }
 
 func (w *WindowAggOp) touchPartition(now time.Time, key any) {
@@ -240,43 +246,44 @@ func (w *WindowAggOp) touchPartition(now time.Time, key any) {
 		w.lastTouchedPartition = make(map[any]time.Time)
 	}
 	w.lastTouchedPartition[key] = now
+	w.partitionTTLExpiry.touch(stableAnyKey(key), now.Add(w.StateTTL))
 }
 
 func (w *WindowAggOp) evictExpired(now time.Time) {
 	if w.StateTTL <= 0 {
 		return
 	}
-	if len(w.lastTouchedWindow) > 0 {
-		for wid, touched := range w.lastTouchedWindow {
-			if now.Sub(touched) <= w.StateTTL {
-				continue
-			}
-			delete(w.lastTouchedWindow, wid)
-			if w.GroupCounts != nil {
-				delete(w.GroupCounts, wid)
-			}
-			if w.State.Data != nil {
-				delete(w.State.Data, wid)
-			}
+	_ = w.windowTTLExpiry.popExpired(now, func(id string) error {
+		wid, err := decodeWindowIDKey(id)
+		if err != nil {
+			return nil
 		}
-	}
-	if len(w.lastTouchedPartition) > 0 {
-		for key, touched := range w.lastTouchedPartition {
-			if now.Sub(touched) <= w.StateTTL {
-				continue
-			}
-			delete(w.lastTouchedPartition, key)
-			if w.PartitionBuffers != nil {
-				delete(w.PartitionBuffers, key)
-			}
-			if w.SessionBuffers != nil {
-				delete(w.SessionBuffers, key)
-			}
-			if w.sessionOut != nil {
-				delete(w.sessionOut, key)
-			}
+		delete(w.lastTouchedWindow, wid)
+		if w.GroupCounts != nil {
+			delete(w.GroupCounts, wid)
 		}
-	}
+		if w.State.Data != nil {
+			delete(w.State.Data, wid)
+		}
+		return nil
+	})
+	_ = w.partitionTTLExpiry.popExpired(now, func(id string) error {
+		key, err := decodeAnyKey(id)
+		if err != nil {
+			key = id
+		}
+		delete(w.lastTouchedPartition, key)
+		if w.PartitionBuffers != nil {
+			delete(w.PartitionBuffers, key)
+		}
+		if w.SessionBuffers != nil {
+			delete(w.SessionBuffers, key)
+		}
+		if w.sessionOut != nil {
+			delete(w.sessionOut, key)
+		}
+		return nil
+	})
 }
 
 func (w *WindowAggOp) backendEnabled() bool {
@@ -728,6 +735,8 @@ func (w *WindowAggOp) applyGroupCount(wid WindowID, groupKey any, deltaCount int
 			delete(gm, groupKey)
 			if len(gm) == 0 {
 				delete(w.State.Data, wid)
+				delete(w.lastTouchedWindow, wid)
+				w.windowTTLExpiry.remove(encodeWindowIDKey(wid))
 			}
 		}
 		return nil
@@ -804,8 +813,9 @@ func (w *WindowAggOp) Apply(batch types.Batch) (types.Batch, error) {
 		return nil, err
 	}
 	w.ensureStateMaps()
-	if w.StateTTL > 0 {
-		w.evictExpired(time.Now())
+	now := time.Now()
+	if shouldRunTTLCheck(&w.nextTTLCheck, now, w.StateTTL, w.ttlCheckInterval) {
+		w.evictExpired(now)
 	}
 
 	var (
@@ -833,8 +843,29 @@ func (w *WindowAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	if err := w.flushBackendState(); err != nil {
 		return nil, err
 	}
-	w.profile.observeBatch(len(batch), out, w.profileAppendHits, w.profileAppendMisses)
+	w.profile.observeBatch(len(batch), out, w.profileAppendHits, w.profileAppendMisses, w.stateEntryCount())
 	return out, nil
+}
+
+func (w *WindowAggOp) stateEntryCount() int {
+	if w == nil {
+		return 0
+	}
+	count := 0
+	for _, groups := range w.State.Data {
+		count += len(groups)
+	}
+	for _, buffer := range w.PartitionBuffers {
+		if buffer != nil {
+			count += len(buffer.Rows)
+		}
+	}
+	for _, buffer := range w.SessionBuffers {
+		if buffer != nil {
+			count += len(buffer.Rows)
+		}
+	}
+	return count
 }
 
 // applyTumbling handles tumbling windows (original implementation)
@@ -1458,7 +1489,8 @@ func (w *WindowAggOp) applySession(batch types.Batch) (types.Batch, error) {
 
 	// Update per-partition event buffers (insert/delete).
 	for _, td := range batch {
-		groupKey := w.KeyFn(td.Tuple)
+		inputTuple := td.EnsureTuple()
+		groupKey := w.KeyFn(inputTuple)
 		touched[groupKey] = struct{}{}
 		w.touchPartition(now, groupKey)
 		pb := w.getOrCreateSessionBuffer(groupKey)
@@ -1510,7 +1542,7 @@ func (w *WindowAggOp) getOrCreateSessionBuffer(key any) *PartitionBuffer {
 	}
 	buffer, ok := w.SessionBuffers[key]
 	if !ok {
-		buffer = &PartitionBuffer{Rows: []RowWithOrder{}, rowIndex: make(map[string]int)}
+		buffer = &PartitionBuffer{Rows: []RowWithOrder{}, rowIndex: make(map[uint64][]int)}
 		w.SessionBuffers[key] = buffer
 	}
 	return buffer
@@ -1520,27 +1552,22 @@ func (pb *PartitionBuffer) ensureRowIndex() {
 	if pb == nil {
 		return
 	}
-	if pb.rowIndex != nil && len(pb.rowIndex) == len(pb.Rows) {
+	if pb.rowIndex != nil {
 		return
 	}
-	pb.rowIndex = make(map[string]int, len(pb.Rows))
+	pb.rowIndex = make(map[uint64][]int, len(pb.Rows))
 	for idx, row := range pb.Rows {
-		key := row.TupleKey
-		if key == "" {
-			key = stableTupleKeyCanonical(row.Tuple)
-			pb.Rows[idx].TupleKey = key
-		}
-		pb.rowIndex[key] = idx
+		hash := rowIdentityHash(row.Tuple, row.Packed)
+		pb.Rows[idx].RowHash = hash
+		pb.rowIndex[hash] = append(pb.rowIndex[hash], idx)
 	}
 }
 
-func (pb *PartitionBuffer) shiftRowIndexes(start, delta int) {
-	if pb == nil || pb.rowIndex == nil || delta == 0 {
+func (pb *PartitionBuffer) invalidateRowIndex() {
+	if pb == nil {
 		return
 	}
-	for idx := start; idx < len(pb.Rows); idx++ {
-		pb.rowIndex[pb.Rows[idx].TupleKey] = idx
-	}
+	pb.rowIndex = nil
 }
 
 func (pb *PartitionBuffer) lowerBound(orderValue any) int {
@@ -1555,21 +1582,23 @@ func (pb *PartitionBuffer) upperBound(orderValue any) int {
 	})
 }
 
-func (pb *PartitionBuffer) findRow(orderValue any, tuple types.Tuple) (idx, start, end int) {
+func (pb *PartitionBuffer) findRow(orderValue any, tuple types.Tuple, packed *types.PackedTuple) (idx, start, end int) {
 	pb.ensureRowIndex()
 	start = pb.lowerBound(orderValue)
 	end = pb.upperBound(orderValue)
-	tupleKey := stableTupleKeyCanonical(tuple)
-	if directIdx, ok := pb.rowIndex[tupleKey]; ok {
-		if directIdx >= 0 && directIdx < len(pb.Rows) && compareValues(pb.Rows[directIdx].OrderValue, orderValue) == 0 {
-			return directIdx, start, end
+	rowHash := rowIdentityHash(tuple, packed)
+	if candidates, ok := pb.rowIndex[rowHash]; ok {
+		for _, directIdx := range candidates {
+			if directIdx < start || directIdx >= end || directIdx < 0 || directIdx >= len(pb.Rows) {
+				continue
+			}
+			if compareValues(pb.Rows[directIdx].OrderValue, orderValue) == 0 && rowMatchesInput(pb.Rows[directIdx], tuple, packed) {
+				return directIdx, start, end
+			}
 		}
-		delete(pb.rowIndex, tupleKey)
 	}
 	for i := start; i < end; i++ {
-		if pb.Rows[i].TupleKey == tupleKey || tuplesEqual(pb.Rows[i].Tuple, tuple) {
-			pb.Rows[i].TupleKey = tupleKey
-			pb.rowIndex[tupleKey] = i
+		if pb.Rows[i].RowHash == rowHash && rowMatchesInput(pb.Rows[i], tuple, packed) {
 			return i, start, end
 		}
 	}
@@ -1577,32 +1606,31 @@ func (pb *PartitionBuffer) findRow(orderValue any, tuple types.Tuple) (idx, star
 }
 
 func (pb *PartitionBuffer) addRowStrict(td types.TupleDelta, orderByCol string) error {
-	orderValue := td.Tuple[orderByCol]
-	idx, _, end := pb.findRow(orderValue, td.Tuple)
+	inputTuple := td.EnsureTuple()
+	orderValue := inputTuple[orderByCol]
+	idx, _, end := pb.findRow(orderValue, inputTuple, td.Packed)
 
 	if idx >= 0 {
 		pb.Rows[idx].Count += td.Count
 		if pb.Rows[idx].Count < 0 {
-			return fmt.Errorf("row underflow for order=%v tuple=%v", orderValue, td.Tuple)
+			return fmt.Errorf("row underflow for order=%v tuple=%v", orderValue, inputTuple)
 		}
 		if pb.Rows[idx].Count == 0 {
-			delete(pb.rowIndex, pb.Rows[idx].TupleKey)
 			pb.Rows = append(pb.Rows[:idx], pb.Rows[idx+1:]...)
-			pb.shiftRowIndexes(idx, -1)
+			pb.invalidateRowIndex()
 		}
 		return nil
 	}
 
 	if td.Count < 0 {
-		return fmt.Errorf("row not found for deletion order=%v tuple=%v", orderValue, td.Tuple)
+		return fmt.Errorf("row not found for deletion order=%v tuple=%v", orderValue, inputTuple)
 	}
 
-	newRow := RowWithOrder{OrderValue: orderValue, Tuple: td.Tuple, TupleKey: stableTupleKeyCanonical(td.Tuple), Count: td.Count}
+	newRow := RowWithOrder{OrderValue: orderValue, Tuple: inputTuple, Packed: types.ClonePackedTuple(td.Packed), RowHash: rowIdentityHash(inputTuple, td.Packed), Count: td.Count}
 	pb.Rows = append(pb.Rows, RowWithOrder{})
 	copy(pb.Rows[end+1:], pb.Rows[end:])
 	pb.Rows[end] = newRow
-	pb.rowIndex[newRow.TupleKey] = end
-	pb.shiftRowIndexes(end+1, 1)
+	pb.invalidateRowIndex()
 	return nil
 }
 
@@ -1722,7 +1750,8 @@ func (w *WindowAggOp) applyFrameBased(batch types.Batch) (types.Batch, error) {
 	// Group by partition
 	partitionDeltas := make(map[any][]types.TupleDelta)
 	for _, td := range batch {
-		partitionKey := w.KeyFn(td.Tuple)
+		inputTuple := td.EnsureTuple()
+		partitionKey := w.KeyFn(inputTuple)
 		partitionDeltas[partitionKey] = append(partitionDeltas[partitionKey], td)
 	}
 
@@ -1757,7 +1786,8 @@ func (w *WindowAggOp) applyFrameBasedValue(batch types.Batch) (types.Batch, erro
 
 	partitionDeltas := make(map[any][]types.TupleDelta)
 	for _, td := range batch {
-		partitionKey := w.KeyFn(td.Tuple)
+		inputTuple := td.EnsureTuple()
+		partitionKey := w.KeyFn(inputTuple)
 		partitionDeltas[partitionKey] = append(partitionDeltas[partitionKey], td)
 	}
 
@@ -1833,7 +1863,7 @@ func (w *WindowAggOp) getOrCreatePartitionBuffer(key any) *PartitionBuffer {
 	}
 	buffer, ok := w.PartitionBuffers[key]
 	if !ok {
-		buffer = &PartitionBuffer{Rows: []RowWithOrder{}, rowIndex: make(map[string]int)}
+		buffer = &PartitionBuffer{Rows: []RowWithOrder{}, rowIndex: make(map[uint64][]int)}
 		w.PartitionBuffers[key] = buffer
 	}
 	return buffer
@@ -1845,18 +1875,18 @@ func (pb *PartitionBuffer) addRow(td types.TupleDelta, orderByCol string) {
 }
 
 func (pb *PartitionBuffer) addRowTracked(td types.TupleDelta, orderByCol string) (affectedIndex int, appended bool) {
-	orderValue := td.Tuple[orderByCol]
+	inputTuple := td.EnsureTuple()
+	orderValue := inputTuple[orderByCol]
 
-	idx, start, end := pb.findRow(orderValue, td.Tuple)
+	idx, start, end := pb.findRow(orderValue, inputTuple, td.Packed)
 
 	if idx >= 0 {
 		// Update existing row
 		pb.Rows[idx].Count += td.Count
 		if pb.Rows[idx].Count == 0 {
 			// Remove row
-			delete(pb.rowIndex, pb.Rows[idx].TupleKey)
 			pb.Rows = append(pb.Rows[:idx], pb.Rows[idx+1:]...)
-			pb.shiftRowIndexes(idx, -1)
+			pb.invalidateRowIndex()
 		}
 		return idx, false
 	} else if td.Count > 0 {
@@ -1864,13 +1894,16 @@ func (pb *PartitionBuffer) addRowTracked(td types.TupleDelta, orderByCol string)
 		// Insert new row
 		newRow := RowWithOrder{
 			OrderValue: orderValue,
-			Tuple:      td.Tuple,
-			TupleKey:   stableTupleKeyCanonical(td.Tuple),
+			Tuple:      inputTuple,
+			Packed:     types.ClonePackedTuple(td.Packed),
+			RowHash:    rowIdentityHash(inputTuple, td.Packed),
 			Count:      td.Count,
 		}
 		if canAppend {
 			pb.Rows = append(pb.Rows, newRow)
-			pb.rowIndex[newRow.TupleKey] = len(pb.Rows) - 1
+			if pb.rowIndex != nil {
+				pb.rowIndex[newRow.RowHash] = append(pb.rowIndex[newRow.RowHash], len(pb.Rows)-1)
+			}
 			return len(pb.Rows) - 1, true
 		}
 		insertAt := end
@@ -1880,11 +1913,24 @@ func (pb *PartitionBuffer) addRowTracked(td types.TupleDelta, orderByCol string)
 		pb.Rows = append(pb.Rows, RowWithOrder{})
 		copy(pb.Rows[insertAt+1:], pb.Rows[insertAt:])
 		pb.Rows[insertAt] = newRow
-		pb.rowIndex[newRow.TupleKey] = insertAt
-		pb.shiftRowIndexes(insertAt+1, 1)
+		pb.invalidateRowIndex()
 		return insertAt, false
 	}
 	return len(pb.Rows), false
+}
+
+func rowIdentityHash(tuple types.Tuple, packed *types.PackedTuple) uint64 {
+	if packed != nil {
+		return stablePackedTupleOrderHash(packed)
+	}
+	return stableTupleOrderHash(tuple)
+}
+
+func rowMatchesInput(row RowWithOrder, tuple types.Tuple, packed *types.PackedTuple) bool {
+	if row.Packed != nil && packed != nil {
+		return packedTuplesEqual(row.Packed, packed)
+	}
+	return types.TuplesEqual(row.Tuple, tuple)
 }
 
 // computeFrameAggregates computes aggregates for all rows in the partition
@@ -1955,13 +2001,16 @@ func (w *WindowAggOp) computeCumulativeFrameAggregates(buffer *PartitionBuffer, 
 			aggState, outDelta = w.AggFn.Apply(aggState, types.TupleDelta{Tuple: row.Tuple, Count: 1})
 			_ = outDelta
 		}
-		out = append(out, types.TupleDelta{Tuple: w.buildFrameResultTuple(row, aggState), Count: row.Count})
+		out = append(out, w.buildFrameResultDelta(row, aggState))
 	}
 
 	return out, nil
 }
 
-func (w *WindowAggOp) buildFrameResultTuple(row RowWithOrder, aggState any) types.Tuple {
+func (w *WindowAggOp) buildFrameResultDelta(row RowWithOrder, aggState any) types.TupleDelta {
+	if row.Packed != nil {
+		return types.TupleDelta{Packed: row.Packed.WithExtras(w.aggValueTuple(aggState)), Count: row.Count}
+	}
 	resultTuple := make(types.Tuple, len(row.Tuple)+len(w.GroupKeys)+1)
 	for k, v := range row.Tuple {
 		resultTuple[k] = v
@@ -1972,7 +2021,7 @@ func (w *WindowAggOp) buildFrameResultTuple(row RowWithOrder, aggState any) type
 			resultTuple[col] = row.Tuple[col]
 		}
 	}
-	return resultTuple
+	return types.TupleDelta{Tuple: resultTuple, Count: row.Count}
 }
 
 func cloneCumulativeAggState(state any) any {
@@ -2074,8 +2123,8 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 				currentState, outDelta = w.AggFn.Apply(currentState, types.TupleDelta{Tuple: row.Tuple, Count: 1})
 				_ = outDelta
 			}
-			td := types.TupleDelta{Tuple: w.buildFrameResultTuple(row, currentState), Count: row.Count}
-			partitionOut[w.frameRowKey(td.Tuple)] = td
+			td := w.buildFrameResultDelta(row, currentState)
+			partitionOut[w.frameTupleDeltaKey(td)] = td
 			tailOutput = td
 			out = append(out, td)
 		}
@@ -2102,26 +2151,26 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 			currentState, outDelta = w.AggFn.Apply(currentState, types.TupleDelta{Tuple: row.Tuple, Count: 1})
 			_ = outDelta
 		}
-		newTail := types.TupleDelta{Tuple: w.buildFrameResultTuple(row, currentState), Count: row.Count}
+		newTail := w.buildFrameResultDelta(row, currentState)
 		oldTail := cache.tailOutput
-		oldKey := w.frameRowKey(oldTail.Tuple)
-		newKey := w.frameRowKey(newTail.Tuple)
+		oldKey := w.frameTupleDeltaKey(oldTail)
+		newKey := w.frameTupleDeltaKey(newTail)
 		var out types.Batch
-		if oldTail.Tuple != nil {
+		if oldTail.Tuple != nil || oldTail.Packed != nil {
 			if oldKey != newKey {
 				delete(partitionOut, oldKey)
-				out = append(out, types.TupleDelta{Tuple: oldTail.Tuple, Count: -oldTail.Count})
+				out = append(out, negateTupleDelta(oldTail))
 				partitionOut[newKey] = newTail
 				out = append(out, newTail)
-			} else if !types.TuplesEqual(oldTail.Tuple, newTail.Tuple) {
+			} else if !tupleDeltaPayloadEqual(oldTail, newTail) {
 				partitionOut[newKey] = newTail
-				out = append(out, types.TupleDelta{Tuple: oldTail.Tuple, Count: -oldTail.Count})
+				out = append(out, negateTupleDelta(oldTail))
 				out = append(out, newTail)
 			} else if newTail.Count != oldTail.Count {
 				partitionOut[newKey] = newTail
 				diff := newTail.Count - oldTail.Count
 				if diff != 0 {
-					out = append(out, types.TupleDelta{Tuple: newTail.Tuple, Count: diff})
+					out = append(out, types.TupleDelta{Tuple: newTail.Tuple, Packed: newTail.Packed, Count: diff})
 				}
 			}
 		} else {
@@ -2150,8 +2199,8 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 			currentState, outDelta = w.AggFn.Apply(currentState, types.TupleDelta{Tuple: row.Tuple, Count: 1})
 			_ = outDelta
 		}
-		td := types.TupleDelta{Tuple: w.buildFrameResultTuple(row, currentState), Count: row.Count}
-		newMap[w.frameRowKey(td.Tuple)] = td
+		td := w.buildFrameResultDelta(row, currentState)
+		newMap[w.frameTupleDeltaKey(td)] = td
 		tailOutput = td
 	}
 
@@ -2159,18 +2208,18 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 	for key, oldTd := range oldMap {
 		newTd, ok := newMap[key]
 		if !ok {
-			out = append(out, types.TupleDelta{Tuple: oldTd.Tuple, Count: -oldTd.Count})
+			out = append(out, negateTupleDelta(oldTd))
 			continue
 		}
-		if !types.TuplesEqual(oldTd.Tuple, newTd.Tuple) {
-			out = append(out, types.TupleDelta{Tuple: oldTd.Tuple, Count: -oldTd.Count})
+		if !tupleDeltaPayloadEqual(oldTd, newTd) {
+			out = append(out, negateTupleDelta(oldTd))
 			out = append(out, newTd)
 			continue
 		}
 		if newTd.Count != oldTd.Count {
 			diff := newTd.Count - oldTd.Count
 			if diff != 0 {
-				out = append(out, types.TupleDelta{Tuple: newTd.Tuple, Count: diff})
+				out = append(out, types.TupleDelta{Tuple: newTd.Tuple, Packed: newTd.Packed, Count: diff})
 			}
 		}
 	}
@@ -2190,6 +2239,49 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 	cache.tailState = cloneCumulativeAggState(currentState)
 	cache.tailOutput = tailOutput
 	return out, nil
+}
+
+func (w *WindowAggOp) frameTupleDeltaKey(td types.TupleDelta) string {
+	if len(w.frameKeyColumnsForRows()) == 0 {
+		return ""
+	}
+	keyTuple := make(types.Tuple, len(w.frameKeyColumnsForRows()))
+	for _, col := range w.frameKeyColumnsForRows() {
+		if value, ok := td.Get(col); ok {
+			keyTuple[col] = value
+		}
+	}
+	return stableTupleKeyForColumns(keyTuple, w.frameKeyColumnsForRows())
+}
+
+func negateTupleDelta(td types.TupleDelta) types.TupleDelta {
+	return types.TupleDelta{Tuple: td.Tuple, Packed: td.Packed, Count: -td.Count}
+}
+
+func tupleDeltaPayloadEqual(left, right types.TupleDelta) bool {
+	if left.Packed != nil || right.Packed != nil {
+		return packedTuplesEqual(left.Packed, right.Packed)
+	}
+	return types.TuplesEqual(left.Tuple, right.Tuple)
+}
+
+func packedTuplesEqual(left, right *types.PackedTuple) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	if !packedRowsEqualIgnoringExtras(left, right) {
+		return false
+	}
+	if len(left.Extras) != len(right.Extras) {
+		return false
+	}
+	for key, value := range left.Extras {
+		other, ok := right.Extras[key]
+		if !ok || !types.EqualAny(value, other) {
+			return false
+		}
+	}
+	return true
 }
 
 // getFrameRows returns rows within the frame for the given row index

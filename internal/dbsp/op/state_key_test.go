@@ -43,3 +43,27 @@ func TestStableTupleKeyCanonicalCachesColumnOrder(t *testing.T) {
 		t.Fatalf("unexpected second tuple key: %q", second)
 	}
 }
+
+func TestCompactAnyOrderKeyUsesStableTupleHash(t *testing.T) {
+	first := compactAnyOrderKey(types.Tuple{"b": 2, "a": "x"})
+	second := compactAnyOrderKey(types.Tuple{"a": "x", "b": 2})
+	third := compactAnyOrderKey(types.Tuple{"a": "x", "b": 3})
+	if first != second {
+		t.Fatalf("expected equal tuple content to produce same compact order key: %q vs %q", first, second)
+	}
+	if first == third {
+		t.Fatalf("expected different tuple content to produce different compact order keys: %q", first)
+	}
+	if len(first) != 18 || first[:2] != "h:" {
+		t.Fatalf("expected compact tuple hash key, got %q", first)
+	}
+}
+
+func TestCompactAnyOrderKeyDistinguishesPackedMissingFromNull(t *testing.T) {
+	schema := types.NewPackedSchema([]string{"timestamp"})
+	presentNull := compactAnyOrderKey(types.NewPackedTupleWithPresence(schema, []any{nil}, []bool{true}))
+	missing := compactAnyOrderKey(types.NewPackedTupleWithPresence(schema, []any{nil}, []bool{false}))
+	if presentNull == missing {
+		t.Fatalf("expected packed hash to distinguish present null from missing field: %q", presentNull)
+	}
+}

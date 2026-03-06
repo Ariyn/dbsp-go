@@ -3,9 +3,11 @@ package op
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
+	"github.com/ariyn/dbsp/internal/metrics"
 )
 
 type joinEntry struct {
@@ -48,7 +50,11 @@ type BinaryOp struct {
 	JoinTTL time.Duration
 
 	// Now is used for TTL; defaults to time.Now when nil.
-	Now func() time.Time
+	Now              func() time.Time
+	ttlCheckInterval time.Duration
+	nextTTLCheck     time.Time
+	leftTTLExpiry    ttlExpiryQueue
+	rightTTLExpiry   ttlExpiryQueue
 
 	// Optional backend-based join state storage (Unit 3).
 	// When nil, join state uses in-memory maps (existing behavior).
@@ -260,7 +266,7 @@ func (b *BinaryOp) joinBackendEnabled() bool {
 	return b != nil && b.Type == BinaryJoin && b.joinStateBackend != nil
 }
 
-func (b *BinaryOp) applyDeltaToJoinState(state map[any]joinBucket, key any, td types.TupleDelta, now time.Time) error {
+func (b *BinaryOp) applyDeltaToJoinState(state map[any]joinBucket, ttlExpiry *ttlExpiryQueue, key any, td types.TupleDelta, now time.Time) error {
 	bucket, ok := state[key]
 	if !ok {
 		bucket = make(joinBucket)
@@ -279,6 +285,9 @@ func (b *BinaryOp) applyDeltaToJoinState(state map[any]joinBucket, key any, td t
 
 	entry.count += td.Count
 	if entry.count == 0 {
+		if ttlExpiry != nil {
+			ttlExpiry.remove(joinStateEntryID(key, tk))
+		}
 		delete(bucket, tk)
 		if len(bucket) == 0 {
 			delete(state, key)
@@ -294,6 +303,9 @@ func (b *BinaryOp) applyDeltaToJoinState(state map[any]joinBucket, key any, td t
 
 	if b.JoinTTL > 0 && td.Count > 0 {
 		entry.expiresAt = now.Add(b.JoinTTL)
+		if ttlExpiry != nil {
+			ttlExpiry.touch(joinStateEntryID(key, tk), entry.expiresAt)
+		}
 	}
 
 	return nil
@@ -305,50 +317,67 @@ func (b *BinaryOp) evictExpiredJoinState(now time.Time) (types.Batch, error) {
 	}
 
 	var out types.Batch
-
-	// Evict left first (retract joins against current right), then evict right.
-	for key, leftBucket := range b.leftState {
-		for tk, le := range leftBucket {
-			if le.expiresAt.IsZero() || now.Before(le.expiresAt) {
-				continue
-			}
-			// Retract joins produced by this left tuple(s).
-			if rightBucket, ok := b.rightState[key]; ok {
-				for _, re := range rightBucket {
-					count := -(le.count * re.count)
-					if count != 0 {
-						out = append(out, types.TupleDelta{Tuple: b.CombineFn(le.tuple, re.tuple), Count: count})
-					}
+	if err := b.leftTTLExpiry.popExpired(now, func(id string) error {
+		key, tupleKey, ok := parseJoinStateEntryID(id)
+		if !ok {
+			return nil
+		}
+		leftBucket, ok := b.leftState[key]
+		if !ok {
+			return nil
+		}
+		le, ok := leftBucket[tupleKey]
+		if !ok {
+			return nil
+		}
+		if rightBucket, ok := b.rightState[key]; ok {
+			for _, re := range rightBucket {
+				count := -(le.count * re.count)
+				if count != 0 {
+					out = append(out, types.TupleDelta{Tuple: b.CombineFn(le.tuple, re.tuple), Count: count})
 				}
 			}
-			delete(leftBucket, tk)
 		}
+		delete(leftBucket, tupleKey)
 		if len(leftBucket) == 0 {
 			delete(b.leftState, key)
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
-	for key, rightBucket := range b.rightState {
-		for tk, re := range rightBucket {
-			if re.expiresAt.IsZero() || now.Before(re.expiresAt) {
-				continue
-			}
-			// Retract joins produced by this right tuple(s) against remaining left.
-			if leftBucket, ok := b.leftState[key]; ok {
-				for _, le := range leftBucket {
-					count := -(le.count * re.count)
-					if count != 0 {
-						out = append(out, types.TupleDelta{Tuple: b.CombineFn(le.tuple, re.tuple), Count: count})
-					}
+	if err := b.rightTTLExpiry.popExpired(now, func(id string) error {
+		key, tupleKey, ok := parseJoinStateEntryID(id)
+		if !ok {
+			return nil
+		}
+		rightBucket, ok := b.rightState[key]
+		if !ok {
+			return nil
+		}
+		re, ok := rightBucket[tupleKey]
+		if !ok {
+			return nil
+		}
+		if leftBucket, ok := b.leftState[key]; ok {
+			for _, le := range leftBucket {
+				count := -(le.count * re.count)
+				if count != 0 {
+					out = append(out, types.TupleDelta{Tuple: b.CombineFn(le.tuple, re.tuple), Count: count})
 				}
 			}
-			delete(rightBucket, tk)
 		}
+		delete(rightBucket, tupleKey)
 		if len(rightBucket) == 0 {
 			delete(b.rightState, key)
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
+	metrics.ObserveOperatorState("BinaryJoinOp", b.stateEntryCount())
 	return out, nil
 }
 
@@ -533,7 +562,7 @@ func (b *BinaryOp) applyJoinWithBackend(leftDelta, rightDelta types.Batch) (type
 	var out types.Batch
 	now := b.now()
 
-	if b.JoinTTL > 0 {
+	if shouldRunTTLCheck(&b.nextTTLCheck, now, b.JoinTTL, b.ttlCheckInterval) {
 		evicted, err := b.evictExpiredJoinStateBackend(now)
 		if err != nil {
 			return nil, err
@@ -648,7 +677,7 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 	var out types.Batch
 
 	now := b.now()
-	if b.JoinTTL > 0 {
+	if shouldRunTTLCheck(&b.nextTTLCheck, now, b.JoinTTL, b.ttlCheckInterval) {
 		evicted, err := b.evictExpiredJoinState(now)
 		if err != nil {
 			return nil, err
@@ -731,7 +760,7 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 		if key == nil {
 			continue
 		}
-		if err := b.applyDeltaToJoinState(b.leftState, key, ld, now); err != nil {
+		if err := b.applyDeltaToJoinState(b.leftState, &b.leftTTLExpiry, key, ld, now); err != nil {
 			return nil, err
 		}
 	}
@@ -740,12 +769,43 @@ func (b *BinaryOp) applyJoin(leftDelta, rightDelta types.Batch) (types.Batch, er
 		if key == nil {
 			continue
 		}
-		if err := b.applyDeltaToJoinState(b.rightState, key, rd, now); err != nil {
+		if err := b.applyDeltaToJoinState(b.rightState, &b.rightTTLExpiry, key, rd, now); err != nil {
 			return nil, err
 		}
 	}
 
+	metrics.ObserveOperatorState("BinaryJoinOp", b.stateEntryCount())
 	return out, nil
+}
+
+func (b *BinaryOp) stateEntryCount() int {
+	if b == nil || b.Type != BinaryJoin {
+		return 0
+	}
+	count := 0
+	for _, bucket := range b.leftState {
+		count += len(bucket)
+	}
+	for _, bucket := range b.rightState {
+		count += len(bucket)
+	}
+	return count
+}
+
+func joinStateEntryID(key any, tupleKey string) string {
+	return stableAnyKey(key) + "\x00" + tupleKey
+}
+
+func parseJoinStateEntryID(id string) (any, string, bool) {
+	encodedKey, tupleKey, ok := strings.Cut(id, "\x00")
+	if !ok {
+		return nil, "", false
+	}
+	key, err := decodeAnyKey(encodedKey)
+	if err != nil {
+		key = encodedKey
+	}
+	return key, tupleKey, true
 }
 
 // applyUnion implements multiset union (simply combines both delta batches).

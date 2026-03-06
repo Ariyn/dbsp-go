@@ -18,6 +18,7 @@ type collectorSet struct {
 	operatorRowsTotal     *prometheus.CounterVec
 	operatorAppendTotal   *prometheus.CounterVec
 	operatorOutputTotal   *prometheus.CounterVec
+	operatorStateEntries  *prometheus.GaugeVec
 }
 
 var (
@@ -38,6 +39,11 @@ func ObservePipelineBatch(inRows, outRows int, nextDur, execDur, sinkDur, ackDur
 func ObserveOperatorBatch(label string, inRows, outRows, distinctOutRows, appendHits, appendMisses int) {
 	collectors := ensureDefaultCollectors()
 	collectors.observeOperatorBatch(label, inRows, outRows, distinctOutRows, appendHits, appendMisses)
+}
+
+func ObserveOperatorState(label string, stateEntries int) {
+	collectors := ensureDefaultCollectors()
+	collectors.observeOperatorState(label, stateEntries)
 }
 
 func ensureDefaultCollectors() *collectorSet {
@@ -99,6 +105,12 @@ func newCollectorSet(registerer prometheus.Registerer) *collectorSet {
 			Name:      "output_rows_total",
 			Help:      "Total number of distinct and repeated operator output rows.",
 		}, []string{"operator", "kind"}),
+		operatorStateEntries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "dbsp",
+			Subsystem: "operator",
+			Name:      "state_entries",
+			Help:      "Current number of retained state entries per operator.",
+		}, []string{"operator"}),
 	}
 	registerer.MustRegister(
 		collectors.pipelineBatches,
@@ -109,6 +121,7 @@ func newCollectorSet(registerer prometheus.Registerer) *collectorSet {
 		collectors.operatorRowsTotal,
 		collectors.operatorAppendTotal,
 		collectors.operatorOutputTotal,
+		collectors.operatorStateEntries,
 	)
 	return collectors
 }
@@ -142,4 +155,11 @@ func (c *collectorSet) observeOperatorBatch(label string, inRows, outRows, disti
 	if appendMisses > 0 {
 		c.operatorAppendTotal.WithLabelValues(label, "miss").Add(float64(appendMisses))
 	}
+}
+
+func (c *collectorSet) observeOperatorState(label string, stateEntries int) {
+	if stateEntries < 0 {
+		stateEntries = 0
+	}
+	c.operatorStateEntries.WithLabelValues(label).Set(float64(stateEntries))
 }

@@ -144,7 +144,7 @@ func validateMinimalContract(cfg *config.PipelineConfig) error {
 }
 
 func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig) error {
-	query, rootNode, requiredFields, err := compileTransform(cfg)
+	query, rootNode, requiredFields, requiredFieldHints, err := compileTransform(cfg)
 	if err != nil {
 		return err
 	}
@@ -161,8 +161,11 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig) error {
 	} else if ttl > 0 {
 		op.ApplyStateTTL(rootNode, ttl)
 	}
+	if cfg.Pipeline.State.OnlyLastLag {
+		op.ApplyOnlyLastLag(rootNode, true)
+	}
 
-	src, err := newSource(cfg, requiredFields)
+	src, err := newSource(cfg, requiredFields, requiredFieldHints)
 	if err != nil {
 		return fmt.Errorf("initializing source: %w", err)
 	}
@@ -230,11 +233,12 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig) error {
 	return nil
 }
 
-func newSource(cfg *config.PipelineConfig, requiredFields map[string]struct{}) (provider.Source, error) {
+func newSource(cfg *config.PipelineConfig, requiredFields map[string]struct{}, requiredFieldHints map[string]string) (provider.Source, error) {
 	var httpCfg config.HTTPSourceConfig
 	if err := config.DecodeTo(cfg.Pipeline.Source.Config, &httpCfg); err != nil {
 		return nil, fmt.Errorf("failed to decode http source config: %w", err)
 	}
+	httpCfg.Schema = mergeSourceSchemaHints(httpCfg.Schema, requiredFieldHints)
 	return source.NewHTTPSource(httpCfg, requiredFields)
 }
 
@@ -250,13 +254,13 @@ func newSink(cfg *config.PipelineConfig, rootNode *op.Node, parquetSchema *confi
 	return baseSink, nil
 }
 
-func compileTransform(cfg *config.PipelineConfig) (string, *op.Node, map[string]struct{}, error) {
+func compileTransform(cfg *config.PipelineConfig) (string, *op.Node, map[string]struct{}, map[string]string, error) {
 	if cfg.Pipeline.Transform.Type != "sql" {
-		return "", nil, nil, fmt.Errorf("unsupported transform type: %s", cfg.Pipeline.Transform.Type)
+		return "", nil, nil, nil, fmt.Errorf("unsupported transform type: %s", cfg.Pipeline.Transform.Type)
 	}
 	query := strings.TrimSpace(cfg.Pipeline.Transform.Query)
 	if query == "" {
-		return "", nil, nil, fmt.Errorf("transform query is empty")
+		return "", nil, nil, nil, fmt.Errorf("transform query is empty")
 	}
 
 	var options []sqlconv.ComplianceOption
@@ -269,22 +273,44 @@ func compileTransform(cfg *config.PipelineConfig) (string, *op.Node, map[string]
 
 	logicalPlan, err := sqlconv.ParseQueryToLogicalPlan(query, options...)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("compiling SQL query: %w", err)
+		return "", nil, nil, nil, fmt.Errorf("compiling SQL query: %w", err)
 	}
 
 	rootNode, err := compileIncrementalQuery(query, options...)
 	if err != nil {
-		return "", nil, nil, fmt.Errorf("compiling SQL query: %w", err)
+		return "", nil, nil, nil, fmt.Errorf("compiling SQL query: %w", err)
 	}
 	requiredFields := ir.CollectRequiredInputColumns(logicalPlan)
+	requiredFieldHints := ir.CollectRequiredInputTypeHints(logicalPlan)
 	if strings.TrimSpace(os.Getenv("DBSP_DEBUG_FIELDS")) != "" {
 		if requiredFields == nil {
 			fmt.Println("DEBUG requiredFields: <all>")
 		} else {
 			fmt.Printf("DEBUG requiredFields (%d): %v\n", len(requiredFields), requiredFields)
 		}
+		if len(requiredFieldHints) == 0 {
+			fmt.Println("DEBUG requiredFieldHints: <empty>")
+		} else {
+			fmt.Printf("DEBUG requiredFieldHints (%d): %v\n", len(requiredFieldHints), requiredFieldHints)
+		}
 	}
-	return query, rootNode, requiredFields, nil
+	return query, rootNode, requiredFields, requiredFieldHints, nil
+}
+
+func mergeSourceSchemaHints(schema map[string]string, hints map[string]string) map[string]string {
+	if len(hints) == 0 {
+		return schema
+	}
+	merged := make(map[string]string, len(schema)+len(hints))
+	for name, typ := range schema {
+		merged[name] = typ
+	}
+	for name, typ := range hints {
+		if _, exists := merged[name]; !exists {
+			merged[name] = typ
+		}
+	}
+	return merged
 }
 
 func validatePartitionColumns(schema *config.ParquetSchema, partitionBy []string) error {

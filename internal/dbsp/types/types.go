@@ -14,14 +14,261 @@ import (
 // Tuple represents a row as a map from column name to value.
 type Tuple map[string]any
 
+type PackedSchema struct {
+	Columns []string
+	index   map[string]int
+}
+
+type PackedTuple struct {
+	Schema  *PackedSchema
+	Values  []any
+	Present []bool
+	Extras  Tuple
+}
+
 // TupleDelta represents a change to a tuple: Count +1 insert, -1 delete
 type TupleDelta struct {
-	Tuple Tuple
-	Count int64
+	Tuple  Tuple
+	Packed *PackedTuple
+	Count  int64
 }
 
 // Batch is a collection of TupleDelta items (a delta-batch)
 type Batch []TupleDelta
+
+func NewPackedSchema(columns []string) *PackedSchema {
+	if len(columns) == 0 {
+		return nil
+	}
+	index := make(map[string]int, len(columns))
+	cloned := make([]string, len(columns))
+	copy(cloned, columns)
+	for i, col := range cloned {
+		index[col] = i
+	}
+	return &PackedSchema{Columns: cloned, index: index}
+}
+
+func NewPackedTuple(schema *PackedSchema, values []any) *PackedTuple {
+	if schema == nil {
+		return nil
+	}
+	present := make([]bool, len(values))
+	for idx := range present {
+		present[idx] = true
+	}
+	return NewPackedTupleWithPresence(schema, values, present)
+}
+
+func NewPackedTupleWithPresence(schema *PackedSchema, values []any, present []bool) *PackedTuple {
+	if schema == nil {
+		return nil
+	}
+	cloned := make([]any, len(values))
+	copy(cloned, values)
+	var clonedPresent []bool
+	if len(present) > 0 {
+		clonedPresent = make([]bool, len(present))
+		copy(clonedPresent, present)
+	}
+	return &PackedTuple{Schema: schema, Values: cloned, Present: clonedPresent}
+}
+
+func (p *PackedTuple) Get(col string) (any, bool) {
+	if p == nil {
+		return nil, false
+	}
+	if p.Extras != nil {
+		if value, ok := p.Extras[col]; ok {
+			return value, true
+		}
+	}
+	if p.Schema == nil {
+		return nil, false
+	}
+	p.Schema.ensureIndex()
+	idx, ok := p.Schema.index[col]
+	if !ok || idx < 0 || idx >= len(p.Values) {
+		return nil, false
+	}
+	if len(p.Present) > 0 {
+		if idx >= len(p.Present) || !p.Present[idx] {
+			return nil, false
+		}
+		return p.Values[idx], true
+	}
+	value := p.Values[idx]
+	if value == nil {
+		return nil, false
+	}
+	return value, true
+}
+
+func (s *PackedSchema) ensureIndex() {
+	if s == nil || s.index != nil {
+		return
+	}
+	s.index = make(map[string]int, len(s.Columns))
+	for idx, col := range s.Columns {
+		s.index[col] = idx
+	}
+}
+
+func (p *PackedTuple) WithExtra(col string, value any) *PackedTuple {
+	if p == nil {
+		return nil
+	}
+	return p.WithExtras(Tuple{col: value})
+}
+
+func (p *PackedTuple) WithExtras(extras Tuple) *PackedTuple {
+	if p == nil {
+		return nil
+	}
+	out := &PackedTuple{Schema: p.Schema, Values: p.Values, Present: p.Present}
+	if len(p.Extras) == 0 && len(extras) == 0 {
+		return out
+	}
+	merged := make(Tuple, len(p.Extras)+len(extras))
+	for key, existing := range p.Extras {
+		merged[key] = existing
+	}
+	for key, value := range extras {
+		merged[key] = value
+	}
+	out.Extras = merged
+	return out
+}
+
+func (p *PackedTuple) Materialize() Tuple {
+	if p == nil {
+		return nil
+	}
+	baseLen := 0
+	if p.Schema != nil {
+		baseLen = len(p.Schema.Columns)
+	}
+	out := make(Tuple, baseLen+len(p.Extras))
+	if p.Schema != nil {
+		for idx, col := range p.Schema.Columns {
+			if idx >= len(p.Values) {
+				break
+			}
+			if len(p.Present) > 0 {
+				if idx >= len(p.Present) || !p.Present[idx] {
+					continue
+				}
+				out[col] = p.Values[idx]
+				continue
+			}
+			if value := p.Values[idx]; value != nil {
+				out[col] = value
+			}
+		}
+	}
+	for key, value := range p.Extras {
+		out[key] = value
+	}
+	return out
+}
+
+func (p *PackedTuple) Clone() *PackedTuple {
+	if p == nil {
+		return nil
+	}
+	out := &PackedTuple{Schema: p.Schema, Values: p.Values, Present: p.Present}
+	if len(p.Extras) > 0 {
+		extra := make(Tuple, len(p.Extras))
+		for key, value := range p.Extras {
+			extra[key] = value
+		}
+		out.Extras = extra
+	}
+	return out
+}
+
+func (p *PackedTuple) Project(columns []string) *PackedTuple {
+	if p == nil {
+		return nil
+	}
+	if len(columns) == 0 {
+		return &PackedTuple{Schema: NewPackedSchema(nil)}
+	}
+	baseColumns := make([]string, 0, len(columns))
+	values := make([]any, 0, len(columns))
+	present := make([]bool, 0, len(columns))
+	var extras Tuple
+	for _, col := range columns {
+		if p.Schema != nil {
+			p.Schema.ensureIndex()
+			if idx, ok := p.Schema.index[col]; ok {
+				baseColumns = append(baseColumns, col)
+				if idx < len(p.Values) {
+					values = append(values, p.Values[idx])
+				} else {
+					values = append(values, nil)
+				}
+				if len(p.Present) > 0 && idx < len(p.Present) {
+					present = append(present, p.Present[idx])
+				} else {
+					present = append(present, idx < len(p.Values))
+				}
+				continue
+			}
+		}
+		if value, ok := p.Get(col); ok {
+			if extras == nil {
+				extras = make(Tuple)
+			}
+			extras[col] = value
+		}
+	}
+	projected := NewPackedTupleWithPresence(NewPackedSchema(baseColumns), values, present)
+	if projected == nil {
+		if len(extras) == 0 {
+			return nil
+		}
+		return &PackedTuple{Extras: extras}
+	}
+	projected.Extras = extras
+	return projected
+}
+
+func (td *TupleDelta) Get(col string) (any, bool) {
+	if td == nil {
+		return nil, false
+	}
+	if td.Tuple != nil {
+		value, ok := td.Tuple[col]
+		return value, ok
+	}
+	if td.Packed != nil {
+		return td.Packed.Get(col)
+	}
+	return nil, false
+}
+
+func (td *TupleDelta) EnsureTuple() Tuple {
+	if td == nil {
+		return nil
+	}
+	if td.Tuple != nil {
+		return td.Tuple
+	}
+	if td.Packed == nil {
+		return nil
+	}
+	td.Tuple = td.Packed.Materialize()
+	return td.Tuple
+}
+
+func MaterializeBatch(batch Batch) Batch {
+	for idx := range batch {
+		batch[idx].EnsureTuple()
+		batch[idx].Packed = nil
+	}
+	return batch
+}
 
 // Interval represents a time duration in milliseconds
 type Interval struct {
@@ -228,6 +475,13 @@ func CloneTuple(t Tuple) Tuple {
 	return out
 }
 
+func ClonePackedTuple(p *PackedTuple) *PackedTuple {
+	if p == nil {
+		return nil
+	}
+	return p.Clone()
+}
+
 // CloneConfigMap returns a shallow copy of a configuration map.
 func CloneConfigMap(in map[string]any) map[string]any {
 	if in == nil {
@@ -247,7 +501,7 @@ func CloneBatch(b Batch) Batch {
 	}
 	out := make(Batch, 0, len(b))
 	for _, td := range b {
-		out = append(out, TupleDelta{Tuple: CloneTuple(td.Tuple), Count: td.Count})
+		out = append(out, TupleDelta{Tuple: CloneTuple(td.Tuple), Packed: ClonePackedTuple(td.Packed), Count: td.Count})
 	}
 	return out
 }

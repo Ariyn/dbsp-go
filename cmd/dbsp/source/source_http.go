@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ type HTTPSource struct {
 	fieldSpecs      []fieldSpec
 	fieldSpecsByLen map[int][]fieldSpec
 	fieldSpecMap    map[string]fieldSpec
+	packedSchema    *types.PackedSchema
 	done            chan struct{}
 	once            sync.Once
 	queueMu         sync.Mutex
@@ -66,6 +68,7 @@ type fieldSpec struct {
 	keyBytes []byte
 	typeName string
 	typeKind fieldTypeKind
+	slot     int
 }
 
 func NewHTTPSource(httpConfig config.HTTPSourceConfig, requiredFields map[string]struct{}) (*HTTPSource, error) {
@@ -119,6 +122,13 @@ func NewHTTPSource(httpConfig config.HTTPSourceConfig, requiredFields map[string
 		timestampUnit:   httpConfig.TimestampUnit,
 		walAvailable:    make(chan struct{}, 1),
 		walBufferLimit:  httpConfig.BufferSize,
+	}
+	if shouldUsePackedSchema(effectiveRequired) {
+		columns := make([]string, 0, len(s.fieldSpecs))
+		for _, spec := range s.fieldSpecs {
+			columns = append(columns, spec.name)
+		}
+		s.packedSchema = types.NewPackedSchema(columns)
 	}
 
 	if httpConfig.WALDir != "" {
@@ -318,20 +328,31 @@ func (s *HTTPSource) parseRequestBodyBytes(body []byte) (types.Batch, error) {
 
 func (s *HTTPSource) decodeObjectBytes(body []byte) (types.TupleDelta, bool, error) {
 	var tuple types.Tuple
+	var packedValues []any
+	var packedPresent []bool
+	if s.packedSchema != nil {
+		packedValues = make([]any, len(s.packedSchema.Columns))
+		packedPresent = make([]bool, len(s.packedSchema.Columns))
+	}
 	remaining := len(s.requiredFields)
 	err := jsonparser.ObjectEach(body, func(key []byte, value []byte, dataType jsonparser.ValueType, offset int) error {
 		spec, ok := s.matchField(key)
 		if !ok {
 			return nil
 		}
-		if tuple == nil {
+		if tuple == nil && packedValues == nil {
 			tuple = make(types.Tuple, s.estimatedTupleCapacity())
 		}
 		decoded, err := s.decodeFieldBytes(spec, value, dataType)
 		if err != nil {
 			return err
 		}
-		tuple[spec.name] = decoded
+		if packedValues != nil {
+			packedValues[spec.slot] = decoded
+			packedPresent[spec.slot] = true
+		} else {
+			tuple[spec.name] = decoded
+		}
 		if remaining > 0 {
 			remaining--
 			if remaining == 0 {
@@ -342,12 +363,18 @@ func (s *HTTPSource) decodeObjectBytes(body []byte) (types.TupleDelta, bool, err
 	})
 	if err != nil {
 		if errors.Is(err, errStopObjectDecode) {
+			if packedValues != nil {
+				return types.TupleDelta{Packed: types.NewPackedTupleWithPresence(s.packedSchema, packedValues, packedPresent), Count: 1}, true, nil
+			}
 			return types.TupleDelta{Tuple: tuple, Count: 1}, true, nil
 		}
 		return types.TupleDelta{}, false, fmt.Errorf("Invalid JSON")
 	}
-	if tuple == nil {
+	if tuple == nil && packedValues == nil {
 		return types.TupleDelta{}, false, nil
+	}
+	if packedValues != nil {
+		return types.TupleDelta{Packed: types.NewPackedTupleWithPresence(s.packedSchema, packedValues, packedPresent), Count: 1}, true, nil
 	}
 	return types.TupleDelta{Tuple: tuple, Count: 1}, true, nil
 }
@@ -369,16 +396,26 @@ func buildFieldSpecs(requiredFields map[string]struct{}, schema map[string]strin
 	if len(requiredFields) == 0 {
 		return nil
 	}
-	specs := make([]fieldSpec, 0, len(requiredFields))
+	names := make([]string, 0, len(requiredFields))
 	for name := range requiredFields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	specs := make([]fieldSpec, 0, len(requiredFields))
+	for idx, name := range names {
 		specs = append(specs, fieldSpec{
 			name:     name,
 			keyBytes: []byte(name),
 			typeName: schema[name],
 			typeKind: parseFieldTypeKind(schema[name]),
+			slot:     idx,
 		})
 	}
 	return specs
+}
+
+func shouldUsePackedSchema(requiredFields map[string]struct{}) bool {
+	return len(requiredFields) > 0
 }
 
 func buildFieldSpecsByLen(requiredFields map[string]struct{}, schema map[string]string) map[int][]fieldSpec {
@@ -398,13 +435,8 @@ func buildFieldSpecMap(requiredFields map[string]struct{}, schema map[string]str
 		return nil
 	}
 	out := make(map[string]fieldSpec, len(requiredFields))
-	for name := range requiredFields {
-		out[name] = fieldSpec{
-			name:     name,
-			keyBytes: []byte(name),
-			typeName: schema[name],
-			typeKind: parseFieldTypeKind(schema[name]),
-		}
+	for _, spec := range buildFieldSpecs(requiredFields, schema) {
+		out[spec.name] = spec
 	}
 	return out
 }

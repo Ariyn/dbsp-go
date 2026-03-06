@@ -63,9 +63,10 @@ func newOperatorApplyProfile(label string) operatorApplyProfile {
 	}
 }
 
-func (p *operatorApplyProfile) observeBatch(inRows int, out types.Batch, appendHits, appendMisses int) {
+func (p *operatorApplyProfile) observeBatch(inRows int, out types.Batch, appendHits, appendMisses int, stateEntries int) {
 	distinctOutRows := distinctTupleCount(out)
 	metrics.ObserveOperatorBatch(p.label, inRows, len(out), distinctOutRows, appendHits, appendMisses)
+	metrics.ObserveOperatorState(p.label, stateEntries)
 	if p == nil || !p.enabled {
 		return
 	}

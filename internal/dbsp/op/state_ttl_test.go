@@ -14,6 +14,7 @@ func TestGroupAggStateTTL(t *testing.T) {
 		&SumAgg{ColName: "v"},
 	)
 	g.SetStateTTL(2 * time.Millisecond)
+	g.ttlCheckInterval = time.Millisecond
 
 	batch := types.Batch{{Tuple: types.Tuple{"k": "a", "v": 1.0}, Count: 1}}
 	if _, err := g.Apply(batch); err != nil {
@@ -32,6 +33,37 @@ func TestGroupAggStateTTL(t *testing.T) {
 	}
 }
 
+func TestGroupAggStateTTLEvictionIsThrottled(t *testing.T) {
+	g := NewGroupAggOp(
+		func(t types.Tuple) any { return t["k"] },
+		func() any { return float64(0) },
+		&SumAgg{ColName: "v"},
+	)
+	g.SetStateTTL(2 * time.Millisecond)
+	g.ttlCheckInterval = time.Second
+
+	batch := types.Batch{{Tuple: types.Tuple{"k": "a", "v": 1.0}, Count: 1}}
+	if _, err := g.Apply(batch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	if _, err := g.Apply(nil); err != nil {
+		t.Fatalf("apply without due ttl check: %v", err)
+	}
+	if got := len(g.State()); got != 1 {
+		t.Fatalf("expected throttled ttl check to keep state, got %d entries", got)
+	}
+
+	g.nextTTLCheck = time.Now().Add(-time.Millisecond)
+	if _, err := g.Apply(nil); err != nil {
+		t.Fatalf("apply with due ttl check: %v", err)
+	}
+	if got := len(g.State()); got != 0 {
+		t.Fatalf("expected state to be evicted once ttl check is due, got %d", got)
+	}
+}
+
 func TestWindowAggStateTTL(t *testing.T) {
 	agg := &SumAgg{ColName: "v"}
 	w := NewWindowAggOp(
@@ -42,6 +74,7 @@ func TestWindowAggStateTTL(t *testing.T) {
 		agg,
 	)
 	w.SetStateTTL(2 * time.Millisecond)
+	w.ttlCheckInterval = time.Millisecond
 
 	batch := types.Batch{{Tuple: types.Tuple{"k": "a", "ts": int64(1000), "v": 1.0}, Count: 1}}
 	if _, err := w.Apply(batch); err != nil {
@@ -67,6 +100,7 @@ func TestJoinStateTTL(t *testing.T) {
 		func(l, r types.Tuple) types.Tuple { return types.Tuple{"k": l["k"]} },
 	)
 	join.SetStateTTL(2 * time.Millisecond)
+	join.ttlCheckInterval = time.Millisecond
 
 	left := types.Batch{{Tuple: types.Tuple{"k": "a"}, Count: 1}}
 	right := types.Batch{{Tuple: types.Tuple{"k": "a"}, Count: 1}}
@@ -108,6 +142,7 @@ func TestApplyStateTTLPropagatesIntoChainedOp(t *testing.T) {
 	root := &Node{Op: &ChainedOp{Ops: []Operator{&MapOp{F: func(td types.TupleDelta) []types.TupleDelta { return []types.TupleDelta{td} }}, ordered}}}
 
 	ApplyStateTTL(root, 2*time.Millisecond)
+	ordered.ttlCheckInterval = time.Millisecond
 	if ordered.StateTTL != 2*time.Millisecond {
 		t.Fatalf("expected chained OrderedWindowOp TTL to be applied, got %v", ordered.StateTTL)
 	}

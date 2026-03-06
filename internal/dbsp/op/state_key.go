@@ -1,8 +1,11 @@
 package op
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -107,6 +110,130 @@ func stableAnyKeyFast(key any) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func compactAnyOrderKey(key any) string {
+	switch v := key.(type) {
+	case nil:
+		return "n:"
+	case string:
+		return "s:" + v
+	case bool:
+		return "b:" + strconv.FormatBool(v)
+	case int:
+		return "i:" + strconv.FormatInt(int64(v), 10)
+	case int8:
+		return "i:" + strconv.FormatInt(int64(v), 10)
+	case int16:
+		return "i:" + strconv.FormatInt(int64(v), 10)
+	case int32:
+		return "i:" + strconv.FormatInt(int64(v), 10)
+	case int64:
+		return "i:" + strconv.FormatInt(v, 10)
+	case uint:
+		return "u:" + strconv.FormatUint(uint64(v), 10)
+	case uint8:
+		return "u:" + strconv.FormatUint(uint64(v), 10)
+	case uint16:
+		return "u:" + strconv.FormatUint(uint64(v), 10)
+	case uint32:
+		return "u:" + strconv.FormatUint(uint64(v), 10)
+	case uint64:
+		return "u:" + strconv.FormatUint(v, 10)
+	case float32:
+		return "f:" + strconv.FormatFloat(float64(v), 'g', -1, 32)
+	case float64:
+		return "f:" + strconv.FormatFloat(v, 'g', -1, 64)
+	case time.Time:
+		return "t:" + v.UTC().Format(time.RFC3339Nano)
+	case types.Tuple:
+		return "h:" + stableTupleOrderHashHex(v)
+	case *types.PackedTuple:
+		return "h:" + stablePackedTupleOrderHashHex(v)
+	case map[string]any:
+		return "h:" + stableTupleOrderHashHex(types.Tuple(v))
+	default:
+		if fast, ok := stableAnyKeyFast(key); ok {
+			return fast
+		}
+		return stableAnyKey(key)
+	}
+}
+
+func stableTupleOrderHashHex(t types.Tuple) string {
+	var raw [8]byte
+	var encoded [16]byte
+	binary.BigEndian.PutUint64(raw[:], stableTupleOrderHash(t))
+	hex.Encode(encoded[:], raw[:])
+	return string(encoded[:])
+}
+
+func stablePackedTupleOrderHashHex(p *types.PackedTuple) string {
+	var raw [8]byte
+	var encoded [16]byte
+	binary.BigEndian.PutUint64(raw[:], stablePackedTupleOrderHash(p))
+	hex.Encode(encoded[:], raw[:])
+	return string(encoded[:])
+}
+
+func stableTupleOrderHash(t types.Tuple) uint64 {
+	if t == nil {
+		return 0
+	}
+	var columns []string
+	if cols, ok := loadCachedTupleColumns(t); ok {
+		columns = cols
+	} else {
+		columns = sortedTupleColumns(t)
+		tupleSchemaColumnsCache.Store(tupleSchemaSignatureForTuple(t), columns)
+	}
+	hash := uint64(1469598103934665603)
+	for _, col := range columns {
+		hashStableBytes(&hash, []byte(col))
+		hashStableByte(&hash, '=')
+		hashStableValue(&hash, t[col])
+		hashStableByte(&hash, '|')
+	}
+	return hash
+}
+
+func stablePackedTupleOrderHash(p *types.PackedTuple) uint64 {
+	if p == nil {
+		return 0
+	}
+	hash := uint64(1469598103934665603)
+	if p.Schema != nil {
+		for idx, col := range p.Schema.Columns {
+			hashStableBytes(&hash, []byte(col))
+			hashStableByte(&hash, '=')
+			present := idx < len(p.Present) && p.Present[idx]
+			hashStableByte(&hash, '0')
+			if present {
+				hash ^= 1
+			}
+			hash *= 1099511628211
+			if idx < len(p.Values) {
+				hashStableValue(&hash, p.Values[idx])
+			} else {
+				hashStableValue(&hash, nil)
+			}
+			hashStableByte(&hash, '|')
+		}
+	}
+	if len(p.Extras) > 0 {
+		extraCols := make([]string, 0, len(p.Extras))
+		for col := range p.Extras {
+			extraCols = append(extraCols, col)
+		}
+		sort.Strings(extraCols)
+		for _, col := range extraCols {
+			hashStableBytes(&hash, []byte(col))
+			hashStableByte(&hash, '=')
+			hashStableValue(&hash, p.Extras[col])
+			hashStableByte(&hash, '|')
+		}
+	}
+	return hash
 }
 
 func stableTupleKeyCanonical(t types.Tuple) string {
@@ -255,4 +382,81 @@ func hashTupleColumnName(name string) uint64 {
 		hash *= prime64
 	}
 	return hash
+}
+
+func hashStableByte(hash *uint64, b byte) {
+	*hash ^= uint64(b)
+	*hash *= 1099511628211
+}
+
+func hashStableBytes(hash *uint64, data []byte) {
+	for _, b := range data {
+		hashStableByte(hash, b)
+	}
+}
+
+func hashStableValue(hash *uint64, value any) {
+	switch v := value.(type) {
+	case nil:
+		hashStableBytes(hash, []byte("null"))
+	case string:
+		hashStableBytes(hash, []byte("s:"))
+		hashStableBytes(hash, []byte(v))
+	case bool:
+		hashStableBytes(hash, []byte("b:"))
+		if v {
+			hashStableBytes(hash, []byte("true"))
+		} else {
+			hashStableBytes(hash, []byte("false"))
+		}
+	case int:
+		hashStableInt64(hash, int64(v))
+	case int8:
+		hashStableInt64(hash, int64(v))
+	case int16:
+		hashStableInt64(hash, int64(v))
+	case int32:
+		hashStableInt64(hash, int64(v))
+	case int64:
+		hashStableInt64(hash, v)
+	case uint:
+		hashStableUint64(hash, uint64(v))
+	case uint8:
+		hashStableUint64(hash, uint64(v))
+	case uint16:
+		hashStableUint64(hash, uint64(v))
+	case uint32:
+		hashStableUint64(hash, uint64(v))
+	case uint64:
+		hashStableUint64(hash, v)
+	case float32:
+		hashStableUint64(hash, uint64(math.Float32bits(v)))
+	case float64:
+		hashStableUint64(hash, math.Float64bits(v))
+	case time.Time:
+		hashStableInt64(hash, v.UTC().UnixNano())
+	case types.Tuple:
+		hashStableBytes(hash, []byte("m:"))
+		hashStableUint64(hash, stableTupleOrderHash(v))
+	case map[string]any:
+		hashStableBytes(hash, []byte("m:"))
+		hashStableUint64(hash, stableTupleOrderHash(types.Tuple(v)))
+	default:
+		hashStableBytes(hash, []byte("x:"))
+		hashStableBytes(hash, []byte(fmt.Sprintf("%#v", value)))
+	}
+}
+
+func hashStableInt64(hash *uint64, value int64) {
+	hashStableBytes(hash, []byte("i:"))
+	var raw [8]byte
+	binary.BigEndian.PutUint64(raw[:], uint64(value))
+	hashStableBytes(hash, raw[:])
+}
+
+func hashStableUint64(hash *uint64, value uint64) {
+	hashStableBytes(hash, []byte("u:"))
+	var raw [8]byte
+	binary.BigEndian.PutUint64(raw[:], value)
+	hashStableBytes(hash, raw[:])
 }

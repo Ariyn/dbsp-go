@@ -748,24 +748,37 @@ func buildPartitionKeyFn(cols []string) func(types.Tuple) any {
 
 // logicalWindowFuncToDBSP transforms LogicalWindowFunc to DBSP operators
 func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*op.Node) (*op.Node, error) {
-	if wf.Spec.FuncName != "LAG" {
-		return nil, fmt.Errorf("only LAG window function is currently supported, got %s", wf.Spec.FuncName)
+	grouped, input := collectSharedWindowFuncs(wf)
+	for _, current := range grouped {
+		if current.Spec.FuncName != "LAG" {
+			return nil, fmt.Errorf("only LAG window function is currently supported, got %s", current.Spec.FuncName)
+		}
+		if len(current.Spec.Args) == 0 {
+			return nil, fmt.Errorf("LAG requires at least one argument")
+		}
 	}
 
-	if len(wf.Spec.Args) == 0 {
-		return nil, fmt.Errorf("LAG requires at least one argument")
-	}
-
-	lagCol := wf.Spec.Args[0]
-	keyFn := buildPartitionKeyFn(wf.Spec.PartitionBy)
-	ordered := op.NewOrderedWindowOp(keyFn, wf.Spec.OrderBy, lagCol, wf.Spec.Offset, wf.OutputCol)
+	primary := grouped[0]
+	lagCol := primary.Spec.Args[0]
+	keyFn := buildPartitionKeyFn(primary.Spec.PartitionBy)
+	ordered := op.NewOrderedWindowOp(keyFn, primary.Spec.OrderBy, lagCol, primary.Spec.Offset, primary.OutputCol)
+	ordered.PartitionCols = append([]string(nil), primary.Spec.PartitionBy...)
 	if strings.ContainsAny(lagCol, "()->:+-*/ ") {
 		ordered.LagExpr = BuildExprFunc(lagCol)
+		ordered.LagOutputs[0].LagExpr = ordered.LagExpr
+	}
+	for _, current := range grouped[1:] {
+		currentLagCol := current.Spec.Args[0]
+		var lagExpr func(types.Tuple) (any, error)
+		if strings.ContainsAny(currentLagCol, "()->:+-*/ ") {
+			lagExpr = BuildExprFunc(currentLagCol)
+		}
+		ordered.AddLagOutput(currentLagCol, lagExpr, current.OutputCol)
 	}
 
 	// Check if there's an input node
-	if wf.Input != nil {
-		inNode, err := logicalToDBSPWithContext(wf.Input, ctes)
+	if input != nil {
+		inNode, err := logicalToDBSPWithContext(input, ctes)
 		if err != nil {
 			return nil, err
 		}
@@ -773,6 +786,66 @@ func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*
 	}
 
 	return &op.Node{Op: ordered}, nil
+}
+
+func collectSharedWindowFuncs(root *LogicalWindowFunc) ([]*LogicalWindowFunc, LogicalNode) {
+	if root == nil {
+		return nil, nil
+	}
+	grouped := make([]*LogicalWindowFunc, 0, 4)
+	produced := make(map[string]struct{})
+	current := root
+	for current != nil {
+		if len(grouped) > 0 && !windowFuncExecutionSpecEqual(grouped[0].Spec, current.Spec) {
+			break
+		}
+		if currentDependsOnPriorWindowOutput(current, produced) {
+			break
+		}
+		grouped = append(grouped, current)
+		if strings.TrimSpace(current.OutputCol) != "" {
+			produced[strings.TrimSpace(current.OutputCol)] = struct{}{}
+		}
+		next, ok := current.Input.(*LogicalWindowFunc)
+		if !ok {
+			break
+		}
+		current = next
+	}
+	input := grouped[len(grouped)-1].Input
+	for left, right := 0, len(grouped)-1; left < right; left, right = left+1, right-1 {
+		grouped[left], grouped[right] = grouped[right], grouped[left]
+	}
+	return grouped, input
+}
+
+func windowFuncExecutionSpecEqual(a, b WindowFuncSpec) bool {
+	if strings.ToUpper(strings.TrimSpace(a.FuncName)) != strings.ToUpper(strings.TrimSpace(b.FuncName)) {
+		return false
+	}
+	if strings.TrimSpace(a.OrderBy) != strings.TrimSpace(b.OrderBy) {
+		return false
+	}
+	if a.Offset != b.Offset {
+		return false
+	}
+	if len(a.PartitionBy) != len(b.PartitionBy) {
+		return false
+	}
+	for idx := range a.PartitionBy {
+		if strings.TrimSpace(a.PartitionBy[idx]) != strings.TrimSpace(b.PartitionBy[idx]) {
+			return false
+		}
+	}
+	return true
+}
+
+func currentDependsOnPriorWindowOutput(wf *LogicalWindowFunc, produced map[string]struct{}) bool {
+	if wf == nil || len(wf.Spec.Args) == 0 || len(produced) == 0 {
+		return false
+	}
+	_, ok := produced[strings.TrimSpace(wf.Spec.Args[0])]
+	return ok
 }
 
 // logicalWindowAggToDBSP transforms LogicalWindowAgg (DuckDB standard window aggregate) to DBSP operators

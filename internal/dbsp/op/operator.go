@@ -12,6 +12,10 @@ type Operator interface {
 	Apply(batch types.Batch) (types.Batch, error)
 }
 
+type packedBatchAware interface {
+	SupportsPackedBatch() bool
+}
+
 // BinaryOperator processes two input batches and returns an output batch.
 // This is used for true 2-input DAG nodes (e.g., Join/Union/Diff).
 type BinaryOperator interface {
@@ -60,6 +64,9 @@ func executeBatch(root *Node, delta types.Batch) (types.Batch, error) {
 	if len(sources) == 0 {
 		if root.Op == nil {
 			return nil, nil
+		}
+		if _, ok := root.Op.(packedBatchAware); !ok {
+			delta = types.MaterializeBatch(delta)
 		}
 		out, err := root.Op.Apply(delta)
 		if err != nil {
@@ -129,6 +136,9 @@ func ExecuteTick(root *Node, sources map[string]types.Batch) (types.Batch, error
 			in, err := eval(n.Inputs[0])
 			if err != nil {
 				return nil, err
+			}
+			if _, ok := n.Op.(packedBatchAware); !ok {
+				in = types.MaterializeBatch(in)
 			}
 			out, err := n.Op.Apply(in)
 			if err != nil {
@@ -268,6 +278,9 @@ func (c *ChainedOp) Apply(batch types.Batch) (types.Batch, error) {
 	current := batch
 	var err error
 	for _, op := range c.Ops {
+		if _, ok := op.(packedBatchAware); !ok {
+			current = types.MaterializeBatch(current)
+		}
 		current, err = op.Apply(current)
 		if err != nil {
 			return nil, err

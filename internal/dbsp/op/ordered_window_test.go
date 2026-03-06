@@ -43,6 +43,37 @@ func TestOrderedWindowOpEmitsBasicLag(t *testing.T) {
 	}
 }
 
+func TestOrderedWindowOpEmitsMultipleLagOutputs(t *testing.T) {
+	op := NewOrderedWindowOp(func(t types.Tuple) any { return t["id"] }, "ts", "v", 1, "v_last")
+	op.AddLagOutput("w", nil, "w_last")
+
+	out, err := op.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 10.0, "w": 100.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 20.0, "w": 200.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(3), "v": 30.0, "w": 300.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("expected 3 output rows, got %d", len(out))
+	}
+
+	seen := make(map[int64]types.Tuple)
+	for _, td := range out {
+		seen[td.Tuple["ts"].(int64)] = td.Tuple
+	}
+	if seen[1]["v_last"] != nil || seen[1]["w_last"] != nil {
+		t.Fatalf("expected first row lag outputs nil, got %v", seen[1])
+	}
+	if types.ToFloat64(seen[2]["v_last"]) != 10.0 || types.ToFloat64(seen[2]["w_last"]) != 100.0 {
+		t.Fatalf("expected second row lag outputs from first row, got %v", seen[2])
+	}
+	if types.ToFloat64(seen[3]["v_last"]) != 20.0 || types.ToFloat64(seen[3]["w_last"]) != 200.0 {
+		t.Fatalf("expected third row lag outputs from second row, got %v", seen[3])
+	}
+}
+
 func TestOrderedWindowOpOutOfOrderInsertRecomputesAffectedRows(t *testing.T) {
 	op := NewOrderedWindowOp(func(t types.Tuple) any { return t["id"] }, "ts", "v", 1, "v_last")
 	if _, err := op.Apply(types.Batch{
@@ -301,6 +332,30 @@ func TestOrderedWindowOpDuplicateRowsHaveStableLagChain(t *testing.T) {
 	}
 }
 
+func TestOrderedWindowOpDeleteMatchesPackedRowByIdentity(t *testing.T) {
+	op := NewOrderedWindowOp(func(t types.Tuple) any { return t["id"] }, "ts", "v", 1, "v_last")
+	schema := types.NewPackedSchema([]string{"id", "ts", "v"})
+	inserted := types.NewPackedTupleWithPresence(schema, []any{"a", int64(1), 10.0}, []bool{true, true, true}).WithExtra("upstream_lag", nil)
+	if _, err := op.Apply(types.Batch{{Packed: inserted, Count: 1}}); err != nil {
+		t.Fatalf("insert packed row: %v", err)
+	}
+
+	// Simulate an upstream delete delta for the same logical row where an extra
+	// derived column representation has drifted. The row identity should still match.
+	deleteDelta := types.NewPackedTupleWithPresence(schema, []any{"a", int64(1), 10.0}, []bool{true, true, true})
+	deleteDelta = deleteDelta.WithExtra("upstream_lag", float64(999))
+	out, err := op.Apply(types.Batch{{Packed: deleteDelta, Count: -1}})
+	if err != nil {
+		t.Fatalf("delete packed row: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected one delete delta, got %d (%v)", len(out), out)
+	}
+	if out[0].Count != -1 {
+		t.Fatalf("expected delete delta, got %v", out[0])
+	}
+}
+
 func TestOrderedWindowOpStateBackendReload(t *testing.T) {
 	backend := NewMemoryStateBackend()
 	op1 := NewOrderedWindowOp(func(t types.Tuple) any { return t["id"] }, "ts", "v", 1, "v_last")
@@ -362,6 +417,7 @@ func TestOrderedWindowOpSnapshotRestoreGraph(t *testing.T) {
 func TestOrderedWindowOpStateTTL(t *testing.T) {
 	op := NewOrderedWindowOp(func(t types.Tuple) any { return t["id"] }, "ts", "v", 1, "v_last")
 	op.SetStateTTL(2 * time.Millisecond)
+	op.ttlCheckInterval = time.Millisecond
 	if _, err := op.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 10.0}, Count: 1}}); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -380,6 +436,7 @@ func TestOrderedWindowOpStateTTL(t *testing.T) {
 func TestOrderedWindowOpPrunesExpiredRowsInHotPartition(t *testing.T) {
 	op := NewOrderedWindowOp(func(t types.Tuple) any { return t["id"] }, "ts", "v", 1, "v_last")
 	op.SetStateTTL(2 * time.Millisecond)
+	op.ttlCheckInterval = time.Millisecond
 	if _, err := op.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 10.0}, Count: 1}}); err != nil {
 		t.Fatalf("apply first: %v", err)
 	}
@@ -397,6 +454,64 @@ func TestOrderedWindowOpPrunesExpiredRowsInHotPartition(t *testing.T) {
 	partition := op.Partitions["a"]
 	if partition == nil || len(partition.Rows) != 1 {
 		t.Fatalf("expected only latest row to remain after pruning, got %+v", partition)
+	}
+}
+
+func TestOrderedWindowOpOnlyLastLagKeepsNewestStateRow(t *testing.T) {
+	op := NewOrderedWindowOp(func(t types.Tuple) any { return t["id"] }, "ts", "v", 1, "v_last")
+	op.SetOnlyLastLag(true)
+
+	out, err := op.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 10.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 20.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(3), "v": 30.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("expected 3 output rows, got %d", len(out))
+	}
+	seen := make(map[int64]any)
+	for _, td := range out {
+		seen[td.Tuple["ts"].(int64)] = td.Tuple["v_last"]
+	}
+	if seen[1] != nil {
+		t.Fatalf("expected first lag nil, got %v", seen[1])
+	}
+	if types.ToFloat64(seen[2]) != 10.0 {
+		t.Fatalf("expected second lag 10.0, got %v", seen[2])
+	}
+	if types.ToFloat64(seen[3]) != 20.0 {
+		t.Fatalf("expected third lag 20.0, got %v", seen[3])
+	}
+	partition := op.Partitions["a"]
+	if partition == nil || len(partition.Rows) != 1 {
+		t.Fatalf("expected only newest retained row, got %+v", partition)
+	}
+	if partition.Rows[0].Tuple["ts"].(int64) != 3 {
+		t.Fatalf("expected newest retained ts=3, got %+v", partition.Rows[0])
+	}
+}
+
+func TestOrderedWindowOpOnlyLastLagDoesNotAffectOffsetTwo(t *testing.T) {
+	op := NewOrderedWindowOp(func(t types.Tuple) any { return t["id"] }, "ts", "v", 2, "v_last")
+	op.SetOnlyLastLag(true)
+
+	out, err := op.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 10.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 20.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(3), "v": 30.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("expected 3 output rows, got %d", len(out))
+	}
+	partition := op.Partitions["a"]
+	if partition == nil || len(partition.Rows) != 3 {
+		t.Fatalf("expected offset two to retain full state, got %+v", partition)
 	}
 }
 

@@ -109,6 +109,46 @@ func TestWindowAggCumulativeFrameAppendUsesPrefixSemantics(t *testing.T) {
 	}
 }
 
+func TestWindowAggCumulativeFrameKeepsPackedRows(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+
+	schema := types.NewPackedSchema([]string{"id", "ts", "v"})
+	out, err := w.Apply(types.Batch{
+		{Packed: types.NewPackedTupleWithPresence(schema, []any{"a", int64(1), 1.0}, []bool{true, true, true}), Count: 1},
+		{Packed: types.NewPackedTupleWithPresence(schema, []any{"a", int64(2), 2.0}, []bool{true, true, true}), Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 output rows, got %d", len(out))
+	}
+	for idx, td := range out {
+		if td.Packed == nil {
+			t.Fatalf("expected packed output at %d, got %+v", idx, td)
+		}
+	}
+	first := out[0].Packed.Materialize()
+	second := out[1].Packed.Materialize()
+	if got := types.ToFloat64(first["agg_result"]); got != 1.0 {
+		t.Fatalf("expected first cumulative 1.0, got %v", first)
+	}
+	if got := types.ToFloat64(second["agg_result"]); got != 3.0 {
+		t.Fatalf("expected second cumulative 3.0, got %v", second)
+	}
+}
+
 func TestWindowAggCumulativeFrameOutOfOrderInsertReplacesSuffix(t *testing.T) {
 	agg := &SumAgg{ColName: "v"}
 	w := NewWindowAggOp(
@@ -313,5 +353,56 @@ func TestWindowAggTumblingCompactsBatchDeltasPerWindowKey(t *testing.T) {
 	}
 	if out[0].Tuple["__window_start"] != int64(0) || out[0].Tuple["__window_end"] != int64(1000) {
 		t.Fatalf("unexpected window bounds: %v", out[0].Tuple)
+	}
+}
+
+func TestWindowAggStateEntryCountExcludesDerivedCaches(t *testing.T) {
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		&SumAgg{ColName: "v"},
+	)
+	w.State.Data[WindowID{Start: 0, End: 10}] = map[any]any{"a": 1.0, "b": 2.0}
+	w.PartitionBuffers["frame"] = &PartitionBuffer{Rows: []RowWithOrder{{RowHash: 1}, {RowHash: 2}}}
+	w.SessionBuffers["session"] = &PartitionBuffer{Rows: []RowWithOrder{{RowHash: 3}}}
+	w.sessionOut["session"] = map[string]types.Tuple{"out": {"id": "a"}}
+	w.frameOut = map[any]map[string]types.TupleDelta{"frame": {"out": {Tuple: types.Tuple{"id": "a"}, Count: 1}}}
+	w.cumulativeFrameCache["frame"] = &cumulativeFramePartitionCache{rowCount: 2}
+
+	if got := w.stateEntryCount(); got != 5 {
+		t.Fatalf("expected state entries to exclude derived caches, got %d", got)
+	}
+}
+
+func TestPartitionBufferRowIndexSurvivesInsertAndDelete(t *testing.T) {
+	pb := &PartitionBuffer{}
+	rows := []types.TupleDelta{
+		{Tuple: types.Tuple{"ts": int64(1), "id": "a", "v": 1.0}, Count: 1},
+		{Tuple: types.Tuple{"ts": int64(3), "id": "a", "v": 3.0}, Count: 1},
+	}
+	for _, td := range rows {
+		pb.addRow(td, "ts")
+	}
+
+	if idx, _, _ := pb.findRow(int64(3), types.Tuple{"ts": int64(3), "id": "a", "v": 3.0}, nil); idx != 1 {
+		t.Fatalf("expected ts=3 row at idx 1 before insert, got %d", idx)
+	}
+
+	pb.addRow(types.TupleDelta{Tuple: types.Tuple{"ts": int64(2), "id": "a", "v": 2.0}, Count: 1}, "ts")
+	if idx, _, _ := pb.findRow(int64(2), types.Tuple{"ts": int64(2), "id": "a", "v": 2.0}, nil); idx != 1 {
+		t.Fatalf("expected ts=2 row at idx 1 after insert, got %d", idx)
+	}
+	if idx, _, _ := pb.findRow(int64(3), types.Tuple{"ts": int64(3), "id": "a", "v": 3.0}, nil); idx != 2 {
+		t.Fatalf("expected ts=3 row at idx 2 after insert, got %d", idx)
+	}
+
+	pb.addRow(types.TupleDelta{Tuple: types.Tuple{"ts": int64(2), "id": "a", "v": 2.0}, Count: -1}, "ts")
+	if idx, _, _ := pb.findRow(int64(3), types.Tuple{"ts": int64(3), "id": "a", "v": 3.0}, nil); idx != 1 {
+		t.Fatalf("expected ts=3 row at idx 1 after delete, got %d", idx)
+	}
+	if idx, _, _ := pb.findRow(int64(2), types.Tuple{"ts": int64(2), "id": "a", "v": 2.0}, nil); idx != -1 {
+		t.Fatalf("expected ts=2 row to be absent after delete, got idx %d", idx)
 	}
 }

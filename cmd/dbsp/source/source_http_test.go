@@ -1,6 +1,7 @@
 package source
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,9 +11,88 @@ import (
 	"time"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
+	"github.com/ariyn/dbsp/internal/dbsp/ir"
+	"github.com/ariyn/dbsp/internal/dbsp/op"
+	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 	"github.com/ariyn/dbsp/internal/dbsp/wal"
 )
+
+const packedWindowQuery = `
+WITH lagged_data AS (
+	SELECT
+		timestamp,
+		panel_position,
+		plant_id,
+		local_date,
+		v_out,
+		i_out,
+		v_in,
+		temp,
+		LAG(timestamp) OVER (PARTITION BY panel_position ORDER BY timestamp) AS timestamp_last,
+		LAG(v_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS v_out_last,
+		LAG(i_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS i_out_last
+	FROM events
+),
+power_calc AS (
+	SELECT
+		timestamp_last AS timestamp_start,
+		timestamp AS timestamp_end,
+		timestamp,
+		panel_position,
+		plant_id,
+		local_date,
+		v_out,
+		i_out,
+		v_in,
+		temp,
+		v_out * i_out AS p_out,
+		v_out_last * i_out_last AS p_out_last,
+		(timestamp::DOUBLE / 1000000000.0) - (timestamp_last::DOUBLE / 1000000000.0) AS timedelta_second
+	FROM lagged_data
+	WHERE timestamp_last IS NOT NULL AND timestamp IS NOT NULL
+),
+combined_data AS (
+	SELECT
+		panel_position AS id,
+		plant_id,
+		local_date,
+		TIME_BUCKET(INTERVAL '5 min', timestamp::TIMESTAMP) AS binned_date,
+		ROUND(AVG(i_out), 2) AS i_out,
+		ROUND(AVG(i_out * v_out), 2) AS p,
+		ROUND(AVG(v_in), 2) AS v_in,
+		ROUND(AVG(v_out), 2) AS v_out,
+		ROUND(AVG(temp), 2) AS temp,
+		SUM((p_out + p_out_last) * timedelta_second / 2.0 / 3600.0) AS energy
+	FROM power_calc
+	GROUP BY id, plant_id, local_date, binned_date
+),
+final_data AS (
+	SELECT
+		i_out,
+		p,
+		v_in,
+		v_out,
+		temp,
+		energy,
+		SUM(energy) OVER (PARTITION BY id ORDER BY binned_date) AS cumulative_energy,
+		id,
+		plant_id,
+		local_date,
+		STRFTIME(binned_date, '%H:%M:%S') AS date,
+		binned_date AS timestamp
+	FROM combined_data
+)
+SELECT *
+FROM final_data
+WHERE id = '0e02e183-c1b2-4492-9eda-26b08892e427.0.0'
+ORDER BY date
+PARTITION BY plant_id, local_date
+`
+
+func tupleForTest(td *types.TupleDelta) types.Tuple {
+	return td.EnsureTuple()
+}
 
 func TestParseRequestBodyReaderFiltersFields(t *testing.T) {
 	s := &HTTPSource{
@@ -34,7 +114,7 @@ func TestParseRequestBodyReaderFiltersFields(t *testing.T) {
 	if len(batch) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(batch))
 	}
-	tuple := batch[0].Tuple
+	tuple := tupleForTest(&batch[0])
 	if _, ok := tuple["a"]; !ok {
 		t.Fatalf("expected field a")
 	}
@@ -62,7 +142,7 @@ func TestParseRequestBodyReaderKeepAll(t *testing.T) {
 	if len(batch) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(batch))
 	}
-	if _, ok := batch[0].Tuple["b"]; !ok {
+	if _, ok := tupleForTest(&batch[0])["b"]; !ok {
 		t.Fatalf("expected field b")
 	}
 }
@@ -82,7 +162,7 @@ func TestParseRequestBodyReaderSingleObject(t *testing.T) {
 	if len(batch) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(batch))
 	}
-	if got := types.ToInt64(batch[0].Tuple["a"]); got != 2 {
+	if got := types.ToInt64(tupleForTest(&batch[0])["a"]); got != 2 {
 		t.Fatalf("expected a=2, got %d", got)
 	}
 }
@@ -115,13 +195,14 @@ func TestNewHTTPSourceDisablesFilteringWithEmptySchema(t *testing.T) {
 	if len(batch) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(batch))
 	}
-	if _, ok := batch[0].Tuple["v_out"]; ok {
+	tuple := tupleForTest(&batch[0])
+	if _, ok := tuple["v_out"]; ok {
 		t.Fatalf("did not expect v_out when filtering is enabled")
 	}
-	if _, ok := batch[0].Tuple["plant_id"]; !ok {
+	if _, ok := tuple["plant_id"]; !ok {
 		t.Fatalf("expected plant_id to be kept")
 	}
-	if _, ok := batch[0].Tuple["local_date"]; !ok {
+	if _, ok := tuple["local_date"]; !ok {
 		t.Fatalf("expected local_date to be kept")
 	}
 }
@@ -144,10 +225,11 @@ func TestParseRequestBodyReaderDoesNotKeepSchemaOnlyFields(t *testing.T) {
 	if len(batch) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(batch))
 	}
-	if _, ok := batch[0].Tuple["a"]; !ok {
+	tuple := tupleForTest(&batch[0])
+	if _, ok := tuple["a"]; !ok {
 		t.Fatalf("expected field a")
 	}
-	if _, ok := batch[0].Tuple["b"]; ok {
+	if _, ok := tuple["b"]; ok {
 		t.Fatalf("did not expect schema-only field b")
 	}
 }
@@ -169,9 +251,10 @@ func TestParseRequestBodyReaderKeepsNestedJSONWithoutRawRedecode(t *testing.T) {
 	if len(batch) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(batch))
 	}
-	meta, ok := batch[0].Tuple["meta"].(map[string]any)
+	tuple := tupleForTest(&batch[0])
+	meta, ok := tuple["meta"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected meta object, got %T", batch[0].Tuple["meta"])
+		t.Fatalf("expected meta object, got %T", tuple["meta"])
 	}
 	nested, ok := meta["nested"].([]any)
 	if !ok {
@@ -207,6 +290,149 @@ func TestMatchFieldUsesLengthBucketFiltering(t *testing.T) {
 	}
 	if _, ok := s.matchField([]byte("v_out")); ok {
 		t.Fatal("did not expect unrelated field to match")
+	}
+}
+
+func TestParseLargePackedBatchKeepsTimestampPresent(t *testing.T) {
+	required := map[string]struct{}{
+		"timestamp":      {},
+		"panel_position": {},
+		"plant_id":       {},
+		"local_date":     {},
+		"v_out":          {},
+		"i_out":          {},
+		"v_in":           {},
+		"temp":           {},
+	}
+	s, err := NewHTTPSource(config.HTTPSourceConfig{TimestampUnit: "ns"}, required)
+	if err != nil {
+		t.Fatalf("NewHTTPSource: %v", err)
+	}
+	defer s.Close()
+
+	var body strings.Builder
+	body.WriteByte('[')
+	for idx := 0; idx < 2000; idx++ {
+		if idx > 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(fmt.Sprintf(`{"timestamp":%d,"panel_position":"panel-1","plant_id":"plant-a","local_date":"2026-02-27","v_out":10.0,"i_out":2.0,"v_in":100.0,"temp":25.0}`,
+			(1772175600+idx*60)*1_000_000_000,
+		))
+	}
+	body.WriteByte(']')
+
+	batch, err := s.parseRequestBodyReader(strings.NewReader(body.String()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(batch) != 2000 {
+		t.Fatalf("expected 2000 records, got %d", len(batch))
+	}
+	for idx := range batch {
+		if _, ok := batch[idx].Get("timestamp"); !ok {
+			t.Fatalf("expected timestamp in parsed row %d", idx)
+		}
+	}
+}
+
+func TestWALQueueChunkingKeepsPackedTimestampPresent(t *testing.T) {
+	required := map[string]struct{}{
+		"timestamp":      {},
+		"panel_position": {},
+		"plant_id":       {},
+		"local_date":     {},
+		"v_out":          {},
+		"i_out":          {},
+		"v_in":           {},
+		"temp":           {},
+	}
+	s, err := NewHTTPSource(config.HTTPSourceConfig{TimestampUnit: "ns", MaxBatchSize: 1000}, required)
+	if err != nil {
+		t.Fatalf("NewHTTPSource: %v", err)
+	}
+	defer s.Close()
+	s.replayDir = "test-replay"
+
+	batch := make(types.Batch, 0, 2000)
+	for idx := 0; idx < 2000; idx++ {
+		batch = append(batch, types.TupleDelta{Packed: types.NewPackedTupleWithPresence(
+			s.packedSchema,
+			[]any{time.Unix(0, int64((1772175600+idx*60)*1_000_000_000)).UTC(), "panel-1", "plant-a", "2026-02-27", 10.0, 2.0, 100.0, 25.0},
+			[]bool{true, true, true, true, true, true, true, true},
+		), Count: 1})
+	}
+	s.enqueueWALBatch(1, batch, nil)
+
+	first, err := s.NextBatch()
+	if err != nil {
+		t.Fatalf("first NextBatch: %v", err)
+	}
+	if len(first) != 1000 {
+		t.Fatalf("expected first chunk size 1000, got %d", len(first))
+	}
+	for idx := range first {
+		if _, ok := first[idx].Get("timestamp"); !ok {
+			t.Fatalf("expected timestamp in first chunk row %d", idx)
+		}
+	}
+
+	second, err := s.NextBatch()
+	if err != nil {
+		t.Fatalf("second NextBatch: %v", err)
+	}
+	if len(second) != 1000 {
+		t.Fatalf("expected second chunk size 1000, got %d", len(second))
+	}
+	for idx := range second {
+		if _, ok := second[idx].Get("timestamp"); !ok {
+			t.Fatalf("expected timestamp in second chunk row %d", idx)
+		}
+	}
+}
+
+func TestPackedLargeBatchExecutesWindowChain(t *testing.T) {
+	logicalPlan, err := sqlconv.ParseQueryToLogicalPlan(packedWindowQuery)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan: %v", err)
+	}
+	required := ir.CollectRequiredInputColumns(logicalPlan)
+	hints := ir.CollectRequiredInputTypeHints(logicalPlan)
+	root, err := sqlconv.ParseQueryToIncrementalDBSP(packedWindowQuery)
+	if err != nil {
+		t.Fatalf("ParseQueryToIncrementalDBSP: %v", err)
+	}
+	httpCfg := config.HTTPSourceConfig{TimestampUnit: "ns", Schema: hints}
+	s, err := NewHTTPSource(httpCfg, required)
+	if err != nil {
+		t.Fatalf("NewHTTPSource: %v", err)
+	}
+	defer s.Close()
+
+	var body strings.Builder
+	body.WriteByte('[')
+	for idx := 0; idx < 1000; idx++ {
+		if idx > 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(fmt.Sprintf(`{"timestamp":%d,"panel_position":"0e02e183-c1b2-4492-9eda-26b08892e427.0.0","plant_id":"plant-a","local_date":"2026-02-27","v_out":10.0,"i_out":2.0,"v_in":100.0,"temp":25.0}`,
+			(1772175600+idx*60)*1_000_000_000,
+		))
+	}
+	body.WriteByte(']')
+
+	batch, err := s.parseRequestBodyReader(strings.NewReader(body.String()))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(batch) != 1000 {
+		t.Fatalf("expected 1000 records, got %d", len(batch))
+	}
+	if _, err := op.Execute(root, batch[:1]); err != nil {
+		t.Fatalf("warmup Execute failed: %v", err)
+	}
+	if _, err := op.Execute(root, batch); err != nil {
+		t.Fatalf("Execute failed: %v", err)
 	}
 }
 
@@ -260,7 +486,7 @@ func TestReplayWALQueuesBatchesWithoutUsingLiveBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next batch: %v", err)
 	}
-	if len(batch) != 1 || types.ToInt64(batch[0].Tuple["a"]) != 1 {
+	if len(batch) != 1 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 1 {
 		t.Fatalf("expected first replay batch with a=1, got %v", batch)
 	}
 }
@@ -307,7 +533,7 @@ func TestReplayWALAckPersistsCursorAndSkipsProcessedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next batch first source: %v", err)
 	}
-	if len(batch) != 1 || types.ToInt64(batch[0].Tuple["a"]) != 1 {
+	if len(batch) != 1 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 1 {
 		t.Fatalf("expected first replayed row a=1, got %v", batch)
 	}
 	if err := s1.AckBatchProcessed(batch); err != nil {
@@ -338,7 +564,7 @@ func TestReplayWALAckPersistsCursorAndSkipsProcessedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next batch second source: %v", err)
 	}
-	if len(batch) != 1 || types.ToInt64(batch[0].Tuple["a"]) != 2 {
+	if len(batch) != 1 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 2 {
 		t.Fatalf("expected remaining replayed row a=2, got %v", batch)
 	}
 }
@@ -377,7 +603,7 @@ func TestReplayWALDecodesNativeBatchRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next batch: %v", err)
 	}
-	if len(batch) != 1 || types.ToInt64(batch[0].Tuple["a"]) != 7 {
+	if len(batch) != 1 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 7 {
 		t.Fatalf("expected decoded native batch record, got %v", batch)
 	}
 }
@@ -425,7 +651,7 @@ func TestHandleIngestWritesNativeBatchWALRecord(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode native batch payload: %v", err)
 		}
-		if len(batch) != 1 || types.ToInt64(batch[0].Tuple["a"]) != 5 {
+		if len(batch) != 1 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 5 {
 			t.Fatalf("unexpected wal batch payload: %v", batch)
 		}
 		return nil
@@ -444,7 +670,7 @@ func TestHandleIngestWritesNativeBatchWALRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next batch: %v", err)
 	}
-	if len(batch) != 1 || types.ToInt64(batch[0].Tuple["a"]) != 5 {
+	if len(batch) != 1 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 5 {
 		t.Fatalf("unexpected next batch: %v", batch)
 	}
 }
@@ -478,7 +704,7 @@ func TestWALNextBatchRespectsMaxBatchSizeAndDefersAckUntilFinalChunk(t *testing.
 	if err != nil {
 		t.Fatalf("first next batch: %v", err)
 	}
-	if len(batch) != 2 || types.ToInt64(batch[0].Tuple["a"]) != 1 || types.ToInt64(batch[1].Tuple["a"]) != 2 {
+	if len(batch) != 2 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 1 || types.ToInt64(tupleForTest(&batch[1])["a"]) != 2 {
 		t.Fatalf("unexpected first chunk: %v", batch)
 	}
 	if err := s.AckBatchProcessed(batch); err != nil {
@@ -492,7 +718,7 @@ func TestWALNextBatchRespectsMaxBatchSizeAndDefersAckUntilFinalChunk(t *testing.
 	if err != nil {
 		t.Fatalf("second next batch: %v", err)
 	}
-	if len(batch) != 2 || types.ToInt64(batch[0].Tuple["a"]) != 3 || types.ToInt64(batch[1].Tuple["a"]) != 4 {
+	if len(batch) != 2 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 3 || types.ToInt64(tupleForTest(&batch[1])["a"]) != 4 {
 		t.Fatalf("unexpected second chunk: %v", batch)
 	}
 	if err := s.AckBatchProcessed(batch); err != nil {
@@ -506,7 +732,7 @@ func TestWALNextBatchRespectsMaxBatchSizeAndDefersAckUntilFinalChunk(t *testing.
 	if err != nil {
 		t.Fatalf("third next batch: %v", err)
 	}
-	if len(batch) != 1 || types.ToInt64(batch[0].Tuple["a"]) != 5 {
+	if len(batch) != 1 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 5 {
 		t.Fatalf("unexpected third chunk: %v", batch)
 	}
 	if err := s.AckBatchProcessed(batch); err != nil {
@@ -567,14 +793,14 @@ func TestHandleIngestSpillsToWALWhenMemoryQueueIsFull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next batch first: %v", err)
 	}
-	if len(batch) != 1 || types.ToInt64(batch[0].Tuple["a"]) != 1 {
+	if len(batch) != 1 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 1 {
 		t.Fatalf("unexpected first batch: %v", batch)
 	}
 	batch, err = s.NextBatch()
 	if err != nil {
 		t.Fatalf("next batch second: %v", err)
 	}
-	if len(batch) != 1 || types.ToInt64(batch[0].Tuple["a"]) != 2 {
+	if len(batch) != 1 || types.ToInt64(tupleForTest(&batch[0])["a"]) != 2 {
 		t.Fatalf("unexpected second batch: %v", batch)
 	}
 }

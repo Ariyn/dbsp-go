@@ -3,6 +3,7 @@ package op
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
@@ -11,17 +12,20 @@ import (
 type orderedWindowSnapshotV1 struct {
 	Partitions  map[any]*orderedWindowPartition
 	StateTTL    time.Duration
+	OnlyLastLag bool
 	LastTouched map[any]time.Time
 }
 
 type orderedWindowPartition struct {
-	Rows    []orderedWindowRow
-	NextSeq int64
+	Rows         []orderedWindowRow
+	NextSeq      int64
+	MinExpiresAt time.Time
 }
 
 type orderedWindowRow struct {
 	OrderValue any
 	Tuple      types.Tuple
+	Packed     *types.PackedTuple
 	TieBreaker string
 	Seq        int64
 	ExpiresAt  time.Time
@@ -35,27 +39,41 @@ type orderedWindowMutation struct {
 }
 
 type orderedWindowOutput struct {
-	row      orderedWindowRow
-	lagValue any
-	count    int64
+	row       orderedWindowRow
+	lagValues []any
+	count     int64
+}
+
+type OrderedWindowLag struct {
+	LagCol    string
+	LagExpr   func(types.Tuple) (any, error)
+	OutputCol string
 }
 
 type OrderedWindowOp struct {
-	KeyFn      func(types.Tuple) any
-	OrderByCol string
-	LagCol     string
-	LagExpr    func(types.Tuple) (any, error)
-	Offset     int
-	OutputCol  string
-	profile    operatorApplyProfile
+	KeyFn         func(types.Tuple) any
+	PartitionCols []string
+	OrderByCol    string
+	LagCol        string
+	LagExpr       func(types.Tuple) (any, error)
+	Offset        int
+	OutputCol     string
+	LagOutputs    []OrderedWindowLag
+	profile       operatorApplyProfile
 
-	Partitions    map[any]*orderedWindowPartition
-	StateTTL      time.Duration
-	lastTouched   map[any]time.Time
-	stateBackend  StateBackend
-	statePrefix   string
-	backendLoaded bool
+	Partitions       map[any]*orderedWindowPartition
+	StateTTL         time.Duration
+	OnlyLastLag      bool
+	lastTouched      map[any]time.Time
+	ttlCheckInterval time.Duration
+	nextTTLCheck     time.Time
+	ttlExpiry        ttlExpiryQueue
+	stateBackend     StateBackend
+	statePrefix      string
+	backendLoaded    bool
 }
+
+func (w *OrderedWindowOp) SupportsPackedBatch() bool { return true }
 
 func NewOrderedWindowOp(keyFn func(types.Tuple) any, orderByCol, lagCol string, offset int, outputCol string) *OrderedWindowOp {
 	if keyFn == nil {
@@ -70,6 +88,7 @@ func NewOrderedWindowOp(keyFn func(types.Tuple) any, orderByCol, lagCol string, 
 		LagCol:      lagCol,
 		Offset:      offset,
 		OutputCol:   outputCol,
+		LagOutputs:  []OrderedWindowLag{{LagCol: lagCol, OutputCol: outputCol}},
 		profile:     newOperatorApplyProfile("OrderedWindowOp"),
 		Partitions:  make(map[any]*orderedWindowPartition),
 		lastTouched: make(map[any]time.Time),
@@ -82,6 +101,33 @@ func (w *OrderedWindowOp) ensureProfiler() {
 	}
 }
 
+func (w *OrderedWindowOp) ensureLagOutputs() {
+	if w == nil {
+		return
+	}
+	if len(w.LagOutputs) > 0 {
+		for idx := range w.LagOutputs {
+			if strings.TrimSpace(w.LagOutputs[idx].OutputCol) == "" {
+				w.LagOutputs[idx].OutputCol = w.defaultOutputColFor(w.LagOutputs[idx].LagCol)
+			}
+		}
+		return
+	}
+	w.LagOutputs = []OrderedWindowLag{{
+		LagCol:    w.LagCol,
+		LagExpr:   w.LagExpr,
+		OutputCol: w.outputCol(),
+	}}
+}
+
+func (w *OrderedWindowOp) AddLagOutput(lagCol string, lagExpr func(types.Tuple) (any, error), outputCol string) {
+	w.ensureLagOutputs()
+	if strings.TrimSpace(outputCol) == "" {
+		outputCol = w.defaultOutputColFor(lagCol)
+	}
+	w.LagOutputs = append(w.LagOutputs, OrderedWindowLag{LagCol: lagCol, LagExpr: lagExpr, OutputCol: outputCol})
+}
+
 func (w *OrderedWindowOp) Snapshot() (any, error) {
 	if w == nil {
 		return orderedWindowSnapshotV1{}, nil
@@ -92,6 +138,7 @@ func (w *OrderedWindowOp) Snapshot() (any, error) {
 	return orderedWindowSnapshotV1{
 		Partitions:  cloneOrderedWindowPartitions(w.Partitions),
 		StateTTL:    w.StateTTL,
+		OnlyLastLag: w.OnlyLastLag,
 		LastTouched: cloneOrderedWindowTouchMap(w.lastTouched),
 	}, nil
 }
@@ -106,6 +153,7 @@ func (w *OrderedWindowOp) Restore(state any) error {
 	}
 	w.Partitions = cloneOrderedWindowPartitions(snap.Partitions)
 	w.StateTTL = snap.StateTTL
+	w.OnlyLastLag = snap.OnlyLastLag
 	w.lastTouched = cloneOrderedWindowTouchMap(snap.LastTouched)
 	if w.lastTouched == nil {
 		w.lastTouched = make(map[any]time.Time)
@@ -130,8 +178,23 @@ func (w *OrderedWindowOp) SetStateTTL(ttl time.Duration) {
 	w.StateTTL = ttl
 }
 
+func (w *OrderedWindowOp) SetOnlyLastLag(enabled bool) {
+	w.OnlyLastLag = enabled
+}
+
+func (w *OrderedWindowOp) touchPartition(now time.Time, key any) {
+	if w.lastTouched == nil {
+		w.lastTouched = make(map[any]time.Time)
+	}
+	w.lastTouched[key] = now
+	if w.StateTTL > 0 {
+		w.ttlExpiry.touch(stableAnyKey(key), now.Add(w.StateTTL))
+	}
+}
+
 func (w *OrderedWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 	w.ensureProfiler()
+	w.ensureLagOutputs()
 	if err := w.loadBackendState(); err != nil {
 		return nil, err
 	}
@@ -142,12 +205,15 @@ func (w *OrderedWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 		w.lastTouched = make(map[any]time.Time)
 	}
 	now := time.Now()
-	w.evictExpired(now)
+	shouldCheckTTL := shouldRunTTLCheck(&w.nextTTLCheck, now, w.StateTTL, w.ttlCheckInterval)
+	if shouldCheckTTL {
+		w.evictExpired(now)
+	}
 	if len(batch) == 0 {
 		if err := w.flushBackendState(); err != nil {
 			return nil, err
 		}
-		w.profile.observeBatch(0, nil, 0, 0)
+		w.profile.observeBatch(0, nil, 0, 0, w.stateEntryCount())
 		return nil, nil
 	}
 
@@ -158,10 +224,12 @@ func (w *OrderedWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 		if td.Count == 0 {
 			continue
 		}
-		partitionKey := w.KeyFn(td.Tuple)
-		w.lastTouched[partitionKey] = now
+		partitionKey := w.partitionKeyForDelta(td)
+		w.touchPartition(now, partitionKey)
 		partition := w.getOrCreatePartition(partitionKey)
-		w.pruneExpiredRows(partition, now)
+		if shouldCheckTTL {
+			w.pruneExpiredRows(partition, now)
+		}
 		count := td.Count
 		step := int64(1)
 		if count < 0 {
@@ -169,9 +237,12 @@ func (w *OrderedWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 			count = -count
 		}
 		for i := int64(0); i < count; i++ {
-			stepOut, appended, err := w.applyUnit(partition, types.TupleDelta{Tuple: td.Tuple, Count: step})
+			stepOut, appended, err := w.applyUnit(partition, types.TupleDelta{Tuple: td.Tuple, Packed: td.Packed, Count: step})
 			if err != nil {
 				return nil, err
+			}
+			if w.shouldRetainOnlyLastLag() {
+				partition.retainNewestRow()
 			}
 			if appended {
 				appendHits++
@@ -184,8 +255,25 @@ func (w *OrderedWindowOp) Apply(batch types.Batch) (types.Batch, error) {
 	if err := w.flushBackendState(); err != nil {
 		return nil, err
 	}
-	w.profile.observeBatch(len(batch), out, appendHits, appendMisses)
+	w.profile.observeBatch(len(batch), out, appendHits, appendMisses, w.stateEntryCount())
 	return out, nil
+}
+
+func (w *OrderedWindowOp) stateEntryCount() int {
+	if w == nil {
+		return 0
+	}
+	count := 0
+	for _, partition := range w.Partitions {
+		if partition != nil {
+			count += len(partition.Rows)
+		}
+	}
+	return count
+}
+
+func (w *OrderedWindowOp) shouldRetainOnlyLastLag() bool {
+	return w != nil && w.OnlyLastLag && w.offset() == 1
 }
 
 func (w *OrderedWindowOp) applyUnit(partition *orderedWindowPartition, td types.TupleDelta) (types.Batch, bool, error) {
@@ -196,12 +284,11 @@ func (w *OrderedWindowOp) applyUnit(partition *orderedWindowPartition, td types.
 	if td.Count > 0 && mutation.append {
 		w.applyMutation(partition, td, mutation)
 		row := partition.Rows[mutation.newPos]
-		outTuple := types.CloneTuple(row.Tuple)
-		if outTuple == nil {
-			outTuple = types.Tuple{}
-		}
-		outTuple[w.outputCol()] = w.getLagValue(partition.Rows, mutation.newPos)
-		return types.Batch{{Tuple: outTuple, Count: 1}}, true, nil
+		return types.Batch{w.materializeOutput(orderedWindowOutput{
+			row:       row,
+			lagValues: w.getLagValues(partition.Rows, mutation.newPos),
+			count:     1,
+		})}, true, nil
 	}
 
 	oldStart, oldEnd := oldBandRange(td.Count, mutation.oldPos, w.Offset, len(partition.Rows))
@@ -216,7 +303,7 @@ func (w *OrderedWindowOp) applyUnit(partition *orderedWindowPartition, td types.
 }
 
 func (w *OrderedWindowOp) planMutation(partition *orderedWindowPartition, td types.TupleDelta) (orderedWindowMutation, error) {
-	orderValue, ok := td.Tuple[w.OrderByCol]
+	orderValue, ok := td.Get(w.OrderByCol)
 	if !ok {
 		return orderedWindowMutation{}, fmt.Errorf("order by column %q not found in tuple", w.OrderByCol)
 	}
@@ -224,7 +311,8 @@ func (w *OrderedWindowOp) planMutation(partition *orderedWindowPartition, td typ
 		row := orderedWindowRow{
 			OrderValue: orderValue,
 			Tuple:      td.Tuple,
-			TieBreaker: stableAnyKey(td.Tuple),
+			Packed:     types.ClonePackedTuple(td.Packed),
+			TieBreaker: w.tieBreakerForDelta(td),
 			Seq:        partition.NextSeq,
 		}
 		if w.StateTTL > 0 {
@@ -241,9 +329,9 @@ func (w *OrderedWindowOp) planMutation(partition *orderedWindowPartition, td typ
 		return orderedWindowMutation{oldPos: pos, newPos: pos, row: row}, nil
 	}
 
-	oldPos := findOrderedMatchPos(partition.Rows, td.Tuple)
+	oldPos := findOrderedMatchPos(partition.Rows, td, orderValue, w.tieBreakerForDelta(td))
 	if oldPos < 0 {
-		return orderedWindowMutation{}, fmt.Errorf("row not found for deletion: %v", td.Tuple)
+		return orderedWindowMutation{}, fmt.Errorf("row not found for deletion")
 	}
 	return orderedWindowMutation{oldPos: oldPos, newPos: oldPos}, nil
 }
@@ -253,15 +341,21 @@ func (w *OrderedWindowOp) applyMutation(partition *orderedWindowPartition, td ty
 		if mutation.append {
 			partition.Rows = append(partition.Rows, mutation.row)
 			partition.NextSeq++
+			partition.observeExpiry(mutation.row.ExpiresAt)
 			return
 		}
 		partition.Rows = append(partition.Rows, orderedWindowRow{})
 		copy(partition.Rows[mutation.newPos+1:], partition.Rows[mutation.newPos:])
 		partition.Rows[mutation.newPos] = mutation.row
 		partition.NextSeq++
+		partition.observeExpiry(mutation.row.ExpiresAt)
 		return
 	}
+	removed := partition.Rows[mutation.oldPos]
 	partition.Rows = append(partition.Rows[:mutation.oldPos], partition.Rows[mutation.oldPos+1:]...)
+	if !removed.ExpiresAt.IsZero() && removed.ExpiresAt.Equal(partition.MinExpiresAt) {
+		partition.recomputeMinExpiry()
+	}
 }
 
 func (w *OrderedWindowOp) buildOutputMap(rows []orderedWindowRow, start int, end int) map[string]orderedWindowOutput {
@@ -275,33 +369,61 @@ func (w *OrderedWindowOp) buildOutputMap(rows []orderedWindowRow, start int, end
 	for idx := start; idx < end; idx++ {
 		row := rows[idx]
 		out[orderedRowIdentity(row)] = orderedWindowOutput{
-			row:      row,
-			lagValue: w.getLagValue(rows, idx),
-			count:    1,
+			row:       row,
+			lagValues: w.getLagValues(rows, idx),
+			count:     1,
 		}
 	}
 	return out
 }
 
 func (w *OrderedWindowOp) materializeOutput(output orderedWindowOutput) types.TupleDelta {
-	tuple := make(types.Tuple, len(output.row.Tuple)+1)
+	outputs := w.lagOutputs()
+	if output.row.Packed != nil {
+		packed := output.row.Packed.WithExtras(w.buildLagExtras(outputs, output.lagValues))
+		return types.TupleDelta{Packed: packed, Count: output.count}
+	}
+	tuple := make(types.Tuple, len(output.row.Tuple)+len(outputs))
 	for key, value := range output.row.Tuple {
 		tuple[key] = value
 	}
-	tuple[w.outputCol()] = output.lagValue
+	for idx, cfg := range outputs {
+		tuple[cfg.OutputCol] = output.lagValues[idx]
+	}
 	return types.TupleDelta{Tuple: tuple, Count: output.count}
 }
 
-func (w *OrderedWindowOp) getLagValue(rows []orderedWindowRow, idx int) any {
+func (w *OrderedWindowOp) buildLagExtras(outputs []OrderedWindowLag, lagValues []any) types.Tuple {
+	if len(outputs) == 0 {
+		return nil
+	}
+	extras := make(types.Tuple, len(outputs))
+	for idx, cfg := range outputs {
+		extras[cfg.OutputCol] = lagValues[idx]
+	}
+	return extras
+}
+
+func (w *OrderedWindowOp) getLagValues(rows []orderedWindowRow, idx int) []any {
+	outputs := w.lagOutputs()
+	values := make([]any, len(outputs))
+	for outputIdx, cfg := range outputs {
+		values[outputIdx] = w.getLagValueFor(rows, idx, cfg)
+	}
+	return values
+}
+
+func (w *OrderedWindowOp) getLagValueFor(rows []orderedWindowRow, idx int, cfg OrderedWindowLag) any {
 	lagIdx := idx - w.offset()
 	if lagIdx < 0 || lagIdx >= len(rows) {
 		return nil
 	}
-	if w.LagExpr != nil {
-		value, _ := w.LagExpr(rows[lagIdx].Tuple)
+	if cfg.LagExpr != nil {
+		value, _ := cfg.LagExpr(rows[lagIdx].materializeTuple())
 		return value
 	}
-	return rows[lagIdx].Tuple[w.LagCol]
+	value, _ := rows[lagIdx].get(cfg.LagCol)
+	return value
 }
 
 func (w *OrderedWindowOp) getOrCreatePartition(key any) *orderedWindowPartition {
@@ -317,30 +439,52 @@ func (w *OrderedWindowOp) getOrCreatePartition(key any) *orderedWindowPartition 
 }
 
 func (w *OrderedWindowOp) evictExpired(now time.Time) {
-	if w.StateTTL <= 0 || len(w.lastTouched) == 0 {
+	if w.StateTTL <= 0 {
 		return
 	}
-	for key, touched := range w.lastTouched {
-		if now.Sub(touched) <= w.StateTTL {
-			continue
+	_ = w.ttlExpiry.popExpired(now, func(id string) error {
+		key, err := decodeAnyKey(id)
+		if err != nil {
+			key = id
 		}
 		delete(w.lastTouched, key)
 		delete(w.Partitions, key)
-	}
+		return nil
+	})
 }
 
 func (w *OrderedWindowOp) pruneExpiredRows(partition *orderedWindowPartition, now time.Time) {
 	if w.StateTTL <= 0 || partition == nil || len(partition.Rows) == 0 {
 		return
 	}
+	if partition.MinExpiresAt.IsZero() || now.Before(partition.MinExpiresAt) {
+		return
+	}
 	keep := partition.Rows[:0]
+	var nextMin time.Time
 	for _, row := range partition.Rows {
 		if !row.ExpiresAt.IsZero() && !now.Before(row.ExpiresAt) {
 			continue
 		}
+		if !row.ExpiresAt.IsZero() && (nextMin.IsZero() || row.ExpiresAt.Before(nextMin)) {
+			nextMin = row.ExpiresAt
+		}
 		keep = append(keep, row)
 	}
 	partition.Rows = keep
+	partition.MinExpiresAt = nextMin
+}
+
+func (p *orderedWindowPartition) retainNewestRow() {
+	if p == nil || len(p.Rows) <= 1 {
+		return
+	}
+	newest := p.Rows[len(p.Rows)-1]
+	p.Rows = []orderedWindowRow{newest}
+	p.MinExpiresAt = newest.ExpiresAt
+	if p.MinExpiresAt.IsZero() {
+		p.recomputeMinExpiry()
+	}
 }
 
 func (w *OrderedWindowOp) backendEnabled() bool {
@@ -406,7 +550,16 @@ func (w *OrderedWindowOp) outputCol() string {
 	if w.OutputCol != "" {
 		return w.OutputCol
 	}
-	return "lag_" + w.LagCol
+	return w.defaultOutputColFor(w.LagCol)
+}
+
+func (w *OrderedWindowOp) defaultOutputColFor(lagCol string) string {
+	return "lag_" + lagCol
+}
+
+func (w *OrderedWindowOp) lagOutputs() []OrderedWindowLag {
+	w.ensureLagOutputs()
+	return w.LagOutputs
 }
 
 func (w *OrderedWindowOp) offset() int {
@@ -426,9 +579,31 @@ func cloneOrderedWindowPartitions(src map[any]*orderedWindowPartition) map[any]*
 			out[key] = &orderedWindowPartition{}
 			continue
 		}
-		out[key] = &orderedWindowPartition{Rows: cloneOrderedRows(partition.Rows), NextSeq: partition.NextSeq}
+		out[key] = &orderedWindowPartition{Rows: cloneOrderedRows(partition.Rows), NextSeq: partition.NextSeq, MinExpiresAt: partition.MinExpiresAt}
 	}
 	return out
+}
+
+func (p *orderedWindowPartition) observeExpiry(expiresAt time.Time) {
+	if expiresAt.IsZero() {
+		return
+	}
+	if p.MinExpiresAt.IsZero() || expiresAt.Before(p.MinExpiresAt) {
+		p.MinExpiresAt = expiresAt
+	}
+}
+
+func (p *orderedWindowPartition) recomputeMinExpiry() {
+	var nextMin time.Time
+	for _, row := range p.Rows {
+		if row.ExpiresAt.IsZero() {
+			continue
+		}
+		if nextMin.IsZero() || row.ExpiresAt.Before(nextMin) {
+			nextMin = row.ExpiresAt
+		}
+	}
+	p.MinExpiresAt = nextMin
 }
 
 func cloneOrderedWindowTouchMap(src map[any]time.Time) map[any]time.Time {
@@ -451,6 +626,7 @@ func cloneOrderedRows(rows []orderedWindowRow) []orderedWindowRow {
 		out[i] = orderedWindowRow{
 			OrderValue: row.OrderValue,
 			Tuple:      types.CloneTuple(row.Tuple),
+			Packed:     types.ClonePackedTuple(row.Packed),
 			TieBreaker: row.TieBreaker,
 			Seq:        row.Seq,
 			ExpiresAt:  row.ExpiresAt,
@@ -465,9 +641,14 @@ func findOrderedInsertPos(rows []orderedWindowRow, row orderedWindowRow) int {
 	})
 }
 
-func findOrderedMatchPos(rows []orderedWindowRow, tuple types.Tuple) int {
+func findOrderedMatchPos(rows []orderedWindowRow, td types.TupleDelta, orderValue any, tieBreaker string) int {
 	for i, row := range rows {
-		if types.TuplesEqual(row.Tuple, tuple) {
+		if row.TieBreaker == tieBreaker && types.EqualAny(row.OrderValue, orderValue) {
+			return i
+		}
+	}
+	for i, row := range rows {
+		if row.matchesDelta(td) {
 			return i
 		}
 	}
@@ -495,6 +676,100 @@ func compareOrderedWindowRows(a, b orderedWindowRow) int {
 
 func orderedRowIdentity(row orderedWindowRow) string {
 	return fmt.Sprintf("%d:%s", row.Seq, row.TieBreaker)
+}
+
+func (w *OrderedWindowOp) partitionKeyForDelta(td types.TupleDelta) any {
+	if td.Tuple != nil {
+		return w.KeyFn(td.Tuple)
+	}
+	switch len(w.PartitionCols) {
+	case 0:
+		return nil
+	case 1:
+		value, _ := td.Get(w.PartitionCols[0])
+		return value
+	default:
+		parts := make([]any, len(w.PartitionCols))
+		for idx, col := range w.PartitionCols {
+			parts[idx], _ = td.Get(col)
+		}
+		return fmt.Sprintf("%v", parts)
+	}
+}
+
+func (w *OrderedWindowOp) tieBreakerForDelta(td types.TupleDelta) string {
+	if td.Packed != nil {
+		return compactAnyOrderKey(td.Packed)
+	}
+	return compactAnyOrderKey(td.Tuple)
+}
+
+func (r orderedWindowRow) get(col string) (any, bool) {
+	if r.Tuple != nil {
+		value, ok := r.Tuple[col]
+		return value, ok
+	}
+	if r.Packed != nil {
+		return r.Packed.Get(col)
+	}
+	return nil, false
+}
+
+func (r orderedWindowRow) materializeTuple() types.Tuple {
+	if r.Tuple != nil {
+		return r.Tuple
+	}
+	if r.Packed != nil {
+		return r.Packed.Materialize()
+	}
+	return nil
+}
+
+func (r orderedWindowRow) matchesDelta(td types.TupleDelta) bool {
+	if packedRowsEqualIgnoringExtras(r.Packed, td.Packed) {
+		return true
+	}
+	left := r.materializeTuple()
+	right := td.EnsureTuple()
+	return types.TuplesEqual(left, right)
+}
+
+func packedRowsEqualIgnoringExtras(left, right *types.PackedTuple) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	if left.Schema == nil || right.Schema == nil {
+		return false
+	}
+	if len(left.Schema.Columns) != len(right.Schema.Columns) {
+		return false
+	}
+	for idx, col := range left.Schema.Columns {
+		if right.Schema.Columns[idx] != col {
+			return false
+		}
+		leftPresent := idx < len(left.Present) && left.Present[idx]
+		rightPresent := idx < len(right.Present) && right.Present[idx]
+		if len(left.Present) == 0 {
+			leftPresent = idx < len(left.Values)
+		}
+		if len(right.Present) == 0 {
+			rightPresent = idx < len(right.Values)
+		}
+		if leftPresent != rightPresent {
+			return false
+		}
+		if !leftPresent {
+			continue
+		}
+		if idx >= len(left.Values) || idx >= len(right.Values) {
+			return false
+		}
+		if !types.EqualAny(left.Values[idx], right.Values[idx]) {
+			return false
+		}
+	}
+	return true
 }
 
 func oldBandRange(deltaCount int64, pos int, offset int, length int) (int, int) {
@@ -539,13 +814,13 @@ func diffOrderedOutputMaps(oldMap, newMap map[string]orderedWindowOutput, materi
 		newOutput, ok := newMap[key]
 		if !ok {
 			oldTd := materialize(oldOutput)
-			out = append(out, types.TupleDelta{Tuple: oldTd.Tuple, Count: -oldTd.Count})
+			out = append(out, types.TupleDelta{Tuple: oldTd.Tuple, Packed: oldTd.Packed, Count: -oldTd.Count})
 			continue
 		}
-		if !types.EqualAny(oldOutput.lagValue, newOutput.lagValue) {
+		if !types.EqualAny(oldOutput.lagValues, newOutput.lagValues) {
 			oldTd := materialize(oldOutput)
 			newTd := materialize(newOutput)
-			out = append(out, types.TupleDelta{Tuple: oldTd.Tuple, Count: -oldTd.Count})
+			out = append(out, types.TupleDelta{Tuple: oldTd.Tuple, Packed: oldTd.Packed, Count: -oldTd.Count})
 			out = append(out, newTd)
 			continue
 		}

@@ -211,6 +211,27 @@ func TestWindowFuncAliasPreservedInDBSP(t *testing.T) {
 	}
 }
 
+func TestSharedLagWindowBuildsSingleOrderedWindowOp(t *testing.T) {
+	query := "WITH lagged_data AS ( SELECT timestamp, panel_position, plant_id, local_date, v_out, i_out, v_in, temp, LAG(timestamp) OVER (PARTITION BY panel_position ORDER BY timestamp) AS timestamp_last, LAG(v_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS v_out_last, LAG(i_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS i_out_last FROM events ) SELECT * FROM lagged_data"
+	root, err := ParseQueryToIncrementalDBSP(query)
+	if err != nil {
+		t.Fatalf("ParseQueryToIncrementalDBSP failed: %v", err)
+	}
+	if got := countOrderedWindowOps(root); got != 1 {
+		t.Fatalf("expected exactly one OrderedWindowOp, got %d", got)
+	}
+	lag := findFirstOrderedWindowOp(root)
+	if lag == nil {
+		t.Fatal("expected OrderedWindowOp in incremental plan")
+	}
+	if len(lag.LagOutputs) != 3 {
+		t.Fatalf("expected 3 shared lag outputs, got %d", len(lag.LagOutputs))
+	}
+	if lag.LagOutputs[0].OutputCol != "timestamp_last" || lag.LagOutputs[1].OutputCol != "v_out_last" || lag.LagOutputs[2].OutputCol != "i_out_last" {
+		t.Fatalf("unexpected lag outputs: %+v", lag.LagOutputs)
+	}
+}
+
 func TestGroupByDeduplicatesAggregateAliases(t *testing.T) {
 	query := "SELECT panel_position AS id, TIME_BUCKET(INTERVAL '5 min', timestamp::TIMESTAMP) AS binned_date, ROUND(AVG(i_out), 2) AS i_out, ROUND(AVG(i_out * v_out), 2) AS p, ROUND(AVG(v_in), 2) AS v_in, ROUND(AVG(v_out), 2) AS v_out, ROUND(AVG(temp), 2) AS temp, SUM((p_out + p_out_last) * timedelta_second / 2.0 / 3600.0) AS energy FROM power_calc GROUP BY id, binned_date"
 	lp, err := ParseQueryToLogicalPlan(query)
@@ -497,6 +518,27 @@ func findFirstOrderedWindowOp(n *op.Node) *op.OrderedWindowOp {
 		}
 	}
 	return nil
+}
+
+func countOrderedWindowOps(n *op.Node) int {
+	if n == nil {
+		return 0
+	}
+	count := 0
+	if _, ok := n.Op.(*op.OrderedWindowOp); ok {
+		count++
+	}
+	if chained, ok := n.Op.(*op.ChainedOp); ok {
+		for _, inner := range chained.Ops {
+			if _, ok := inner.(*op.OrderedWindowOp); ok {
+				count++
+			}
+		}
+	}
+	for _, in := range n.Inputs {
+		count += countOrderedWindowOps(in)
+	}
+	return count
 }
 
 func keyForTuple(id any, ts any) string {
