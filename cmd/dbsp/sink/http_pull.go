@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -53,7 +54,7 @@ func NewHTTPPullSink(hcfg config.HTTPPullSinkConfig, partitionBy []string, schem
 		partitions:  make(map[string]*partitionEntry),
 	}
 
-	as := BuildArrowSchema(schema, true)
+	as := BuildArrowSchema(schema)
 	s.arrowSchema = as
 
 	// Start HTTP server in background
@@ -89,6 +90,9 @@ func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
 
 	for _, td := range batch {
 		pk := s.getPartitionKey(td.Tuple)
+		if strings.TrimSpace(os.Getenv("DBSP_DEBUG_PARTITION")) != "" {
+			fmt.Printf("DEBUG partition key: %s\n", pk)
+		}
 		entry, ok := s.partitions[pk]
 		if !ok {
 			entry = &partitionEntry{
@@ -110,21 +114,62 @@ func (s *HTTPPullSink) getPartitionKey(t types.Tuple) string {
 		return "default"
 	}
 	if len(s.partitionBy) == 1 {
-		return sanitizeHivePathSegment(fmt.Sprintf("%v", t[s.partitionBy[0]]))
+		val := resolvePartitionValue(t, s.partitionBy[0])
+		return sanitizeHivePathSegment(fmt.Sprintf("%v", val))
 	}
 
 	vals := make(map[string]string, len(s.partitionBy))
 	for _, col := range s.partitionBy {
-		vals[col] = sanitizeHivePathSegment(fmt.Sprintf("%v", t[col]))
+		val := resolvePartitionValue(t, col)
+		vals[col] = sanitizeHivePathSegment(fmt.Sprintf("%v", val))
 	}
 
 	b, _ := json.Marshal(vals)
 	return string(b)
 }
 
+func resolvePartitionValue(t types.Tuple, col string) any {
+	if t == nil {
+		return nil
+	}
+	if v, ok := t[col]; ok {
+		return v
+	}
+	colLower := strings.ToLower(strings.TrimSpace(col))
+	if colLower == "" {
+		return nil
+	}
+	for k, v := range t {
+		keyLower := strings.ToLower(strings.TrimSpace(k))
+		if keyLower == colLower {
+			return v
+		}
+		if dot := strings.LastIndex(keyLower, "."); dot != -1 {
+			if keyLower[dot+1:] == colLower {
+				return v
+			}
+		}
+	}
+	return nil
+}
+
 func (s *HTTPPullSink) Close() error {
 	if s.server != nil {
 		_ = s.server.Shutdown(context.Background())
+	}
+	return nil
+}
+
+// Checkpoint writes the current state of all partitions to Parquet files in the given directory.
+func (s *HTTPPullSink) Checkpoint(dir string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for pk, entry := range s.partitions {
+		path := filepath.Join(dir, pk, "checkpoint.parquet")
+		if err := entry.store.WriteToParquet(path, s.arrowSchema, s.mem); err != nil {
+			return fmt.Errorf("failed to checkpoint partition %s: %w", pk, err)
+		}
 	}
 	return nil
 }

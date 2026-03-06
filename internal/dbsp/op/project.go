@@ -12,8 +12,8 @@ type ProjectExprFn struct {
 // ProjectOp projects a tuple into a smaller tuple and can compute derived columns.
 // Unlike MapOp, it can return an error if expression evaluation fails.
 type ProjectOp struct {
-	Columns []string
-	Exprs   []ProjectExprFn
+	Columns   []string
+	Exprs     []ProjectExprFn
 	KeepInput bool
 }
 

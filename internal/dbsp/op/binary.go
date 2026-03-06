@@ -248,6 +248,19 @@ func (b *BinaryOp) SetJoinStateBackend(backend StateBackend, prefix string) {
 	}
 }
 
+// SetStateTTL applies a global state TTL to join state when unset.
+func (b *BinaryOp) SetStateTTL(ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	if b.Type != BinaryJoin {
+		return
+	}
+	if b.JoinTTL <= 0 || b.JoinTTL > ttl {
+		b.JoinTTL = ttl
+	}
+}
+
 func (b *BinaryOp) joinBackendEnabled() bool {
 	return b != nil && b.Type == BinaryJoin && b.joinStateBackend != nil
 }

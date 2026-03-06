@@ -2,6 +2,7 @@ package sqlconv
 
 import (
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,8 +15,14 @@ import (
 )
 
 // ParseQueryToLogicalPlan parses a tiny subset of SQL into a LogicalNode.
-func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
+func ParseQueryToLogicalPlan(query string, options ...ComplianceOption) (ir.LogicalNode, error) {
 	query = strings.TrimSpace(query)
+	// Apply options
+	settings := &ComplianceSettings{}
+	for _, opt := range options {
+		opt(settings)
+	}
+
 	// Pre-process: Extract global PARTITION BY at the end of query (sink config)
 	actualQuery, partitions, err := extractGlobalPartitionBy(query)
 	if err != nil {
@@ -42,6 +49,12 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 		if lp, ok, ferr := parseTimeWindowGroupByFallback(actualQuery); ferr != nil {
 			return nil, ferr
 		} else if ok {
+			if settings.StrictValidation {
+				return nil, fmt.Errorf("strict validation failed: fallback parser used for time-window query")
+			}
+			if settings.FallbackWarn {
+				fmt.Printf("Warning: fallback parser used for query: %s\n", actualQuery)
+			}
 			if len(partitions) > 0 {
 				return &ir.LogicalView{
 					Name:        "auto_view",
@@ -52,6 +65,12 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 			return lp, nil
 		}
 		if lp, ok := parseComplexTelemetryFallback(actualQuery); ok {
+			if settings.StrictValidation {
+				return nil, fmt.Errorf("strict validation failed: fallback parser used for complex telemetry query")
+			}
+			if settings.FallbackWarn {
+				fmt.Printf("Warning: fallback parser used for query: %s\n", actualQuery)
+			}
 			if len(partitions) > 0 {
 				return &ir.LogicalView{
 					Name:        "auto_view",
@@ -83,6 +102,25 @@ func ParseQueryToLogicalPlan(query string) (ir.LogicalNode, error) {
 	}
 
 	return lp, err
+}
+
+type ComplianceSettings struct {
+	StrictValidation bool
+	FallbackWarn     bool
+}
+
+type ComplianceOption func(*ComplianceSettings)
+
+func WithStrictValidation(enable bool) ComplianceOption {
+	return func(s *ComplianceSettings) {
+		s.StrictValidation = enable
+	}
+}
+
+func WithFallbackWarn(enable bool) ComplianceOption {
+	return func(s *ComplianceSettings) {
+		s.FallbackWarn = enable
+	}
 }
 
 func normalizeQueryForParser(query string) string {
@@ -405,53 +443,46 @@ func parseSelectToLogicalPlanCore(sel *ast.Select, query string, ctes map[string
 		}
 	}
 
-	// 3. Window functions (LAG, LEAD, etc.)
-	// Find ALL window functions in SELECT list and chain them
-	windowFuncs, err := findAllWindowFunctionsFromSelect(sel)
-	if err != nil {
-		return nil, err
+	// 3. GROUP BY clause
+	hasAggs := false
+	if aggs, err := findAggregatesForGroupBy(sel, query); err == nil && len(aggs) > 0 {
+		hasAggs = true
 	}
-	if len(windowFuncs) == 0 {
-		fallback, ferr := findAllWindowFunctionsFromQuery(query)
-		if ferr == nil {
-			windowFuncs = fallback
-		}
-	}
-	for _, wf := range windowFuncs {
-		wf.Input = currentNode
-		currentNode = wf
-	}
-
-	// 4. Window aggregate functions (SUM(...) OVER ...)
-	windowAggs, err := findAllWindowAggregatesFromSelect(sel)
-	if err != nil {
-		return nil, err
-	}
-	if len(windowAggs) == 0 {
-		fallback, ferr := findAllWindowAggregatesFromQuery(query)
-		if ferr == nil {
-			windowAggs = fallback
-		}
-	}
-	for _, waf := range windowAggs {
-		waf.Input = currentNode
-		currentNode = waf
-	}
-
-	// 5. GROUP BY clause
-	if len(sel.GroupBy) > 0 {
+	if len(sel.GroupBy) > 0 || hasAggs {
 		var (
 			groupCols      []string
 			windowSpec     *ir.WindowSpec
 			timeWindowSpec *ir.TimeWindowSpec
+			err            error
 		)
 
-		groupCols, windowSpec, timeWindowSpec, err = parseGroupByWithTimeWindow(sel.GroupBy)
-		if err != nil {
-			return nil, err
+		if len(sel.GroupBy) > 0 {
+			groupCols, windowSpec, timeWindowSpec, err = parseGroupByWithTimeWindow(sel.GroupBy)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// Auto-grouping logic
+			timeWindowSpec, err = findTimeBucketInSelect(sel, query)
+			if err != nil || timeWindowSpec == nil {
+				// Fallback to regular group agg if no time_bucket found but has aggs
+				// (Scalar aggregate case)
+			} else {
+				// Inject group keys for auto-grouping
+				groupCols = findNonAggregatedCols(sel, query)
+				if alias := findTimeBucketAliasInSelect(sel, query); alias != "" {
+					seen := make(map[string]struct{}, len(groupCols))
+					for _, c := range groupCols {
+						seen[c] = struct{}{}
+					}
+					if _, ok := seen[alias]; !ok {
+						groupCols = append(groupCols, alias)
+					}
+				}
+			}
 		}
 
-		aliasExprs := buildGroupByAliasMaterializationExprs(sel, groupCols)
+		aliasExprs := buildGroupByAliasMaterializationExprs(sel, query, groupCols)
 		if len(aliasExprs) > 0 {
 			currentNode = &ir.LogicalProject{
 				KeepInput: true,
@@ -465,27 +496,31 @@ func parseSelectToLogicalPlanCore(sel *ast.Select, query string, ctes map[string
 			if err != nil {
 				return nil, err
 			}
-			if len(aggs) != 1 {
-				return nil, errors.New("time-window GROUP BY supports exactly one aggregate")
-			}
-			aggName := strings.ToUpper(strings.TrimSpace(aggs[0].Name))
-			aggCol := strings.TrimSpace(aggs[0].Col)
-			if aggName == "COUNT" && aggCol == "*" {
-				aggCol = ""
-			}
-			outputCol := extractAggAliasFromQuery(query, aggs[0])
-			if strings.TrimSpace(outputCol) == "" {
-				outputCol = strings.ToLower(aggName) + "_" + strings.ReplaceAll(aggs[0].Col, " ", "")
-			}
-
-			currentNode = &ir.LogicalWindowAgg{
-				AggName:        aggName,
-				AggCol:         aggCol,
-				PartitionBy:    groupCols,
+			lg := &ir.LogicalGroupAgg{
+				Keys:           groupCols,
 				TimeWindowSpec: timeWindowSpec,
-				OutputCol:      outputCol,
 				Input:          currentNode,
 			}
+			if len(aggs) > 0 {
+				if len(aggs) == 1 {
+					lg.AggName = aggs[0].Name
+					if strings.ToUpper(aggs[0].Name) == "COUNT" && strings.TrimSpace(aggs[0].Col) == "*" {
+						lg.AggCol = ""
+					} else {
+						lg.AggCol = aggs[0].Col
+					}
+				} else {
+					lg.Aggs = make([]ir.AggSpec, 0, len(aggs))
+					for _, a := range aggs {
+						col := a.Col
+						if strings.ToUpper(a.Name) == "COUNT" && strings.TrimSpace(col) == "*" {
+							col = ""
+						}
+						lg.Aggs = append(lg.Aggs, ir.AggSpec{Name: a.Name, Col: col, As: a.As})
+					}
+				}
+			}
+			currentNode = lg
 		} else {
 			aggs, err := findAggregatesForGroupBy(sel, query)
 			if err != nil {
@@ -516,6 +551,42 @@ func parseSelectToLogicalPlanCore(sel *ast.Select, query string, ctes map[string
 			currentNode = lg
 		}
 	}
+	// 4. Window functions (LAG, LEAD, etc.)
+	// Window functions must be applied after GROUP BY, on the grouped result.
+	windowFuncs, err := findAllWindowFunctionsFromSelect(sel)
+	if err != nil {
+		return nil, err
+	}
+	fallbackWindowFuncs, ferr := findAllWindowFunctionsFromQuery(query)
+	if len(windowFuncs) == 0 {
+		if ferr == nil {
+			windowFuncs = fallbackWindowFuncs
+		}
+	} else if ferr == nil && len(fallbackWindowFuncs) > 0 {
+		windowFuncs = mergeWindowFuncAliases(windowFuncs, fallbackWindowFuncs)
+	}
+	for _, wf := range windowFuncs {
+		wf.Input = currentNode
+		currentNode = wf
+	}
+
+	// 5. Window aggregate functions (SUM(...) OVER ...)
+	windowAggs, err := findAllWindowAggregatesFromSelect(sel)
+	if err != nil {
+		return nil, err
+	}
+	if len(windowAggs) == 0 {
+		fallback, ferr := findAllWindowAggregatesFromQuery(query)
+		if ferr == nil {
+			windowAggs = fallback
+		}
+	}
+	for _, waf := range windowAggs {
+		waf.Input = currentNode
+		currentNode = waf
+	}
+
+	// 6. Projection (SELECT list)
 
 	// 6. Projection (SELECT list)
 	// Apply projection whenever SELECT list is explicit.
@@ -528,7 +599,7 @@ func parseSelectToLogicalPlanCore(sel *ast.Select, query string, ctes map[string
 	if len(selectCols) > 0 || len(selectExprs) > 0 {
 		if !shouldSkipFinalProjectionForWindow(sel, selectCols, selectExprs) {
 			currentNode = &ir.LogicalProject{
-				KeepInput: shouldKeepInputForProjection(sel),
+				KeepInput: shouldKeepInputForProjection(sel, query),
 				Columns:   selectCols,
 				Exprs:     selectExprs,
 				Input:     currentNode,
@@ -568,6 +639,91 @@ func parseSelectToLogicalPlanCore(sel *ast.Select, query string, ctes map[string
 	}
 
 	return currentNode, nil
+}
+
+func mergeWindowFuncAliases(primary, fallback []*ir.LogicalWindowFunc) []*ir.LogicalWindowFunc {
+	if len(primary) == 0 || len(fallback) == 0 {
+		return primary
+	}
+	for _, wf := range primary {
+		fb := findMatchingWindowFunc(fallback, wf)
+		if fb == nil {
+			continue
+		}
+		if shouldPreferFallbackOutputCol(wf.OutputCol, fb.OutputCol, wf.Spec.FuncName, firstArg(wf.Spec.Args)) {
+			wf.OutputCol = fb.OutputCol
+		}
+	}
+	return primary
+}
+
+func findMatchingWindowFunc(candidates []*ir.LogicalWindowFunc, target *ir.LogicalWindowFunc) *ir.LogicalWindowFunc {
+	if target == nil {
+		return nil
+	}
+	for _, c := range candidates {
+		if c == nil {
+			continue
+		}
+		if windowFuncSpecEqual(c.Spec, target.Spec) {
+			return c
+		}
+	}
+	return nil
+}
+
+func windowFuncSpecEqual(a, b ir.WindowFuncSpec) bool {
+	if strings.ToUpper(strings.TrimSpace(a.FuncName)) != strings.ToUpper(strings.TrimSpace(b.FuncName)) {
+		return false
+	}
+	if strings.TrimSpace(a.OrderBy) != strings.TrimSpace(b.OrderBy) {
+		return false
+	}
+	if a.Offset != b.Offset {
+		return false
+	}
+	if len(a.Args) != len(b.Args) {
+		return false
+	}
+	for i := range a.Args {
+		if strings.TrimSpace(a.Args[i]) != strings.TrimSpace(b.Args[i]) {
+			return false
+		}
+	}
+	if len(a.PartitionBy) != len(b.PartitionBy) {
+		return false
+	}
+	for i := range a.PartitionBy {
+		if strings.TrimSpace(a.PartitionBy[i]) != strings.TrimSpace(b.PartitionBy[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldPreferFallbackOutputCol(primary, fallback, funcName, arg string) bool {
+	if strings.TrimSpace(fallback) == "" {
+		return false
+	}
+	if strings.TrimSpace(primary) == "" {
+		return true
+	}
+	fn := strings.ToLower(strings.TrimSpace(funcName))
+	arg = strings.TrimSpace(arg)
+	default1 := fn + "_" + arg
+	default2 := fn + "_" + sanitizeIdentifierForAlias(arg)
+	// Prefer explicit alias when primary looks like an auto-generated name.
+	if primary == default1 || primary == default2 {
+		return true
+	}
+	return false
+}
+
+func firstArg(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[0]
 }
 
 // parseSimpleIntervalToMillis parses a very small subset of SQL interval
@@ -636,8 +792,8 @@ func parseSimpleIntervalToMillis(intervalSQL string) (int64, error) {
 }
 
 // ParseQueryToDBSP builds a LogicalPlan then transforms it to a DBSP operator node.
-func ParseQueryToDBSP(query string) (*op.Node, error) {
-	lp, err := ParseQueryToLogicalPlan(query)
+func ParseQueryToDBSP(query string, options ...ComplianceOption) (*op.Node, error) {
+	lp, err := ParseQueryToLogicalPlan(query, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -740,7 +896,7 @@ func parseJoinCore(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string
 	}, nil
 }
 
-func buildGroupByAliasMaterializationExprs(sel *ast.Select, groupCols []string) []ir.ProjectExpr {
+func buildGroupByAliasMaterializationExprs(sel *ast.Select, query string, groupCols []string) []ir.ProjectExpr {
 	if sel == nil || len(groupCols) == 0 || len(sel.SelectList) == 0 {
 		return nil
 	}
@@ -761,10 +917,24 @@ func buildGroupByAliasMaterializationExprs(sel *ast.Select, groupCols []string) 
 			continue
 		}
 		exprSQL := strings.TrimSpace(item.Expr.String())
+		if recovered, ok := extractSelectExprByAlias(query, alias); ok {
+			exprSQL = strings.TrimSpace(recovered)
+		} else {
+			exprSQL = recoverMalformedExprByAlias(query, alias, exprSQL)
+		}
 		exprSQL = simplifyGroupAliasExpr(exprSQL)
 		if exprSQL == "" {
 			continue
 		}
+
+		// Double-check: if the expression is still just the alias, try to find the raw column name
+		// if it was promoted from raw column to group key.
+		if strings.ToUpper(exprSQL) == strings.ToUpper(alias) {
+			if col, ok := item.Expr.(*ast.ColName); ok {
+				exprSQL = col.Name
+			}
+		}
+
 		out = append(out, ir.ProjectExpr{ExprSQL: exprSQL, As: alias})
 	}
 	return out
@@ -772,13 +942,120 @@ func buildGroupByAliasMaterializationExprs(sel *ast.Select, groupCols []string) 
 
 func simplifyGroupAliasExpr(expr string) string {
 	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return ""
+	}
 	upper := strings.ToUpper(expr)
+	// If it contains an aggregate function, it must be the output of a GroupAgg.
+	// We return the likely monoid output column name.
+	if strings.Contains(upper, "AVG(") {
+		return "avg_delta"
+	}
+	if strings.Contains(upper, "SUM(") {
+		return "agg_delta"
+	}
+	if strings.Contains(upper, "COUNT(") {
+		return "count_delta"
+	}
+	if strings.Contains(upper, "MIN(") {
+		return "min"
+	}
+	if strings.Contains(upper, "MAX(") {
+		return "max"
+	}
+
 	if strings.HasPrefix(upper, "TIME_BUCKET(") {
-		if col := extractTimeBucketSourceColumn(expr); col != "" {
-			return col
+		if canonical := canonicalizeTimeBucketExpr(expr); canonical != "" {
+			return canonical
 		}
 	}
+
+	// STRICT: In grouped SELECT, every non-aggregate expression must be precisely
+	// a grouping key or an expression over grouping keys.
+	// Currently, our planner materializes aliases for group keys that match
+	// the SELECT list. If an expression isn't directly a group-key alias,
+	// it should ideally be rejected if it references non-grouped columns.
+
 	return normalizeQuotedIdentifierExpr(expr)
+}
+
+func canonicalizeTimeBucketExpr(expr string) string {
+	open := strings.Index(expr, "(")
+	close := strings.LastIndex(expr, ")")
+	if open == -1 || close == -1 || close <= open {
+		return ""
+	}
+	inner := strings.TrimSpace(expr[open+1 : close])
+	if inner == "" {
+		return ""
+	}
+
+	depth := 0
+	split := -1
+	for i := 0; i < len(inner); i++ {
+		switch inner[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				split = i
+				break
+			}
+		}
+	}
+	if split == -1 {
+		return ""
+	}
+
+	firstArg := strings.TrimSpace(inner[:split])
+	secondArg := strings.TrimSpace(inner[split+1:])
+	if firstArg == "" || secondArg == "" {
+		return ""
+	}
+
+	parseInterval := func(raw string) (string, string, bool) {
+		raw = strings.TrimSpace(raw)
+		patterns := []string{
+			`(?i)^INTERVAL\s*'([0-9]+)\s*([A-Z]+)'\s*$`,
+			`(?i)^INTERVAL\s*'([0-9]+)'\s*([A-Z]+)\s*$`,
+			`(?i)^INTERVAL\s*([0-9]+)\s*([A-Z]+)\s*$`,
+		}
+		for _, pat := range patterns {
+			re := regexp.MustCompile(pat)
+			m := re.FindStringSubmatch(strings.ToUpper(raw))
+			if len(m) != 3 {
+				continue
+			}
+			num := strings.TrimSpace(m[1])
+			unit := strings.TrimSpace(m[2])
+			switch unit {
+			case "MIN", "MINS", "MINUTE", "MINUTES":
+				unit = "MINUTE"
+			case "SEC", "SECS", "SECOND", "SECONDS":
+				unit = "SECOND"
+			case "HOUR", "HOURS":
+				unit = "HOUR"
+			}
+			return num, unit, true
+		}
+		return "", "", false
+	}
+
+	num, unit, ok := parseInterval(firstArg)
+	if !ok {
+		return ""
+	}
+
+	secondArg = normalizeQuotedIdentifierExpr(secondArg)
+	if secondArg == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("TIME_BUCKET(INTERVAL '%s' %s, %s)", num, unit, secondArg)
 }
 
 func extractTimeBucketSourceColumn(expr string) string {
@@ -1268,9 +1545,9 @@ func parseFrameSpec(frame *ast.WindowFrame) *ir.FrameSpec {
 
 // ParseQueryToIncrementalDBSP parses SQL, builds DBSP graph, and applies differentiation.
 // This produces an incremental view maintenance graph that processes delta batches.
-func ParseQueryToIncrementalDBSP(query string) (*op.Node, error) {
+func ParseQueryToIncrementalDBSP(query string, options ...ComplianceOption) (*op.Node, error) {
 	// First get the base DBSP graph
-	baseNode, err := ParseQueryToDBSP(query)
+	baseNode, err := ParseQueryToDBSP(query, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -1359,7 +1636,7 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string, ct
 		// No GROUP BY - add projection if needed
 		if len(selectCols) > 0 || len(selectExprs) > 0 {
 			currentNode = &ir.LogicalProject{
-				KeepInput: shouldKeepInputForProjection(sel),
+				KeepInput: shouldKeepInputForProjection(sel, rawQuery),
 				Columns:   selectCols,
 				Exprs:     selectExprs,
 				Input:     currentNode,
@@ -1455,9 +1732,10 @@ func aggOutputAlias(query string, agg AggCall) string {
 }
 
 func findAggregatesForGroupBy(sel *ast.Select, query string) ([]AggCall, error) {
+	aggMap := make(map[string]AggCall)
+	order := make([]string, 0)
+
 	if queryAggs, err := findAggregatesFromQuery(query); err == nil && len(queryAggs) > 0 {
-		aggMap := make(map[string]AggCall)
-		order := make([]string, 0, len(queryAggs))
 		for _, a := range queryAggs {
 			a.Col = normalizeQuotedIdentifierTokens(strings.TrimSpace(a.Col))
 			a.As = extractAggAliasFromQuery(query, a)
@@ -1468,33 +1746,77 @@ func findAggregatesForGroupBy(sel *ast.Select, query string) ([]AggCall, error) 
 			order = append(order, key)
 			aggMap[key] = a
 		}
-		out := make([]AggCall, 0, len(order))
-		for _, key := range order {
-			out = append(out, aggMap[key])
-		}
-		return out, nil
 	}
 
 	if selAggs, err := findAggregatesFromSelect(sel); err == nil && len(selAggs) > 0 {
-		aggMap := make(map[string]AggCall)
-		order := make([]string, 0, len(selAggs))
 		for _, a := range selAggs {
 			a.Col = normalizeQuotedIdentifierTokens(strings.TrimSpace(a.Col))
 			key := strings.ToUpper(strings.TrimSpace(a.Name)) + "|" + strings.TrimSpace(a.Col)
-			if _, exists := aggMap[key]; exists {
+			if existing, exists := aggMap[key]; exists {
+				if strings.TrimSpace(existing.As) == "" && strings.TrimSpace(a.As) != "" {
+					existing.As = strings.TrimSpace(a.As)
+					aggMap[key] = existing
+				}
 				continue
 			}
 			order = append(order, key)
 			aggMap[key] = a
 		}
-		out := make([]AggCall, 0, len(order))
-		for _, key := range order {
-			out = append(out, aggMap[key])
-		}
-		return out, nil
 	}
 
-	return nil, errors.New("no aggregate function found")
+	// Fallback: detect nested aggregates from the select item SQL string.
+	if sel != nil {
+		for _, item := range sel.SelectList {
+			alias := strings.TrimSpace(item.As)
+			exprSQL := ""
+			if alias != "" {
+				if recovered, ok := extractSelectExprByAlias(query, alias); ok {
+					exprSQL = strings.TrimSpace(recovered)
+				}
+			}
+			if exprSQL == "" {
+				exprSQL = strings.TrimSpace(item.Expr.String())
+			}
+			if exprSQL == "" {
+				continue
+			}
+			upperExpr := strings.ToUpper(exprSQL)
+			if strings.Contains(upperExpr, " OVER ") {
+				continue
+			}
+			if looksMalformedExprSQL(exprSQL) {
+				continue
+			}
+			calls, err := parseNestedAggCalls(exprSQL)
+			if err != nil || len(calls) == 0 {
+				continue
+			}
+			for _, call := range calls {
+				call.Col = normalizeQuotedIdentifierTokens(strings.TrimSpace(call.Col))
+				call.As = alias
+				key := strings.ToUpper(strings.TrimSpace(call.Name)) + "|" + strings.TrimSpace(call.Col)
+				if existing, exists := aggMap[key]; exists {
+					if strings.TrimSpace(existing.As) == "" && strings.TrimSpace(call.As) != "" {
+						existing.As = strings.TrimSpace(call.As)
+						aggMap[key] = existing
+					}
+					continue
+				}
+				order = append(order, key)
+				aggMap[key] = call
+			}
+		}
+	}
+
+	if len(order) == 0 {
+		return nil, errors.New("no aggregate function found")
+	}
+
+	out := make([]AggCall, 0, len(order))
+	for _, key := range order {
+		out = append(out, aggMap[key])
+	}
+	return out, nil
 }
 
 // parseJoinConditions parses ON clause into JoinConditions
@@ -1600,8 +1922,17 @@ func parseJoinConditionsFromSQL(sql string) ([]ir.JoinCondition, error) {
 	return conds, nil
 }
 
-func shouldKeepInputForProjection(sel *ast.Select) bool {
+func shouldKeepInputForProjection(sel *ast.Select, query string) bool {
 	if sel == nil {
+		return false
+	}
+	// For GROUP BY queries, we must NOT keep full input because aggregation
+	// collapses the input tuples. We only have access to group keys and aggregates.
+	hasAggs := false
+	if aggs, err := findAggregatesForGroupBy(sel, query); err == nil && len(aggs) > 0 {
+		hasAggs = true
+	}
+	if len(sel.GroupBy) > 0 || hasAggs {
 		return false
 	}
 	hasWindow := false
@@ -1862,6 +2193,151 @@ func splitOnceOutsideParens(s string, sep byte) (string, string, bool) {
 		}
 	}
 	return "", "", false
+}
+
+func findTimeBucketInSelect(sel *ast.Select, query string) (*ir.TimeWindowSpec, error) {
+	for _, item := range sel.SelectList {
+		exprSQL := ""
+		if alias := strings.TrimSpace(item.As); alias != "" {
+			if recovered, ok := extractSelectExprByAlias(query, alias); ok {
+				exprSQL = recovered
+			}
+		}
+		if exprSQL == "" {
+			exprSQL = item.Expr.String()
+		}
+		upper := strings.ToUpper(exprSQL)
+		if strings.Contains(upper, "TIME_BUCKET(") {
+			// DuckDB style pattern matching: TIME_BUCKET(INTERVAL, COL)
+			open := strings.Index(upper, "TIME_BUCKET(") + 11
+			close := strings.LastIndex(upper, ")")
+			if open != -1 && close != -1 {
+				inner := strings.TrimSpace(exprSQL[open+1 : close])
+				parts := splitWindowArgs(inner)
+				if len(parts) >= 2 {
+					intervalStr := strings.TrimSpace(parts[0])
+					timeCol := strings.TrimSpace(parts[1])
+
+					// Strip CAST if present in timeCol: CAST(timestamp AS BIGINT) -> timestamp
+					colUp := strings.ToUpper(timeCol)
+					if strings.HasPrefix(colUp, "CAST(") {
+						cOpen := strings.Index(colUp, "(")
+						cAs := strings.Index(colUp, " AS ")
+						if cOpen != -1 && cAs != -1 {
+							timeCol = strings.TrimSpace(timeCol[cOpen+1 : cAs])
+						}
+					}
+					timeCol = strings.Trim(timeCol, "`\"'")
+
+					// Strip INTERVAL if present
+					if strings.HasPrefix(strings.ToUpper(intervalStr), "INTERVAL ") {
+						intervalStr = strings.TrimSpace(intervalStr[9:])
+					}
+					// and potentially quotes
+					intervalStr = strings.Trim(intervalStr, "'\"")
+
+					millis, err := parseIntervalArg(intervalStr)
+					if err == nil {
+						return &ir.TimeWindowSpec{
+							WindowType: "TUMBLING",
+							TimeCol:    timeCol,
+							SizeMillis: millis,
+						}, nil
+					}
+				}
+			}
+			// Standard Tumble/etc fallback
+			parsed, err := ParseTimeWindowSQL(exprSQL)
+			if err == nil && parsed != nil {
+				return parsed, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func findTimeBucketAliasInSelect(sel *ast.Select, query string) string {
+	if sel == nil {
+		return ""
+	}
+	for _, item := range sel.SelectList {
+		exprSQL := ""
+		alias := strings.TrimSpace(item.As)
+		if alias != "" {
+			if recovered, ok := extractSelectExprByAlias(query, alias); ok {
+				exprSQL = recovered
+			}
+		}
+		if exprSQL == "" {
+			exprSQL = item.Expr.String()
+		}
+		if strings.Contains(strings.ToUpper(exprSQL), "TIME_BUCKET(") {
+			return alias
+		}
+	}
+	return ""
+}
+
+func findNonAggregatedCols(sel *ast.Select, query string) []string {
+	seen := make(map[string]struct{})
+	var cols []string
+	for _, item := range sel.SelectList {
+		expr := item.Expr
+		alias := strings.TrimSpace(item.As)
+
+		// Don't include if it is an aggregate call
+		isAgg := false
+		exprSQL := ""
+		if alias != "" {
+			if recovered, ok := extractSelectExprByAlias(query, alias); ok {
+				exprSQL = recovered
+			}
+		}
+		if exprSQL == "" {
+			exprSQL = expr.String()
+		}
+		upper := strings.ToUpper(exprSQL)
+		if strings.Contains(upper, "AVG(") || strings.Contains(upper, "SUM(") || strings.Contains(upper, "COUNT(") || strings.Contains(upper, "MIN(") || strings.Contains(upper, "MAX(") || strings.Contains(upper, "TIME_BUCKET(") {
+			isAgg = true
+		}
+
+		if !isAgg {
+			name := alias
+			if name == "" {
+				if col, ok := expr.(*ast.ColName); ok {
+					name = col.Name
+				}
+			}
+			if name == "" {
+				// Final fallback: try to use the raw expression string if it's a simple identifier
+				raw := strings.Trim(exprSQL, "`\"'")
+				if isSimpleIdentifier(raw) {
+					name = raw
+				}
+			}
+			if name != "" {
+				if _, ok := seen[name]; !ok {
+					seen[name] = struct{}{}
+					cols = append(cols, name)
+				}
+			}
+		}
+	}
+	return cols
+}
+
+func isSimpleIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func isWordChar(c byte) bool {

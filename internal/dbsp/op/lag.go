@@ -264,6 +264,8 @@ type LagAgg struct {
 // LagMonoid is the monoid state for LAG aggregation
 type LagMonoid struct {
 	Buffer OrderedBuffer
+	// Pending captures output deltas produced by the most recent Apply call.
+	Pending types.Batch
 }
 
 func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
@@ -353,17 +355,8 @@ func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 		}
 	}
 
-	// Return single delta if only one, otherwise need to merge
-	if len(outDeltas) == 0 {
-		return monoid, nil
-	}
-	if len(outDeltas) == 1 {
-		return monoid, &outDeltas[0]
-	}
-
-	// Multiple deltas - return first one for now
-	// In full implementation, would need to batch these
-	return monoid, &outDeltas[0]
+	monoid.Pending = outDeltas
+	return monoid, nil
 }
 
 func (l *LagAgg) getOutputCol() string {

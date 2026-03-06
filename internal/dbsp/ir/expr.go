@@ -157,6 +157,7 @@ const (
 type token struct {
 	kind tokenKind
 	text string
+	pos  int
 }
 
 type exprParser struct {
@@ -177,7 +178,7 @@ func (p *exprParser) parse() (exprNode, error) {
 		return nil, err
 	}
 	if p.cur.kind != tokEOF {
-		return nil, fmt.Errorf("unexpected token %q", p.cur.text)
+		return nil, p.errorAtCurrent(fmt.Sprintf("unexpected token %q", p.cur.text))
 	}
 	return n, nil
 }
@@ -245,7 +246,7 @@ func (p *exprParser) parseCast() (exprNode, error) {
 	for p.cur.kind == tokDoubleColon {
 		p.cur = p.nextToken()
 		if p.cur.kind != tokIdent {
-			return nil, fmt.Errorf("expected type after ::")
+			return nil, p.errorAtCurrent("expected type after ::")
 		}
 		typeName := p.cur.text
 		p.cur = p.nextToken()
@@ -262,7 +263,7 @@ func (p *exprParser) parseJSON() (exprNode, error) {
 	for p.cur.kind == tokArrow {
 		p.cur = p.nextToken()
 		if p.cur.kind != tokString && p.cur.kind != tokIdent {
-			return nil, fmt.Errorf("expected key after ->")
+			return nil, p.errorAtCurrent("expected key after ->")
 		}
 		key := p.cur.text
 		p.cur = p.nextToken()
@@ -305,7 +306,7 @@ func (p *exprParser) parsePrimary() (exprNode, error) {
 				}
 			}
 			if p.cur.kind != tokRParen {
-				return nil, fmt.Errorf("expected ) after function args")
+				return nil, p.errorAtCurrent("expected ) after function args")
 			}
 			p.cur = p.nextToken()
 			return &funcCallNode{name: strings.ToUpper(ident), args: args}, nil
@@ -313,7 +314,7 @@ func (p *exprParser) parsePrimary() (exprNode, error) {
 		if strings.ToUpper(ident) == "INTERVAL" {
 			// Handle INTERVAL '5' MINUTE
 			if p.cur.kind != tokString && p.cur.kind != tokNumber {
-				return nil, fmt.Errorf("expected value after INTERVAL")
+				return nil, p.errorAtCurrent("expected value after INTERVAL")
 			}
 			val := p.cur.text
 			p.cur = p.nextToken()
@@ -351,12 +352,12 @@ func (p *exprParser) parsePrimary() (exprNode, error) {
 			return nil, err
 		}
 		if p.cur.kind != tokRParen {
-			return nil, fmt.Errorf("expected )")
+			return nil, p.errorAtCurrent("expected )")
 		}
 		p.cur = p.nextToken()
 		return inner, nil
 	default:
-		return nil, fmt.Errorf("unexpected token %q", p.cur.text)
+		return nil, p.errorAtCurrent(fmt.Sprintf("unexpected token %q", p.cur.text))
 	}
 }
 
@@ -371,59 +372,60 @@ func (p *exprParser) nextToken() token {
 		break
 	}
 	if p.pos >= len(p.src) {
-		return token{kind: tokEOF}
+		return token{kind: tokEOF, pos: len(p.src)}
 	}
 
+	start := p.pos
 	c := p.src[p.pos]
 	switch c {
 	case '+':
 		p.pos++
-		return token{kind: tokPlus, text: "+"}
+		return token{kind: tokPlus, text: "+", pos: start}
 	case '-':
 		if p.pos+1 < len(p.src) && p.src[p.pos+1] == '>' {
 			p.pos += 2
-			return token{kind: tokArrow, text: "->"}
+			return token{kind: tokArrow, text: "->", pos: start}
 		}
 		p.pos++
-		return token{kind: tokMinus, text: "-"}
+		return token{kind: tokMinus, text: "-", pos: start}
 	case '*':
 		p.pos++
-		return token{kind: tokStar, text: "*"}
+		return token{kind: tokStar, text: "*", pos: start}
 	case '/':
 		p.pos++
-		return token{kind: tokSlash, text: "/"}
+		return token{kind: tokSlash, text: "/", pos: start}
 	case '(':
 		p.pos++
-		return token{kind: tokLParen, text: "("}
+		return token{kind: tokLParen, text: "(", pos: start}
 	case ')':
 		p.pos++
-		return token{kind: tokRParen, text: ")"}
+		return token{kind: tokRParen, text: ")", pos: start}
 	case ':':
 		if p.pos+1 < len(p.src) && p.src[p.pos+1] == ':' {
 			p.pos += 2
-			return token{kind: tokDoubleColon, text: "::"}
+			return token{kind: tokDoubleColon, text: "::", pos: start}
 		}
 		p.pos++
-		return token{kind: tokIdent, text: ":"}
+		return token{kind: tokIdent, text: ":", pos: start}
 	case ',':
 		p.pos++
-		return token{kind: tokComma, text: ","}
+		return token{kind: tokComma, text: ",", pos: start}
 	case '\'':
 		// single-quoted string
 		p.pos++
-		start := p.pos
+		start = p.pos
 		for p.pos < len(p.src) && p.src[p.pos] != '\'' {
 			p.pos++
 		}
 		if p.pos >= len(p.src) {
-			return token{kind: tokString, text: p.src[start:]}
+			return token{kind: tokString, text: p.src[start:], pos: start - 1}
 		}
 		text := p.src[start:p.pos]
 		p.pos++
-		return token{kind: tokString, text: text}
+		return token{kind: tokString, text: text, pos: start - 1}
 	default:
 		// ident or number
-		start := p.pos
+		start = p.pos
 		if c >= '0' && c <= '9' {
 			p.pos++
 			for p.pos < len(p.src) {
@@ -434,7 +436,7 @@ func (p *exprParser) nextToken() token {
 				}
 				break
 			}
-			return token{kind: tokNumber, text: p.src[start:p.pos]}
+			return token{kind: tokNumber, text: p.src[start:p.pos], pos: start}
 		}
 		p.pos++
 		for p.pos < len(p.src) {
@@ -445,8 +447,20 @@ func (p *exprParser) nextToken() token {
 			}
 			break
 		}
-		return token{kind: tokIdent, text: strings.TrimSpace(p.src[start:p.pos])}
+		return token{kind: tokIdent, text: strings.TrimSpace(p.src[start:p.pos]), pos: start}
 	}
+}
+
+func (p *exprParser) errorAtCurrent(msg string) error {
+	pos := p.cur.pos
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(p.src) {
+		pos = len(p.src)
+	}
+	caret := strings.Repeat(" ", pos) + "^"
+	return fmt.Errorf("%s\nat pos %d:\n%s\n%s", msg, pos, p.src, caret)
 }
 
 type exprNode interface {
@@ -743,6 +757,9 @@ func evalRound(value any, precision int64) (any, error) {
 }
 
 func toTime(v any) (time.Time, error) {
+	if v == nil {
+		return time.Time{}, nil
+	}
 	switch x := v.(type) {
 	case time.Time:
 		return x, nil
@@ -760,11 +777,68 @@ func toTime(v any) (time.Time, error) {
 		}
 		return time.Time{}, fmt.Errorf("cannot parse time: %s", x)
 	case int64:
-		return time.Unix(x, 0), nil
+		switch {
+		case x > 1e16:
+			return time.Unix(0, x), nil
+		case x > 1e14:
+			return time.Unix(0, x*1e3), nil
+		case x > 1e11:
+			return time.Unix(0, x*1e6), nil
+		default:
+			return time.Unix(x, 0), nil
+		}
 	case int:
-		return time.Unix(int64(x), 0), nil
+		xi := int64(x)
+		switch {
+		case xi > 1e16:
+			return time.Unix(0, xi), nil
+		case xi > 1e14:
+			return time.Unix(0, xi*1e3), nil
+		case xi > 1e11:
+			return time.Unix(0, xi*1e6), nil
+		default:
+			return time.Unix(xi, 0), nil
+		}
 	case float64:
-		return time.Unix(int64(x), 0), nil
+		xi := int64(x)
+		switch {
+		case xi > 1e16:
+			return time.Unix(0, xi), nil
+		case xi > 1e14:
+			return time.Unix(0, xi*1e3), nil
+		case xi > 1e11:
+			return time.Unix(0, xi*1e6), nil
+		default:
+			return time.Unix(xi, 0), nil
+		}
+	case json.Number:
+		if iv, err := x.Int64(); err == nil {
+			switch {
+			case iv > 1e16:
+				return time.Unix(0, iv), nil
+			case iv > 1e14:
+				return time.Unix(0, iv*1e3), nil
+			case iv > 1e11:
+				return time.Unix(0, iv*1e6), nil
+			default:
+				return time.Unix(iv, 0), nil
+			}
+		}
+		fv, err := x.Float64()
+		if err != nil {
+			return time.Time{}, fmt.Errorf("unsupported time conversion: %T", v)
+		}
+		iv := int64(fv)
+		switch {
+		case iv > 1e16:
+			return time.Unix(0, iv), nil
+		case iv > 1e14:
+			return time.Unix(0, iv*1e3), nil
+		case iv > 1e11:
+			return time.Unix(0, iv*1e6), nil
+		default:
+			return time.Unix(iv, 0), nil
+		}
 	default:
 		return time.Time{}, fmt.Errorf("unsupported time conversion: %T", v)
 	}
@@ -787,7 +861,7 @@ func parseInterval(s any) (time.Duration, error) {
 	switch unit {
 	case "SECOND", "SECONDS":
 		return time.Duration(val) * time.Second, nil
-	case "MINUTE", "MINUTES":
+	case "MIN", "MINS", "MINUTE", "MINUTES":
 		return time.Duration(val) * time.Minute, nil
 	case "HOUR", "HOURS":
 		return time.Duration(val) * time.Hour, nil

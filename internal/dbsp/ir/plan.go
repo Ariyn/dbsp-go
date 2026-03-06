@@ -71,6 +71,8 @@ type LogicalGroupAgg struct {
 	// non-windowed group-by. If non-nil, the engine will treat this as
 	// a tumbling-window aggregation over TimeCol with the given size.
 	WindowSpec *WindowSpec
+	// TimeWindowSpec describes TUMBLE, HOP/SLIDING, or SESSION windows.
+	TimeWindowSpec *TimeWindowSpec
 	// Input is the child logical node
 	Input LogicalNode
 }

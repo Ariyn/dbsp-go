@@ -3,6 +3,8 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/provider"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
@@ -52,6 +54,9 @@ func RunPipeline(ctx context.Context, source provider.Source, sink provider.Sink
 		resultBatch, err := execute(batch)
 		if err != nil {
 			return err
+		}
+		if strings.TrimSpace(os.Getenv("DBSP_DEBUG_PIPELINE")) != "" {
+			fmt.Printf("DEBUG pipeline: output batch size=%d\n", len(resultBatch))
 		}
 		if err := sink.WriteBatch(resultBatch); err != nil {
 			return err

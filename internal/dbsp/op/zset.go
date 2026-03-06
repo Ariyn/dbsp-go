@@ -2,7 +2,15 @@ package op
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/array"
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/parquet"
+	"github.com/apache/arrow/go/v15/parquet/compress"
+	"github.com/apache/arrow/go/v15/parquet/pqarrow"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
@@ -96,6 +104,80 @@ func (s *ZSetStore) LookupByKey(key any, keyFn func(types.Tuple) any) []types.Tu
 		return true
 	})
 	return out
+}
+
+// WriteToParquet serializes the current state of the ZSetStore to a Parquet file.
+func (s *ZSetStore) WriteToParquet(path string, arrowSchema *arrow.Schema, mem memory.Allocator) error {
+	if s == nil || s.entries == nil || len(s.entries) == 0 {
+		return nil // Nothing to save
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	props := parquet.NewWriterProperties(parquet.WithCompression(compress.Codecs.Snappy))
+	arrProps := pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema())
+
+	writer, err := pqarrow.NewFileWriter(arrowSchema, f, props, arrProps)
+	if err != nil {
+		return err
+	}
+	defer writer.Close()
+
+	// Materialize Z-set into arrow record
+	builders := make([]array.Builder, len(arrowSchema.Fields()))
+	for i, f := range arrowSchema.Fields() {
+		builders[i] = array.NewBuilder(mem, f.Type)
+	}
+	defer func() {
+		for _, b := range builders {
+			if b != nil {
+				b.Release()
+			}
+		}
+	}()
+
+	for _, entry := range s.entries {
+		for i, field := range arrowSchema.Fields() {
+			val, ok := entry.tuple[field.Name]
+			if !ok || val == nil {
+				builders[i].AppendNull()
+				continue
+			}
+
+			switch field.Type.ID() {
+			case arrow.INT64:
+				iv, _ := types.ToInt64Safe(val)
+				builders[i].(*array.Int64Builder).Append(iv)
+			case arrow.FLOAT64:
+				fv, _ := types.ToFloat64Safe(val)
+				builders[i].(*array.Float64Builder).Append(fv)
+			case arrow.STRING:
+				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
+			default:
+				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
+			}
+		}
+	}
+
+	cols := make([]arrow.Array, len(builders))
+	for i, b := range builders {
+		cols[i] = b.NewArray()
+	}
+	rec := array.NewRecord(arrowSchema, cols, int64(len(s.entries)))
+	defer rec.Release()
+	for _, a := range cols {
+		a.Release()
+	}
+
+	return writer.Write(rec)
 }
 
 func (s *ZSetStore) ToBatch() types.Batch {

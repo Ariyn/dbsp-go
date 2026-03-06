@@ -23,7 +23,11 @@ func isSimpleColumnRef(expr string) bool {
 }
 
 func buildGroupKeyFn(keys []string) func(types.Tuple) any {
-	if len(keys) == 0 {
+	return buildGroupKeyFnWithWindow(keys, nil)
+}
+
+func buildGroupKeyFnWithWindow(keys []string, window *TimeWindowSpec) func(types.Tuple) any {
+	if len(keys) == 0 && window == nil {
 		return func(types.Tuple) any { return nil }
 	}
 
@@ -37,21 +41,47 @@ func buildGroupKeyFn(keys []string) func(types.Tuple) any {
 		}
 	}
 
-	if len(keys) == 1 {
-		fn := exprFns[0]
-		return func(t types.Tuple) any {
-			v, _ := fn(t)
-			return v
+	// Prepare window bucket function if needed
+	var timeCol string
+	var size int64
+	var timeExpr func(types.Tuple) (any, error)
+	if window != nil {
+		timeCol = window.TimeCol
+		size = window.SizeMillis
+		if strings.ContainsAny(timeCol, "()->:+-*/ ") {
+			timeExpr = BuildExprFunc(timeCol)
+		} else {
+			timeExpr = func(t types.Tuple) (any, error) { return t[timeCol], nil }
 		}
 	}
 
-	keyCols := append([]string(nil), keys...)
 	return func(t types.Tuple) any {
-		kt := make(types.Tuple, len(keyCols))
-		for i, col := range keyCols {
+		kt := make(types.Tuple, len(keys)+1)
+		for i, col := range keys {
 			v, _ := exprFns[i](t)
 			kt[col] = v
 		}
+
+		if window != nil {
+			v, _ := timeExpr(t)
+			if v != nil {
+				ts, err := toTime(v)
+				if err == nil {
+					millis := ts.UnixNano() / 1e6
+					if size > 0 {
+						bucket := (millis / size) * size
+						kt["window_start"] = bucket
+					} else {
+						kt["window_start"] = millis
+					}
+				} else {
+					fmt.Printf("DEBUG: toTime failed for value %v (type %T): %v\n", v, v, err)
+				}
+			} else {
+				fmt.Printf("DEBUG: timeExpr returned nil for column %s in tuple %v\n", window.TimeCol, t)
+			}
+		}
+
 		b, err := json.Marshal(kt)
 		if err == nil {
 			return string(b)
@@ -374,7 +404,7 @@ func LogicalToDBSP(l LogicalNode) (*op.Node, error) {
 
 // logicalGroupAggToDBSPWithContext transforms LogicalGroupAgg to a GroupAgg or WindowAgg operator.
 func logicalGroupAggToDBSPWithContext(n *LogicalGroupAgg, ctes map[string]*op.Node) (*op.Node, error) {
-	keyFn := buildGroupKeyFn(n.Keys)
+	keyFn := buildGroupKeyFnWithWindow(n.Keys, n.TimeWindowSpec)
 
 	var aggOp op.Operator
 	if len(n.Aggs) > 0 {
@@ -390,18 +420,36 @@ func logicalGroupAggToDBSPWithContext(n *LogicalGroupAgg, ctes map[string]*op.No
 		}
 		g := op.NewGroupAggMultiOp(keyFn, aggSlots)
 		g.SetGroupKeyColNames(n.Keys)
+		g.EmitValue = true
+		if n.TimeWindowSpec != nil {
+			g.TimeWindowSpec = op.WindowSpecLite{
+				TimeCol:     n.TimeWindowSpec.TimeCol,
+				SizeMillis:  n.TimeWindowSpec.SizeMillis,
+				WindowType:  op.WindowTypeTumbling, // Default for now
+				SlideMillis: n.TimeWindowSpec.SlideMillis,
+				GapMillis:   n.TimeWindowSpec.GapMillis,
+			}
+		}
 		aggOp = g
 	} else {
 		agg, aggInit, err := buildSingleAggFunc(strings.ToUpper(n.AggName), n.AggCol)
 		if err != nil {
 			return nil, err
 		}
-		if n.WindowSpec != nil {
+		if n.TimeWindowSpec != nil {
+			ws := n.TimeWindowSpec
+			aggOp = op.NewWindowAggOp(op.WindowSpecLite{
+				TimeCol:    ws.TimeCol,
+				SizeMillis: ws.SizeMillis,
+				WindowType: op.WindowTypeTumbling,
+			}, keyFn, n.Keys, aggInit, agg)
+		} else if n.WindowSpec != nil {
 			ws := n.WindowSpec
 			aggOp = op.NewWindowAggOp(op.WindowSpecLite{TimeCol: ws.TimeCol, SizeMillis: ws.SizeMillis}, keyFn, n.Keys, aggInit, agg)
 		} else {
 			g := op.NewGroupAggOp(keyFn, aggInit, agg)
 			g.SetGroupKeyColNames(n.Keys)
+			g.EmitValue = true
 			aggOp = g
 		}
 	}
@@ -727,6 +775,8 @@ func logicalWindowAggToDBSPWithContext(wa *LogicalWindowAgg, ctes map[string]*op
 		}
 
 		windowOp := op.NewWindowAggOp(windowSpec, keyFn, wa.PartitionBy, aggInit, agg)
+		windowOp.KeepInput = true
+		windowOp.EmitValue = true
 		return attachLogicalWindowAggInputWithContext(wa, windowOp, ctes)
 	}
 
@@ -752,6 +802,8 @@ func logicalWindowAggToDBSPWithContext(wa *LogicalWindowAgg, ctes map[string]*op
 		windowOp := op.NewWindowAggOp(op.WindowSpecLite{}, keyFn, wa.PartitionBy, aggInit, agg)
 		windowOp.OrderByCol = wa.OrderBy
 		windowOp.FrameSpec = frameSpec
+		windowOp.KeepInput = true
+		windowOp.EmitValue = true
 
 		node, err := attachLogicalWindowAggInputWithContext(wa, windowOp, ctes)
 		if err != nil {

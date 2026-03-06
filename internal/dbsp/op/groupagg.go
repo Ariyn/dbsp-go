@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
@@ -22,6 +23,10 @@ type GroupAggOp struct {
 	AggFn   AggFunc
 	Aggs    []AggSlot
 
+	// EmitValue switches aggregate output from delta to current value.
+	// When true, the operator emits (-1 old, +1 new) value tuples per key.
+	EmitValue bool
+
 	state      map[any]any
 	multiState map[any][]any
 	KeyColName string // Optional: name of the key column to include in output (legacy single-key mode)
@@ -32,6 +37,14 @@ type GroupAggOp struct {
 	// This is preferred for multi-key grouping because the internal key may be an
 	// encoded composite string.
 	GroupKeyColNames []string
+
+	// TimeWindowSpec, when set, applying a fixed tumbling window over the timestamp
+	// column before aggregation.
+	TimeWindowSpec WindowSpecLite
+
+	// StateTTL evicts per-key aggregate state based on processing-time inactivity.
+	StateTTL    time.Duration
+	lastTouched map[any]time.Time
 
 	stateBackend StateBackend
 	statePrefix  string
@@ -64,6 +77,50 @@ func (g *GroupAggOp) SetStateBackend(backend StateBackend, prefix string) {
 	if g.statePrefix == "" {
 		g.statePrefix = "groupagg/default"
 	}
+}
+
+func (g *GroupAggOp) SetStateTTL(ttl time.Duration) {
+	g.StateTTL = ttl
+}
+
+func (g *GroupAggOp) touchKey(now time.Time, key any) {
+	if g.StateTTL <= 0 {
+		return
+	}
+	if g.lastTouched == nil {
+		g.lastTouched = make(map[any]time.Time)
+	}
+	g.lastTouched[key] = now
+}
+
+func (g *GroupAggOp) evictExpired(now time.Time) error {
+	if g.StateTTL <= 0 || len(g.lastTouched) == 0 {
+		return nil
+	}
+	for key, touched := range g.lastTouched {
+		if now.Sub(touched) <= g.StateTTL {
+			continue
+		}
+		delete(g.lastTouched, key)
+		if g.backendEnabled() {
+			if len(g.Aggs) > 0 {
+				if err := g.stateBackend.Delete(g.multiStateKey(key)); err != nil {
+					return err
+				}
+			} else {
+				if err := g.stateBackend.Delete(g.singleStateKey(key)); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if len(g.Aggs) > 0 {
+			delete(g.multiState, key)
+		} else {
+			delete(g.state, key)
+		}
+	}
+	return nil
 }
 
 func (g *GroupAggOp) backendEnabled() bool {
@@ -381,13 +438,52 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 		return g.applyMulti(batch)
 	}
 
+	now := time.Now()
+	if err := g.evictExpired(now); err != nil {
+		return nil, err
+	}
+
 	var out types.Batch
-	// For delta-style aggregates (SUM/COUNT/AVG), compact per group key within
-	// the batch so that net-zero changes don't emit output.
-	pending := make(map[any]*types.TupleDelta)
 	if g.state == nil {
 		g.state = make(map[any]any)
 	}
+	if g.EmitValue {
+		for _, td := range batch {
+			key := g.KeyFn(td.Tuple)
+			prev, ok, err := g.getSingleState(key)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				prev = g.AggInit()
+			}
+			oldVal := any(nil)
+			if ok {
+				oldVal = aggValueFromState(g.AggFn, prev)
+			}
+			newState, _ := g.AggFn.Apply(prev, td)
+			if err := g.putSingleState(key, newState); err != nil {
+				return nil, err
+			}
+			g.touchKey(now, key)
+			newVal := aggValueFromState(g.AggFn, newState)
+			if ok && types.EqualAny(oldVal, newVal) {
+				continue
+			}
+			colName := aggOutputColumnName(g.AggFn)
+			if ok && oldVal != nil {
+				out = append(out, types.TupleDelta{Tuple: g.buildValueTuple(td, key, map[string]any{colName: oldVal}), Count: -1})
+			}
+			if newVal != nil {
+				out = append(out, types.TupleDelta{Tuple: g.buildValueTuple(td, key, map[string]any{colName: newVal}), Count: 1})
+			}
+		}
+		return out, nil
+	}
+
+	// For delta-style aggregates (SUM/COUNT/AVG), compact per group key within
+	// the batch so that net-zero changes don't emit output.
+	pending := make(map[any]*types.TupleDelta)
 	for _, td := range batch {
 		key := g.KeyFn(td.Tuple)
 		prev, ok, err := g.getSingleState(key)
@@ -398,9 +494,37 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 			prev = g.AggInit()
 		}
 		newVal, outDelta := g.AggFn.Apply(prev, td)
+		if lagAgg, ok := g.AggFn.(*LagAgg); ok {
+			_ = lagAgg
+			lm, ok := newVal.(LagMonoid)
+			if !ok {
+				return nil, fmt.Errorf("unexpected lag monoid type %T", newVal)
+			}
+			pendingLag := lm.Pending
+			lm.Pending = nil
+			if err := g.putSingleState(key, lm); err != nil {
+				return nil, err
+			}
+			g.touchKey(now, key)
+			for _, ld := range pendingLag {
+				if ld.Tuple == nil {
+					ld.Tuple = types.Tuple{}
+				}
+				if len(g.GroupKeyColNames) > 0 {
+					for _, col := range g.GroupKeyColNames {
+						ld.Tuple[col] = td.Tuple[col]
+					}
+				} else if g.KeyColName != "" {
+					ld.Tuple[g.KeyColName] = key
+				}
+				out = append(out, ld)
+			}
+			continue
+		}
 		if err := g.putSingleState(key, newVal); err != nil {
 			return nil, err
 		}
+		g.touchKey(now, key)
 		if outDelta != nil {
 			if outDelta.Tuple == nil {
 				outDelta.Tuple = types.Tuple{}
@@ -471,6 +595,61 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 
 func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
+
+	now := time.Now()
+	if err := g.evictExpired(now); err != nil {
+		return nil, err
+	}
+	if g.EmitValue {
+		if g.multiState == nil {
+			g.multiState = make(map[any][]any)
+		}
+		for _, td := range batch {
+			key := g.KeyFn(td.Tuple)
+			states, ok, err := g.getMultiState(key)
+			if err != nil {
+				return nil, err
+			}
+			if !ok || len(states) != len(g.Aggs) {
+				states = make([]any, len(g.Aggs))
+				for i, a := range g.Aggs {
+					if a.Init != nil {
+						states[i] = a.Init()
+					}
+				}
+			}
+			oldVals := make([]any, len(g.Aggs))
+			if ok {
+				for i, a := range g.Aggs {
+					oldVals[i] = aggValueFromState(a.Fn, states[i])
+				}
+			}
+			for i, a := range g.Aggs {
+				newVal, _ := a.Fn.Apply(states[i], td)
+				states[i] = newVal
+			}
+			if err := g.putMultiState(key, states); err != nil {
+				return nil, err
+			}
+			g.touchKey(now, key)
+			newVals := make([]any, len(g.Aggs))
+			changed := !ok
+			for i, a := range g.Aggs {
+				newVals[i] = aggValueFromState(a.Fn, states[i])
+				if ok && !types.EqualAny(oldVals[i], newVals[i]) {
+					changed = true
+				}
+			}
+			if !changed {
+				continue
+			}
+			if ok {
+				out = append(out, types.TupleDelta{Tuple: g.buildValueTuple(td, key, aggValueMap(g.Aggs, oldVals)), Count: -1})
+			}
+			out = append(out, types.TupleDelta{Tuple: g.buildValueTuple(td, key, aggValueMap(g.Aggs, newVals)), Count: 1})
+		}
+		return out, nil
+	}
 	// Compact additive deltas per group key within the batch so that net-zero
 	// changes don't emit output.
 	pending := make(map[any]*types.TupleDelta)
@@ -526,6 +705,7 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 		if err := g.putMultiState(key, states); err != nil {
 			return nil, err
 		}
+		g.touchKey(now, key)
 	}
 
 	for _, td := range pending {
@@ -566,6 +746,117 @@ func mergePendingTupleDeltaLocal(pending map[any]*types.TupleDelta, key any, del
 
 	// Keep merged deltas; higher-level consumers may rely on explicit zero/non-zero
 	// updates for grouped outputs in complex plans.
+}
+
+func aggOutputColumnName(agg AggFunc) string {
+	switch a := agg.(type) {
+	case *SumAgg:
+		if strings.TrimSpace(a.DeltaCol) != "" {
+			return a.DeltaCol
+		}
+		return "agg_delta"
+	case *AvgAgg:
+		if strings.TrimSpace(a.DeltaCol) != "" {
+			return a.DeltaCol
+		}
+		return "avg_delta"
+	case *CountAgg:
+		if strings.TrimSpace(a.DeltaCol) != "" {
+			return a.DeltaCol
+		}
+		return "count_delta"
+	case *MinAgg:
+		return "min"
+	case *MaxAgg:
+		return "max"
+	default:
+		return "agg_delta"
+	}
+}
+
+func aggValueFromState(agg AggFunc, state any) any {
+	if state == nil {
+		return nil
+	}
+	switch a := agg.(type) {
+	case *SumAgg:
+		switch v := state.(type) {
+		case float64:
+			return v
+		case int64:
+			return float64(v)
+		case int:
+			return float64(v)
+		default:
+			return types.ToFloat64(state)
+		}
+	case *CountAgg:
+		switch v := state.(type) {
+		case int64:
+			return v
+		case int:
+			return int64(v)
+		default:
+			return types.ToInt64(state)
+		}
+	case *AvgAgg:
+		switch v := state.(type) {
+		case AvgMonoid:
+			if v.Count == 0 {
+				return nil
+			}
+			return v.Sum / float64(v.Count)
+		case AvgState:
+			if v.count == 0 {
+				return nil
+			}
+			return v.sum / v.count
+		default:
+			return state
+		}
+	case *MinAgg:
+		ms, ok := state.(SortedMultiset)
+		if !ok || ms.IsEmpty() {
+			return nil
+		}
+		_ = a
+		return ms.Min()
+	case *MaxAgg:
+		ms, ok := state.(SortedMultiset)
+		if !ok || ms.IsEmpty() {
+			return nil
+		}
+		_ = a
+		return ms.Max()
+	default:
+		return state
+	}
+}
+
+func (g *GroupAggOp) buildValueTuple(td types.TupleDelta, key any, values map[string]any) types.Tuple {
+	out := types.Tuple{}
+	if len(g.GroupKeyColNames) > 0 {
+		for _, col := range g.GroupKeyColNames {
+			out[col] = td.Tuple[col]
+		}
+	} else if g.KeyColName != "" {
+		out[g.KeyColName] = key
+	}
+	for k, v := range values {
+		out[k] = v
+	}
+	return out
+}
+
+func aggValueMap(aggs []AggSlot, vals []any) map[string]any {
+	out := make(map[string]any, len(aggs))
+	for i, a := range aggs {
+		col := aggOutputColumnName(a.Fn)
+		if i < len(vals) {
+			out[col] = vals[i]
+		}
+	}
+	return out
 }
 
 func addNumericLocal(a, b any) any {
@@ -852,9 +1143,9 @@ func (c *CountAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta)
 // The aggregate value is computed as sum/count, and the delta reports
 // changes in the "avg_delta" column.
 type AvgAgg struct {
-	ColName string
+	ColName  string
 	DeltaCol string
-	Expr    func(types.Tuple) (any, error)
+	Expr     func(types.Tuple) (any, error)
 }
 
 // AvgMonoid is the monoid structure for AVG aggregation.
@@ -930,10 +1221,34 @@ func (a *AvgAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 	switch x := raw.(type) {
 	case int:
 		v = float64(x)
+	case int32:
+		v = float64(x)
 	case int64:
+		v = float64(x)
+	case uint:
+		v = float64(x)
+	case uint32:
+		v = float64(x)
+	case uint64:
+		v = float64(x)
+	case float32:
 		v = float64(x)
 	case float64:
 		v = x
+	case json.Number:
+		f, err := x.Float64()
+		if err != nil {
+			v = 0
+			break
+		}
+		v = f
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			v = 0
+			break
+		}
+		v = f
 	default:
 		v = 0
 	}

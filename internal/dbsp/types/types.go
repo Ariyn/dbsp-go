@@ -181,17 +181,32 @@ func ToFloat64Safe(v any) (float64, bool) {
 	case uint32:
 		return float64(x), true
 	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
-		if err != nil {
-			return 0, false
+		trimmed := strings.TrimSpace(x)
+		f, err := strconv.ParseFloat(trimmed, 64)
+		if err == nil {
+			return f, true
 		}
-		return f, true
+		// Accept common timestamp strings and map to UnixNano for numeric casts.
+		layouts := []string{
+			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05Z07:00",
+			"2006-01-02",
+			time.RFC3339,
+		}
+		for _, layout := range layouts {
+			if t, perr := time.Parse(layout, trimmed); perr == nil {
+				return float64(t.UnixNano()), true
+			}
+		}
+		return 0, false
 	case json.Number:
 		f, err := x.Float64()
 		if err != nil {
 			return 0, false
 		}
 		return f, true
+	case time.Time:
+		return float64(x.UnixNano()), true
 	default:
 		return 0, false
 	}
@@ -234,6 +249,8 @@ func ToInt64Safe(v any) (int64, bool) {
 			return 0, false
 		}
 		return i, true
+	case time.Time:
+		return x.UnixNano(), true
 	default:
 		return 0, false
 	}
@@ -342,7 +359,7 @@ func equalValue(a, b reflect.Value) bool {
 	case reflect.Func:
 		return a.IsNil() && b.IsNil()
 	default:
-		if a.Type() == b.Type() && a.Type().Comparable() {
+		if a.Type() == b.Type() && a.Type().Comparable() && a.CanInterface() && b.CanInterface() {
 			return a.Interface() == b.Interface()
 		}
 		if a.CanInterface() && b.CanInterface() {

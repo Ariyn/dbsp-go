@@ -44,7 +44,11 @@ func extractSelectColumns(sel *ast.Select) ([]string, error) {
 func extractProjectionSpecs(sel *ast.Select, query string) ([]string, []ir.ProjectExpr, error) {
 	var cols []string
 	var exprs []ir.ProjectExpr
-	groupedQuery := len(sel.GroupBy) > 0
+	hasAggs := false
+	if items, err := findAggregatesFromQuery(query); err == nil && len(items) > 0 {
+		hasAggs = true
+	}
+	groupedQuery := len(sel.GroupBy) > 0 || hasAggs
 	for _, item := range sel.SelectList {
 		switch e := item.Expr.(type) {
 		case *ast.StarExpr:
@@ -121,7 +125,10 @@ func extractProjectionSpecs(sel *ast.Select, query string) ([]string, []ir.Proje
 			if groupedQuery {
 				colName := strings.TrimSpace(item.As)
 				if colName == "" {
-					return nil, nil, errors.New("unsupported grouped function expression without alias (use AS <name>)")
+					// STRICT: If not an aggregate and not an obvious group key alias,
+					// we should check if it's actually an allowed group key expression.
+					// For now, if no alias is provided, we fail to avoid silent NULLs.
+					return nil, nil, errors.New("grouped SELECT expression must have an alias or be an aggregate/group-key (e.g. SELECT expr AS name ... GROUP BY expr)")
 				}
 				cols = append(cols, colName)
 				continue
@@ -290,6 +297,9 @@ func findAggregatesFromSelect(sel *ast.Select) ([]AggCall, error) {
 	}
 	out := make([]AggCall, 0)
 	for _, item := range sel.SelectList {
+		if fn, ok := item.Expr.(*ast.FuncExpr); ok && fn.Over != nil {
+			continue
+		}
 		aggs := collectAggCallsFromExpr(item.Expr)
 		for _, agg := range aggs {
 			agg.As = strings.TrimSpace(item.As)
@@ -690,6 +700,12 @@ func recoverMalformedExprByAlias(query, alias, exprSQL string) string {
 func looksMalformedExprSQL(expr string) bool {
 	e := strings.TrimSpace(expr)
 	if e == "" {
+		return true
+	}
+	if strings.Count(e, "'")%2 == 1 {
+		return true
+	}
+	if strings.Contains(e, "''") {
 		return true
 	}
 	if strings.Contains(e, "'('") || strings.Contains(e, "')'") {

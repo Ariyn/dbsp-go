@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "query_hash": "0bec9906851b89e8cccc6237c8b04cd7e7859f3fce7069e3f7a139ed0595efca",
+  "columns": [
+    {
+      "name": "id",
+      "type": "int64"
+    },
+    {
+      "name": "name",
+      "type": "string"
+    }
+  ]
+}

@@ -4,16 +4,20 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/cmd/dbsp/pipeline"
 	"github.com/ariyn/dbsp/cmd/dbsp/provider"
 	"github.com/ariyn/dbsp/cmd/dbsp/sink"
 	"github.com/ariyn/dbsp/cmd/dbsp/source"
+	"github.com/ariyn/dbsp/internal/dbsp/ir"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
@@ -22,8 +26,25 @@ import (
 var compileIncrementalQuery = sqlconv.ParseQueryToIncrementalDBSP
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "graph" {
+		if err := runGraphCommand(os.Args[2:]); err != nil {
+			fmt.Printf("graph error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if addr := strings.TrimSpace(os.Getenv("DBSP_PPROF_ADDR")); addr != "" {
+		go func() {
+			fmt.Printf("pprof listening on %s\n", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				fmt.Printf("pprof server error: %v\n", err)
+			}
+		}()
+	}
 
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
@@ -80,12 +101,17 @@ func validateMinimalContract(cfg *config.PipelineConfig) error {
 }
 
 func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig) error {
-	query, rootNode, err := compileTransform(cfg)
+	query, rootNode, requiredFields, err := compileTransform(cfg)
 	if err != nil {
 		return err
 	}
+	if ttl, err := config.ParseDuration(cfg.Pipeline.State.StateTTL); err != nil {
+		return fmt.Errorf("invalid state_ttl: %w", err)
+	} else if ttl > 0 {
+		op.ApplyStateTTL(rootNode, ttl)
+	}
 
-	src, err := newSource(cfg)
+	src, err := newSource(cfg, requiredFields)
 	if err != nil {
 		return fmt.Errorf("initializing source: %w", err)
 	}
@@ -106,6 +132,44 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig) error {
 	defer snk.Close()
 
 	fmt.Println("Starting minimal pipeline (http -> sql -> http_pull)...")
+
+	// WAL Recovery
+	if hsrc, ok := src.(*source.HTTPSource); ok {
+		var httpCfg config.HTTPSourceConfig
+		_ = config.DecodeTo(cfg.Pipeline.Source.Config, &httpCfg)
+		if httpCfg.WALDir != "" {
+			fmt.Printf("Replaying WAL from %s...\n", httpCfg.WALDir)
+			if err := hsrc.ReplayWAL(httpCfg.WALDir); err != nil {
+				fmt.Printf("Warning: WAL replay error: %v\n", err)
+			}
+		}
+
+		// Periodic Checkpoint (Phase 03)
+		if httpCfg.CheckpointDir != "" {
+			interval, _ := config.ParseDuration(httpCfg.CheckpointInterval)
+			if interval <= 0 {
+				interval = 5 * time.Minute
+			}
+			go func() {
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						if psink, ok := snk.(*sink.HTTPPullSink); ok {
+							fmt.Printf("Creating periodic checkpoint in %s...\n", httpCfg.CheckpointDir)
+							if err := psink.Checkpoint(httpCfg.CheckpointDir); err != nil {
+								fmt.Printf("Checkpoint error: %v\n", err)
+							}
+						}
+					}
+				}
+			}()
+		}
+	}
+
 	if err := pipeline.RunPipeline(ctx, src, snk, func(batch types.Batch) (types.Batch, error) {
 		return op.Execute(rootNode, batch)
 	}); err != nil {
@@ -115,12 +179,12 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig) error {
 	return nil
 }
 
-func newSource(cfg *config.PipelineConfig) (provider.Source, error) {
+func newSource(cfg *config.PipelineConfig, requiredFields map[string]struct{}) (provider.Source, error) {
 	var httpCfg config.HTTPSourceConfig
 	if err := config.DecodeTo(cfg.Pipeline.Source.Config, &httpCfg); err != nil {
 		return nil, fmt.Errorf("failed to decode http source config: %w", err)
 	}
-	return source.NewHTTPSource(httpCfg)
+	return source.NewHTTPSource(httpCfg, requiredFields)
 }
 
 func newSink(cfg *config.PipelineConfig, rootNode *op.Node, parquetSchema *config.ParquetSchema) (provider.Sink, error) {
@@ -135,19 +199,41 @@ func newSink(cfg *config.PipelineConfig, rootNode *op.Node, parquetSchema *confi
 	return baseSink, nil
 }
 
-func compileTransform(cfg *config.PipelineConfig) (string, *op.Node, error) {
+func compileTransform(cfg *config.PipelineConfig) (string, *op.Node, map[string]struct{}, error) {
 	if cfg.Pipeline.Transform.Type != "sql" {
-		return "", nil, fmt.Errorf("unsupported transform type: %s", cfg.Pipeline.Transform.Type)
+		return "", nil, nil, fmt.Errorf("unsupported transform type: %s", cfg.Pipeline.Transform.Type)
 	}
 	query := strings.TrimSpace(cfg.Pipeline.Transform.Query)
 	if query == "" {
-		return "", nil, fmt.Errorf("transform query is empty")
+		return "", nil, nil, fmt.Errorf("transform query is empty")
 	}
-	rootNode, err := compileIncrementalQuery(query)
+
+	var options []sqlconv.ComplianceOption
+	if cfg.Pipeline.Transform.SQLCompliance.StrictValidation {
+		options = append(options, sqlconv.WithStrictValidation(true))
+	}
+	if cfg.Pipeline.Transform.SQLCompliance.FallbackWarn {
+		options = append(options, sqlconv.WithFallbackWarn(true))
+	}
+
+	logicalPlan, err := sqlconv.ParseQueryToLogicalPlan(query, options...)
 	if err != nil {
-		return "", nil, fmt.Errorf("compiling SQL query: %w", err)
+		return "", nil, nil, fmt.Errorf("compiling SQL query: %w", err)
 	}
-	return query, rootNode, nil
+
+	rootNode, err := compileIncrementalQuery(query, options...)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("compiling SQL query: %w", err)
+	}
+	requiredFields := ir.CollectRequiredInputColumns(logicalPlan)
+	if strings.TrimSpace(os.Getenv("DBSP_DEBUG_FIELDS")) != "" {
+		if requiredFields == nil {
+			fmt.Println("DEBUG requiredFields: <all>")
+		} else {
+			fmt.Printf("DEBUG requiredFields (%d): %v\n", len(requiredFields), requiredFields)
+		}
+	}
+	return query, rootNode, requiredFields, nil
 }
 
 func validatePartitionColumns(schema *config.ParquetSchema, partitionBy []string) error {

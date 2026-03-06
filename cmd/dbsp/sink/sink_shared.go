@@ -12,11 +12,6 @@ import (
 func AppendTupleDeltasToArrowBuilders(schema *arrow.Schema, builders []array.Builder, batch types.Batch) error {
 	for _, td := range batch {
 		for i, f := range schema.Fields() {
-			if f.Name == "__count" {
-				builders[i].(*array.Int64Builder).Append(td.Count)
-				continue
-			}
-
 			val, ok := td.Tuple[f.Name]
 			if !ok || val == nil {
 				builders[i].AppendNull()
@@ -40,8 +35,8 @@ func AppendTupleDeltasToArrowBuilders(schema *arrow.Schema, builders []array.Bui
 	return nil
 }
 
-func BuildArrowSchema(ps *config.ParquetSchema, includeCount bool) *arrow.Schema {
-	fields := make([]arrow.Field, 0, len(ps.Columns)+1)
+func BuildArrowSchema(ps *config.ParquetSchema) *arrow.Schema {
+	fields := make([]arrow.Field, 0, len(ps.Columns))
 	for _, c := range ps.Columns {
 		var dt arrow.DataType
 		switch c.Type {
@@ -56,10 +51,5 @@ func BuildArrowSchema(ps *config.ParquetSchema, includeCount bool) *arrow.Schema
 		}
 		fields = append(fields, arrow.Field{Name: c.Name, Type: dt, Nullable: true})
 	}
-	if includeCount {
-		// Always include __count for Z-set multiplicity
-		fields = append(fields, arrow.Field{Name: "__count", Type: arrow.PrimitiveTypes.Int64, Nullable: false})
-	}
-
 	return arrow.NewSchema(fields, nil)
 }

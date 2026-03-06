@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
@@ -53,10 +54,14 @@ type FrameSpecLite struct {
 // WindowAggOp maintains per-window aggregate state and emits deltas only
 // for windows affected by each input delta.
 type WindowAggOp struct {
-	Spec       WindowSpecLite
-	KeyFn      func(types.Tuple) any
-	GroupKeys  []string // column names for group keys (empty if no grouping)
-	OrderByCol string   // ORDER BY column for frame-based windows
+	Spec      WindowSpecLite
+	KeyFn     func(types.Tuple) any
+	GroupKeys []string // column names for group keys (empty if no grouping)
+	KeepInput bool
+	// EmitValue switches aggregate output from delta to current value.
+	// When true, the operator emits (-1 old, +1 new) value tuples per window/group.
+	EmitValue  bool
+	OrderByCol string // ORDER BY column for frame-based windows
 	FrameSpec  *FrameSpecLite
 	AggInit    func() any
 	AggFn      AggFunc
@@ -75,6 +80,13 @@ type WindowAggOp struct {
 	// sessionOut stores the last computed session output tuples per partition.
 	// We diff against this to emit retractions/insertions when sessions merge/split/extend.
 	sessionOut map[any]map[string]types.Tuple
+	// frameOut stores the last computed frame-based output tuples per partition.
+	frameOut map[any]map[string]types.TupleDelta
+
+	// StateTTL evicts window/partition state based on processing-time inactivity.
+	StateTTL             time.Duration
+	lastTouchedWindow    map[WindowID]time.Time
+	lastTouchedPartition map[any]time.Time
 
 	stateBackend  StateBackend
 	statePrefix   string
@@ -88,6 +100,7 @@ type windowAggSnapshotV1 struct {
 	PartitionBuffers map[any]*PartitionBuffer
 	SessionBuffers   map[any]*PartitionBuffer
 	SessionOut       map[any]map[string]types.Tuple
+	FrameOut         map[any]map[string]types.TupleDelta
 }
 
 func (w *WindowAggOp) Snapshot() (any, error) {
@@ -113,6 +126,9 @@ func (w *WindowAggOp) Snapshot() (any, error) {
 	if w.sessionOut != nil {
 		snap.SessionOut = w.sessionOut
 	}
+	if w.frameOut != nil {
+		snap.FrameOut = w.frameOut
+	}
 	return snap, nil
 }
 
@@ -131,6 +147,7 @@ func (w *WindowAggOp) Restore(state any) error {
 	w.PartitionBuffers = s.PartitionBuffers
 	w.SessionBuffers = s.SessionBuffers
 	w.sessionOut = s.SessionOut
+	w.frameOut = s.FrameOut
 	w.ensureStateMaps()
 	w.backendLoaded = true
 	if err := w.flushBackendState(); err != nil {
@@ -175,6 +192,67 @@ func (w *WindowAggOp) SetStateBackend(backend StateBackend, prefix string) {
 		w.statePrefix = "windowagg/default"
 	}
 	w.backendLoaded = false
+}
+
+func (w *WindowAggOp) SetStateTTL(ttl time.Duration) {
+	w.StateTTL = ttl
+}
+
+func (w *WindowAggOp) touchWindow(now time.Time, wid WindowID) {
+	if w.StateTTL <= 0 {
+		return
+	}
+	if w.lastTouchedWindow == nil {
+		w.lastTouchedWindow = make(map[WindowID]time.Time)
+	}
+	w.lastTouchedWindow[wid] = now
+}
+
+func (w *WindowAggOp) touchPartition(now time.Time, key any) {
+	if w.StateTTL <= 0 {
+		return
+	}
+	if w.lastTouchedPartition == nil {
+		w.lastTouchedPartition = make(map[any]time.Time)
+	}
+	w.lastTouchedPartition[key] = now
+}
+
+func (w *WindowAggOp) evictExpired(now time.Time) {
+	if w.StateTTL <= 0 {
+		return
+	}
+	if len(w.lastTouchedWindow) > 0 {
+		for wid, touched := range w.lastTouchedWindow {
+			if now.Sub(touched) <= w.StateTTL {
+				continue
+			}
+			delete(w.lastTouchedWindow, wid)
+			if w.GroupCounts != nil {
+				delete(w.GroupCounts, wid)
+			}
+			if w.State.Data != nil {
+				delete(w.State.Data, wid)
+			}
+		}
+	}
+	if len(w.lastTouchedPartition) > 0 {
+		for key, touched := range w.lastTouchedPartition {
+			if now.Sub(touched) <= w.StateTTL {
+				continue
+			}
+			delete(w.lastTouchedPartition, key)
+			if w.PartitionBuffers != nil {
+				delete(w.PartitionBuffers, key)
+			}
+			if w.SessionBuffers != nil {
+				delete(w.SessionBuffers, key)
+			}
+			if w.sessionOut != nil {
+				delete(w.sessionOut, key)
+			}
+		}
+	}
 }
 
 func (w *WindowAggOp) backendEnabled() bool {
@@ -280,6 +358,7 @@ func (w *WindowAggOp) loadBackendState() error {
 		w.PartitionBuffers = make(map[any]*PartitionBuffer)
 		w.SessionBuffers = make(map[any]*PartitionBuffer)
 		w.sessionOut = make(map[any]map[string]types.Tuple)
+		w.frameOut = make(map[any]map[string]types.TupleDelta)
 
 		if payload, ok, err := w.stateBackend.Get(w.backendV2SpecKey()); err != nil {
 			return err
@@ -398,6 +477,23 @@ func (w *WindowAggOp) loadBackendState() error {
 			return err
 		}
 
+		foutPrefix := fmt.Sprintf("%s/fout/", w.backendV2BasePrefix())
+		if err := w.stateBackend.IterPrefix([]byte(foutPrefix), func(key, value []byte) error {
+			partitionEnc := parseWindowAggV2OnePartKey(string(key), foutPrefix)
+			partitionKey, err := decodeAnyKey(partitionEnc)
+			if err != nil {
+				partitionKey = partitionEnc
+			}
+			var out map[string]types.TupleDelta
+			if err := decodeGobValue(value, &out); err != nil {
+				return nil
+			}
+			w.frameOut[partitionKey] = out
+			return nil
+		}); err != nil {
+			return err
+		}
+
 		w.ensureStateMaps()
 		w.backendLoaded = true
 		return nil
@@ -422,6 +518,7 @@ func (w *WindowAggOp) loadBackendState() error {
 	w.PartitionBuffers = s.PartitionBuffers
 	w.SessionBuffers = s.SessionBuffers
 	w.sessionOut = s.SessionOut
+	w.frameOut = s.FrameOut
 	w.ensureStateMaps()
 	w.backendLoaded = true
 	return nil
@@ -501,6 +598,15 @@ func (w *WindowAggOp) flushBackendState() error {
 		ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: key, Value: payload})
 	}
 
+	for partitionKey, out := range w.frameOut {
+		payload, err := encodeGobValue(out)
+		if err != nil {
+			return err
+		}
+		key := []byte(fmt.Sprintf("%s/fout/%s", w.backendV2BasePrefix(), stableAnyKey(partitionKey)))
+		ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: key, Value: payload})
+	}
+
 	return w.stateBackend.BatchWrite(ops)
 }
 
@@ -520,18 +626,58 @@ func (w *WindowAggOp) ensureStateMaps() {
 	if w.sessionOut == nil {
 		w.sessionOut = make(map[any]map[string]types.Tuple)
 	}
+	if w.frameOut == nil {
+		w.frameOut = make(map[any]map[string]types.TupleDelta)
+	}
 }
 
 func (w *WindowAggOp) injectGroupKeyColumns(outTuple types.Tuple, inTuple types.Tuple) {
 	if outTuple == nil {
 		return
 	}
-	if len(w.GroupKeys) == 0 {
+	if len(w.GroupKeys) == 0 && !w.KeepInput {
+		return
+	}
+	if inTuple == nil {
 		return
 	}
 	for _, col := range w.GroupKeys {
 		outTuple[col] = inTuple[col]
 	}
+	if w.KeepInput {
+		for k, v := range inTuple {
+			if _, ok := outTuple[k]; ok {
+				continue
+			}
+			outTuple[k] = v
+		}
+	}
+}
+
+func (w *WindowAggOp) aggValueTuple(aggState any) types.Tuple {
+	vals := types.Tuple{}
+	return w.extractAggResult(vals, aggState)
+}
+
+func hasAnyNonNilValue(t types.Tuple) bool {
+	for _, v := range t {
+		if v != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *WindowAggOp) buildWindowValueTuple(wid WindowID, inTuple types.Tuple, values types.Tuple) types.Tuple {
+	out := types.Tuple{
+		"__window_start": wid.Start,
+		"__window_end":   wid.End,
+	}
+	w.injectGroupKeyColumns(out, inTuple)
+	for k, v := range values {
+		out[k] = v
+	}
+	return out
 }
 
 func (w *WindowAggOp) applyGroupCount(wid WindowID, groupKey any, deltaCount int64) error {
@@ -627,6 +773,10 @@ func (w *WindowAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	if err := w.loadBackendState(); err != nil {
 		return nil, err
 	}
+	w.ensureStateMaps()
+	if w.StateTTL > 0 {
+		w.evictExpired(time.Now())
+	}
 
 	var (
 		out types.Batch
@@ -658,8 +808,12 @@ func (w *WindowAggOp) Apply(batch types.Batch) (types.Batch, error) {
 
 // applyTumbling handles tumbling windows (original implementation)
 func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
+	if w.EmitValue {
+		return w.applyTumblingValue(batch)
+	}
 	var out types.Batch
 	w.ensureStateMaps()
+	now := time.Now()
 	// Compact additive deltas per (window, groupKey).
 	type winGroup struct {
 		wid WindowID
@@ -694,6 +848,8 @@ func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
 					continue
 				}
 			}
+
+			w.touchWindow(now, wid)
 
 			gm, ok := w.State.Data[wid]
 			if !ok {
@@ -808,10 +964,157 @@ func (w *WindowAggOp) applyTumbling(batch types.Batch) (types.Batch, error) {
 	return out, nil
 }
 
-// applySliding handles sliding windows
-func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
+func (w *WindowAggOp) applyTumblingValue(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
 	w.ensureStateMaps()
+	now := time.Now()
+
+	type winGroup struct {
+		wid WindowID
+		key any
+	}
+	type valueSnapshot struct {
+		vals   types.Tuple
+		exists bool
+	}
+
+	oldVals := make(map[winGroup]valueSnapshot)
+	newVals := make(map[winGroup]types.Tuple)
+	inputTuples := make(map[winGroup]types.Tuple)
+	baseCounts := make(map[winGroup]int64)
+	countDeltas := make(map[winGroup]int64)
+
+	for _, td := range batch {
+		rawTs, ok := td.Tuple[w.Spec.TimeCol]
+		if !ok || rawTs == nil {
+			continue
+		}
+		ts, ok := rawTs.(int64)
+		if !ok {
+			continue
+		}
+
+		winIDs := windowIDsForTumble(w.Spec, ts)
+		if len(winIDs) == 0 {
+			continue
+		}
+
+		groupKey := w.KeyFn(td.Tuple)
+
+		for _, wid := range winIDs {
+			if w.WatermarkFn != nil {
+				wm := w.WatermarkFn()
+				if wid.End <= wm {
+					continue
+				}
+			}
+
+			w.touchWindow(now, wid)
+
+			gm, ok := w.State.Data[wid]
+			if !ok {
+				gm = make(map[any]any)
+				w.State.Data[wid] = gm
+			}
+			prev, existed := gm[groupKey]
+			if !existed || prev == nil {
+				prev = w.AggInit()
+			}
+
+			k := winGroup{wid: wid, key: groupKey}
+			inputTuples[k] = td.Tuple
+			if _, ok := baseCounts[k]; !ok {
+				var base int64
+				if cm := w.GroupCounts[wid]; cm != nil {
+					base = cm[groupKey]
+				}
+				baseCounts[k] = base
+			}
+			countDeltas[k] += td.Count
+
+			if _, ok := oldVals[k]; !ok {
+				if existed {
+					oldVals[k] = valueSnapshot{vals: w.aggValueTuple(prev), exists: true}
+				} else {
+					oldVals[k] = valueSnapshot{}
+				}
+			}
+
+			newState, _ := w.AggFn.Apply(prev, td)
+			gm[groupKey] = newState
+			newVals[k] = w.aggValueTuple(newState)
+		}
+	}
+
+	for k, base := range baseCounts {
+		delta := countDeltas[k]
+		final := base + delta
+		if final < 0 {
+			return nil, fmt.Errorf("window group underflow for window=%v groupKey=%v resultingCount=%d", k.wid, k.key, final)
+		}
+		if final == 0 {
+			if cm := w.GroupCounts[k.wid]; cm != nil {
+				delete(cm, k.key)
+				if len(cm) == 0 {
+					delete(w.GroupCounts, k.wid)
+				}
+			}
+			if gm := w.State.Data[k.wid]; gm != nil {
+				delete(gm, k.key)
+				if len(gm) == 0 {
+					delete(w.State.Data, k.wid)
+				}
+			}
+			continue
+		}
+		cm, ok := w.GroupCounts[k.wid]
+		if !ok {
+			cm = make(map[any]int64)
+			w.GroupCounts[k.wid] = cm
+		}
+		cm[k.key] = final
+	}
+
+	keys := make(map[winGroup]struct{})
+	for k := range oldVals {
+		keys[k] = struct{}{}
+	}
+	for k := range newVals {
+		keys[k] = struct{}{}
+	}
+
+	for k := range keys {
+		snap := oldVals[k]
+		newVal := newVals[k]
+		final := baseCounts[k] + countDeltas[k]
+		if final <= 0 {
+			if snap.exists && hasAnyNonNilValue(snap.vals) {
+				out = append(out, types.TupleDelta{Tuple: w.buildWindowValueTuple(k.wid, inputTuples[k], snap.vals), Count: -1})
+			}
+			continue
+		}
+		if snap.exists && types.TuplesEqual(snap.vals, newVal) {
+			continue
+		}
+		if snap.exists && hasAnyNonNilValue(snap.vals) {
+			out = append(out, types.TupleDelta{Tuple: w.buildWindowValueTuple(k.wid, inputTuples[k], snap.vals), Count: -1})
+		}
+		if hasAnyNonNilValue(newVal) {
+			out = append(out, types.TupleDelta{Tuple: w.buildWindowValueTuple(k.wid, inputTuples[k], newVal), Count: 1})
+		}
+	}
+
+	return out, nil
+}
+
+// applySliding handles sliding windows
+func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
+	if w.EmitValue {
+		return w.applySlidingValue(batch)
+	}
+	var out types.Batch
+	w.ensureStateMaps()
+	now := time.Now()
 	// Compact additive deltas per (window, groupKey).
 	type winGroup struct {
 		wid WindowID
@@ -848,6 +1151,8 @@ func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 				}
 			}
 
+			w.touchWindow(now, wid)
+
 			gm, ok := w.State.Data[wid]
 			if !ok {
 				gm = make(map[any]any)
@@ -961,6 +1266,149 @@ func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 	return out, nil
 }
 
+func (w *WindowAggOp) applySlidingValue(batch types.Batch) (types.Batch, error) {
+	var out types.Batch
+	w.ensureStateMaps()
+	now := time.Now()
+
+	type winGroup struct {
+		wid WindowID
+		key any
+	}
+	type valueSnapshot struct {
+		vals   types.Tuple
+		exists bool
+	}
+
+	oldVals := make(map[winGroup]valueSnapshot)
+	newVals := make(map[winGroup]types.Tuple)
+	inputTuples := make(map[winGroup]types.Tuple)
+	baseCounts := make(map[winGroup]int64)
+	countDeltas := make(map[winGroup]int64)
+
+	for _, td := range batch {
+		rawTs, ok := td.Tuple[w.Spec.TimeCol]
+		if !ok || rawTs == nil {
+			continue
+		}
+		ts, ok := rawTs.(int64)
+		if !ok {
+			continue
+		}
+
+		winIDs := windowIDsForSliding(w.Spec, ts)
+		if len(winIDs) == 0 {
+			continue
+		}
+
+		groupKey := w.KeyFn(td.Tuple)
+
+		for _, wid := range winIDs {
+			if w.WatermarkFn != nil {
+				wm := w.WatermarkFn()
+				if wid.End <= wm {
+					continue
+				}
+			}
+
+			w.touchWindow(now, wid)
+
+			gm, ok := w.State.Data[wid]
+			if !ok {
+				gm = make(map[any]any)
+				w.State.Data[wid] = gm
+			}
+			prev, existed := gm[groupKey]
+			if !existed || prev == nil {
+				prev = w.AggInit()
+			}
+
+			k := winGroup{wid: wid, key: groupKey}
+			inputTuples[k] = td.Tuple
+			if _, ok := baseCounts[k]; !ok {
+				var base int64
+				if cm := w.GroupCounts[wid]; cm != nil {
+					base = cm[groupKey]
+				}
+				baseCounts[k] = base
+			}
+			countDeltas[k] += td.Count
+
+			if _, ok := oldVals[k]; !ok {
+				if existed {
+					oldVals[k] = valueSnapshot{vals: w.aggValueTuple(prev), exists: true}
+				} else {
+					oldVals[k] = valueSnapshot{}
+				}
+			}
+
+			newState, _ := w.AggFn.Apply(prev, td)
+			gm[groupKey] = newState
+			newVals[k] = w.aggValueTuple(newState)
+		}
+	}
+
+	for k, base := range baseCounts {
+		delta := countDeltas[k]
+		final := base + delta
+		if final < 0 {
+			return nil, fmt.Errorf("window group underflow for window=%v groupKey=%v resultingCount=%d", k.wid, k.key, final)
+		}
+		if final == 0 {
+			if cm := w.GroupCounts[k.wid]; cm != nil {
+				delete(cm, k.key)
+				if len(cm) == 0 {
+					delete(w.GroupCounts, k.wid)
+				}
+			}
+			if gm := w.State.Data[k.wid]; gm != nil {
+				delete(gm, k.key)
+				if len(gm) == 0 {
+					delete(w.State.Data, k.wid)
+				}
+			}
+			continue
+		}
+		cm, ok := w.GroupCounts[k.wid]
+		if !ok {
+			cm = make(map[any]int64)
+			w.GroupCounts[k.wid] = cm
+		}
+		cm[k.key] = final
+	}
+
+	keys := make(map[winGroup]struct{})
+	for k := range oldVals {
+		keys[k] = struct{}{}
+	}
+	for k := range newVals {
+		keys[k] = struct{}{}
+	}
+
+	for k := range keys {
+		snap := oldVals[k]
+		newVal := newVals[k]
+		final := baseCounts[k] + countDeltas[k]
+		if final <= 0 {
+			if snap.exists && hasAnyNonNilValue(snap.vals) {
+				out = append(out, types.TupleDelta{Tuple: w.buildWindowValueTuple(k.wid, inputTuples[k], snap.vals), Count: -1})
+			}
+			continue
+		}
+		if snap.exists && types.TuplesEqual(snap.vals, newVal) {
+			continue
+		}
+		if snap.exists && hasAnyNonNilValue(snap.vals) {
+			out = append(out, types.TupleDelta{Tuple: w.buildWindowValueTuple(k.wid, inputTuples[k], snap.vals), Count: -1})
+		}
+		if hasAnyNonNilValue(newVal) {
+			out = append(out, types.TupleDelta{Tuple: w.buildWindowValueTuple(k.wid, inputTuples[k], newVal), Count: 1})
+		}
+	}
+
+	return out, nil
+}
+
 // applySession handles session windows.
 // This implementation is stateful across batches and supports session extend/merge/split.
 // For correctness and simplicity, we buffer per-partition events and recompute the
@@ -969,6 +1417,7 @@ func (w *WindowAggOp) applySliding(batch types.Batch) (types.Batch, error) {
 func (w *WindowAggOp) applySession(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
 	w.ensureStateMaps()
+	now := time.Now()
 	if w.Spec.GapMillis <= 0 {
 		return nil, fmt.Errorf("session window requires GapMillis > 0")
 	}
@@ -980,6 +1429,7 @@ func (w *WindowAggOp) applySession(batch types.Batch) (types.Batch, error) {
 	for _, td := range batch {
 		groupKey := w.KeyFn(td.Tuple)
 		touched[groupKey] = struct{}{}
+		w.touchPartition(now, groupKey)
 		pb := w.getOrCreateSessionBuffer(groupKey)
 		if err := pb.addRowStrict(td, w.Spec.TimeCol); err != nil {
 			return nil, err
@@ -1165,9 +1615,27 @@ func tupleKeyLocal(tup types.Tuple) string {
 	return b.String()
 }
 
+func frameRowKey(tup types.Tuple, orderBy string, groupKeys []string) string {
+	if tup == nil {
+		return ""
+	}
+	keyTuple := types.Tuple{}
+	if orderBy != "" {
+		keyTuple[orderBy] = tup[orderBy]
+	}
+	for _, k := range groupKeys {
+		keyTuple[k] = tup[k]
+	}
+	return tupleKeyLocal(keyTuple)
+}
+
 // applyFrameBased handles frame-based windows (RANGE/ROWS BETWEEN)
 func (w *WindowAggOp) applyFrameBased(batch types.Batch) (types.Batch, error) {
+	if w.EmitValue {
+		return w.applyFrameBasedValue(batch)
+	}
 	var out types.Batch
+	now := time.Now()
 
 	// Group by partition
 	partitionDeltas := make(map[any][]types.TupleDelta)
@@ -1178,6 +1646,7 @@ func (w *WindowAggOp) applyFrameBased(batch types.Batch) (types.Batch, error) {
 
 	// Process each partition
 	for partitionKey, deltas := range partitionDeltas {
+		w.touchPartition(now, partitionKey)
 		buffer := w.getOrCreatePartitionBuffer(partitionKey)
 
 		// Apply deltas to buffer
@@ -1191,6 +1660,69 @@ func (w *WindowAggOp) applyFrameBased(batch types.Batch) (types.Batch, error) {
 			return nil, err
 		}
 		out = append(out, frameOut...)
+	}
+
+	return out, nil
+}
+
+func (w *WindowAggOp) applyFrameBasedValue(batch types.Batch) (types.Batch, error) {
+	var out types.Batch
+	now := time.Now()
+
+	partitionDeltas := make(map[any][]types.TupleDelta)
+	for _, td := range batch {
+		partitionKey := w.KeyFn(td.Tuple)
+		partitionDeltas[partitionKey] = append(partitionDeltas[partitionKey], td)
+	}
+
+	for partitionKey, deltas := range partitionDeltas {
+		w.touchPartition(now, partitionKey)
+		buffer := w.getOrCreatePartitionBuffer(partitionKey)
+		for _, td := range deltas {
+			buffer.addRow(td, w.OrderByCol)
+		}
+
+		frameOut, err := w.computeFrameAggregates(buffer, partitionKey)
+		if err != nil {
+			return nil, err
+		}
+
+		newMap := make(map[string]types.TupleDelta, len(frameOut))
+		for _, td := range frameOut {
+			key := frameRowKey(td.Tuple, w.OrderByCol, w.GroupKeys)
+			newMap[key] = td
+		}
+		oldMap := w.frameOut[partitionKey]
+		if oldMap == nil {
+			oldMap = make(map[string]types.TupleDelta)
+		}
+
+		for k, oldTd := range oldMap {
+			newTd, ok := newMap[k]
+			if !ok {
+				out = append(out, types.TupleDelta{Tuple: oldTd.Tuple, Count: -oldTd.Count})
+				continue
+			}
+			if !types.TuplesEqual(oldTd.Tuple, newTd.Tuple) {
+				out = append(out, types.TupleDelta{Tuple: oldTd.Tuple, Count: -oldTd.Count})
+				out = append(out, newTd)
+				continue
+			}
+			if newTd.Count != oldTd.Count {
+				diff := newTd.Count - oldTd.Count
+				if diff != 0 {
+					out = append(out, types.TupleDelta{Tuple: newTd.Tuple, Count: diff})
+				}
+			}
+		}
+
+		for k, newTd := range newMap {
+			if _, ok := oldMap[k]; !ok {
+				out = append(out, newTd)
+			}
+		}
+
+		w.frameOut[partitionKey] = newMap
 	}
 
 	return out, nil
