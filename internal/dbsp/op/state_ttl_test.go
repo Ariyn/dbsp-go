@@ -102,3 +102,27 @@ func TestJoinStateTTL(t *testing.T) {
 		t.Fatalf("expected no output after eviction, got %d", len(out))
 	}
 }
+
+func TestApplyStateTTLPropagatesIntoChainedOp(t *testing.T) {
+	ordered := NewOrderedWindowOp(func(t types.Tuple) any { return t["k"] }, "ts", "v", 1, "v_last")
+	root := &Node{Op: &ChainedOp{Ops: []Operator{&MapOp{F: func(td types.TupleDelta) []types.TupleDelta { return []types.TupleDelta{td} }}, ordered}}}
+
+	ApplyStateTTL(root, 2*time.Millisecond)
+	if ordered.StateTTL != 2*time.Millisecond {
+		t.Fatalf("expected chained OrderedWindowOp TTL to be applied, got %v", ordered.StateTTL)
+	}
+
+	if _, err := ordered.Apply(types.Batch{{Tuple: types.Tuple{"k": "a", "ts": int64(1), "v": 1.0}, Count: 1}}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := len(ordered.Partitions); got != 1 {
+		t.Fatalf("expected 1 partition, got %d", got)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if _, err := ordered.Apply(nil); err != nil {
+		t.Fatalf("apply for eviction: %v", err)
+	}
+	if got := len(ordered.Partitions); got != 0 {
+		t.Fatalf("expected partition eviction, got %d", got)
+	}
+}

@@ -2,9 +2,7 @@ package op
 
 import (
 	"fmt"
-	"os"
 	"sort"
-	"strings"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
@@ -35,6 +33,25 @@ type Node struct {
 
 // Execute runs the operator at root with the given delta batch and returns its output.
 func Execute(root *Node, delta types.Batch) (types.Batch, error) {
+	if len(delta) > 1 {
+		return executeSequentially(root, delta)
+	}
+	return executeBatch(root, delta)
+}
+
+func executeSequentially(root *Node, delta types.Batch) (types.Batch, error) {
+	var out types.Batch
+	for _, td := range delta {
+		stepOut, err := executeBatch(root, types.Batch{td})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, stepOut...)
+	}
+	return out, nil
+}
+
+func executeBatch(root *Node, delta types.Batch) (types.Batch, error) {
 	if root == nil {
 		return nil, nil
 	}
@@ -48,7 +65,6 @@ func Execute(root *Node, delta types.Batch) (types.Batch, error) {
 		if err != nil {
 			return nil, err
 		}
-		debugBatch(fmt.Sprintf("%T", root.Op), out)
 		return out, nil
 	}
 	if len(sources) == 1 {
@@ -59,10 +75,19 @@ func Execute(root *Node, delta types.Batch) (types.Batch, error) {
 }
 
 // ExecuteTick evaluates the operator DAG rooted at root for a single logical time tick.
-// Input batches are provided by source name.
+//
+// When any reachable source contributes more than one delta, the tick is expanded
+// into deterministic micro-ticks so downstream stateful operators observe a stable
+// one-delta-at-a-time sequence. Micro-ticks are ordered by source name in
+// round-robin order while preserving per-source input order.
 func ExecuteTick(root *Node, sources map[string]types.Batch) (types.Batch, error) {
 	if root == nil {
 		return nil, nil
+	}
+
+	sourceNames := SourceNames(root)
+	if needsExpandedTick(sourceNames, sources) {
+		return executeExpandedTick(root, sourceNames, sources)
 	}
 
 	// If the graph contains DelayOp, we must evaluate with register semantics.
@@ -109,7 +134,6 @@ func ExecuteTick(root *Node, sources map[string]types.Batch) (types.Batch, error
 			if err != nil {
 				return nil, err
 			}
-			debugBatch(fmt.Sprintf("%T", n.Op), out)
 			memo[n] = out
 			return out, nil
 
@@ -130,7 +154,6 @@ func ExecuteTick(root *Node, sources map[string]types.Batch) (types.Batch, error
 			if err != nil {
 				return nil, err
 			}
-			debugBatch(fmt.Sprintf("%T", n.Op), out)
 			memo[n] = out
 			return out, nil
 
@@ -142,79 +165,39 @@ func ExecuteTick(root *Node, sources map[string]types.Batch) (types.Batch, error
 	return eval(root)
 }
 
-func debugBatch(label string, batch types.Batch) {
-	if strings.TrimSpace(os.Getenv("DBSP_DEBUG_TRACE")) == "" {
-		return
-	}
-	if len(batch) == 0 {
-		fmt.Printf("DEBUG trace %s: batch size=0\n", label)
-		return
-	}
-	keys := []string(nil)
-	if strings.TrimSpace(os.Getenv("DBSP_DEBUG_TRACE_KEYS")) != "" {
-		keys = tupleKeysLocal(batch[0].Tuple)
-	}
-	fields := parseDebugFields(os.Getenv("DBSP_DEBUG_TRACE_FIELDS"))
-	if len(fields) == 0 {
-		fields = []string{
-			"timestamp",
-			"timestamp_last",
-			"v_out_last",
-			"i_out_last",
-			"p_out_last",
-			"timedelta_second",
-			"energy",
-			"cumulative_energy",
+func needsExpandedTick(sourceNames []string, sources map[string]types.Batch) bool {
+	for _, name := range sourceNames {
+		if len(sources[name]) > 1 {
+			return true
 		}
 	}
-	max := 3
-	if len(batch) < max {
-		max = len(batch)
-	}
-	for i := 0; i < max; i++ {
-		td := batch[i]
-		vals := make([]string, 0, len(fields))
-		for _, f := range fields {
-			if v, ok := td.Tuple[f]; ok {
-				vals = append(vals, fmt.Sprintf("%s=%v", f, v))
-			} else {
-				vals = append(vals, fmt.Sprintf("%s=<nil>", f))
+	return false
+}
+
+func executeExpandedTick(root *Node, sourceNames []string, sources map[string]types.Batch) (types.Batch, error) {
+	var (
+		out     types.Batch
+		hasMore = true
+	)
+
+	for offset := 0; hasMore; offset++ {
+		hasMore = false
+		for _, name := range sourceNames {
+			batch := sources[name]
+			if offset >= len(batch) {
+				continue
 			}
-		}
-		if len(keys) > 0 {
-			fmt.Printf("DEBUG trace %s: count=%d %s keys=%v\n", label, td.Count, strings.Join(vals, " "), keys)
-		} else {
-			fmt.Printf("DEBUG trace %s: count=%d %s\n", label, td.Count, strings.Join(vals, " "))
+			hasMore = true
+			stepSources := map[string]types.Batch{name: {batch[offset]}}
+			stepOut, err := ExecuteTick(root, stepSources)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, stepOut...)
 		}
 	}
-}
 
-func parseDebugFields(raw string) []string {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return nil
-	}
-	parts := strings.Split(trimmed, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func tupleKeysLocal(t types.Tuple) []string {
-	if t == nil {
-		return nil
-	}
-	keys := make([]string, 0, len(t))
-	for k := range t {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return out, nil
 }
 
 func graphHasDelay(root *Node) bool {
@@ -284,12 +267,11 @@ type ChainedOp struct {
 func (c *ChainedOp) Apply(batch types.Batch) (types.Batch, error) {
 	current := batch
 	var err error
-	for idx, op := range c.Ops {
+	for _, op := range c.Ops {
 		current, err = op.Apply(current)
 		if err != nil {
 			return nil, err
 		}
-		debugBatch(fmt.Sprintf("%d:%T", idx, op), current)
 	}
 	return current, nil
 }

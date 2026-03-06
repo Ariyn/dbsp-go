@@ -30,6 +30,48 @@ func TestCollectRequiredColumnsKeepInput(t *testing.T) {
 	}
 }
 
+func TestCollectRequiredColumnsSelectStarOverCTE(t *testing.T) {
+	cteBody := &LogicalProject{
+		Columns: []string{"a"},
+		Exprs:   []ProjectExpr{{ExprSQL: "b + c", As: "bc"}},
+		Input:   &LogicalScan{Table: "t"},
+	}
+	root := &LogicalWith{
+		CTENames: []string{"x"},
+		CTEs:     map[string]LogicalNode{"x": cteBody},
+		Body: &LogicalProject{
+			Columns: []string{"*"},
+			Input:   &LogicalCTERef{CTEName: "x"},
+		},
+	}
+
+	cols := CollectRequiredInputColumns(root)
+	if cols == nil {
+		t.Fatalf("expected concrete source columns, got nil")
+	}
+	assertHasColumn(t, cols, "a")
+	assertHasColumn(t, cols, "b")
+	assertHasColumn(t, cols, "c")
+}
+
+func TestCollectRequiredColumnsKeepInputOverDerivedInput(t *testing.T) {
+	root := &LogicalProject{
+		KeepInput: true,
+		Exprs:     []ProjectExpr{{ExprSQL: "a + b", As: "ab"}},
+		Input: &LogicalProject{
+			Columns: []string{"a", "b"},
+			Input:   &LogicalScan{Table: "t"},
+		},
+	}
+
+	cols := CollectRequiredInputColumns(root)
+	if cols == nil {
+		t.Fatalf("expected concrete source columns, got nil")
+	}
+	assertHasColumn(t, cols, "a")
+	assertHasColumn(t, cols, "b")
+}
+
 func TestCollectRequiredColumnsPredicate(t *testing.T) {
 	root := &LogicalFilter{
 		PredicateSQL: "a > 1 AND b = 'x'",

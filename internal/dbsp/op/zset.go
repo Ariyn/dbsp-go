@@ -59,7 +59,7 @@ func (s *ZSetStore) ApplyDelta(delta types.Batch) error {
 			if td.Count < 0 {
 				return fmt.Errorf("zset underflow for tuple=%v count=%d", td.Tuple, td.Count)
 			}
-			e = &zsetEntry{tuple: types.CloneTuple(td.Tuple)}
+			e = &zsetEntry{tuple: td.Tuple}
 			s.entries[tk] = e
 		}
 
@@ -73,9 +73,23 @@ func (s *ZSetStore) ApplyDelta(delta types.Batch) error {
 		}
 
 		// Keep latest tuple materialization.
-		e.tuple = types.CloneTuple(td.Tuple)
+		e.tuple = td.Tuple
 	}
 	return nil
+}
+
+func (s *ZSetStore) SnapshotBatch() types.Batch {
+	if s == nil || len(s.entries) == 0 {
+		return nil
+	}
+	out := make(types.Batch, 0, len(s.entries))
+	for _, e := range s.entries {
+		if e == nil || e.count == 0 {
+			continue
+		}
+		out = append(out, types.TupleDelta{Tuple: e.tuple, Count: e.count})
+	}
+	return out
 }
 
 func (s *ZSetStore) ForEach(f func(t types.Tuple, count int64) bool) {

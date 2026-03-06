@@ -24,6 +24,13 @@ func ApplyStateTTL(root *Node, ttl time.Duration) {
 		if setter, ok := n.Op.(StateTTLSetter); ok {
 			setter.SetStateTTL(ttl)
 		}
+		if chained, ok := n.Op.(*ChainedOp); ok {
+			for _, inner := range chained.Ops {
+				if setter, ok := inner.(StateTTLSetter); ok {
+					setter.SetStateTTL(ttl)
+				}
+			}
+		}
 		for _, in := range n.Inputs {
 			stack = append(stack, in)
 		}

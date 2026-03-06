@@ -21,17 +21,27 @@ func (p *ProjectOp) Apply(batch types.Batch) (types.Batch, error) {
 	if len(p.Columns) == 0 && len(p.Exprs) == 0 {
 		return batch, nil
 	}
-	var out types.Batch
+	if p.KeepInput && len(p.Exprs) == 0 {
+		return batch, nil
+	}
+	out := make(types.Batch, 0, len(batch))
 	for _, td := range batch {
-		projected := make(types.Tuple)
+		capacity := len(p.Exprs)
+		if p.KeepInput {
+			capacity += len(td.Tuple)
+		} else {
+			capacity += len(p.Columns)
+		}
+		projected := make(types.Tuple, capacity)
 		if p.KeepInput {
 			for k, v := range td.Tuple {
 				projected[k] = v
 			}
-		}
-		for _, col := range p.Columns {
-			if v, ok := td.Tuple[col]; ok {
-				projected[col] = v
+		} else {
+			for _, col := range p.Columns {
+				if v, ok := td.Tuple[col]; ok {
+					projected[col] = v
+				}
 			}
 		}
 		for _, e := range p.Exprs {

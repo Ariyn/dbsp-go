@@ -9,6 +9,12 @@ type Source interface {
 	Close() error
 }
 
+// BatchAcknowledger allows a source to persist progress after a batch has been
+// fully processed by execute+sink.
+type BatchAcknowledger interface {
+	AckBatchProcessed(types.Batch) error
+}
+
 // Sink is the interface for data sinks
 type Sink interface {
 	// WriteBatch writes a batch of results.

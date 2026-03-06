@@ -48,3 +48,59 @@ func TestLagAggEmitsAllDeltas(t *testing.T) {
 		t.Fatalf("expected ts=3 lag 20.0, got %v", v)
 	}
 }
+
+func TestLagAggOutOfOrderInsertRecomputesAffectedRows(t *testing.T) {
+	lag := &LagAgg{OrderByCol: "ts", LagCol: "v", Offset: 1, OutputCol: "v_last"}
+	g := NewGroupAggOp(func(t types.Tuple) any { return t["id"] }, func() any {
+		return LagMonoid{Buffer: NewOrderedBuffer("ts")}
+	}, lag)
+
+	initial := types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 10.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(3), "v": 30.0}, Count: 1},
+	}
+	if _, err := g.Apply(initial); err != nil {
+		t.Fatalf("apply initial: %v", err)
+	}
+
+	out, err := g.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 20.0}, Count: 1}})
+	if err != nil {
+		t.Fatalf("apply insert: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("expected 3 output deltas, got %d (%v)", len(out), out)
+	}
+
+	type observed struct {
+		count int64
+		lag   any
+	}
+	seen := map[int64][]observed{}
+	for _, td := range out {
+		ts, ok := td.Tuple["ts"].(int64)
+		if !ok {
+			t.Fatalf("expected ts int64, got %T", td.Tuple["ts"])
+		}
+		seen[ts] = append(seen[ts], observed{count: td.Count, lag: td.Tuple["v_last"]})
+	}
+
+	if got := seen[int64(2)]; len(got) != 1 || got[0].count != 1 || types.ToFloat64(got[0].lag) != 10.0 {
+		t.Fatalf("expected ts=2 +1 lag 10.0, got %v", got)
+	}
+	if got := seen[int64(3)]; len(got) != 2 {
+		t.Fatalf("expected ts=3 replacement deltas, got %v", got)
+	}
+
+	var removedOld, addedNew bool
+	for _, item := range seen[int64(3)] {
+		switch {
+		case item.count == -1 && types.ToFloat64(item.lag) == 10.0:
+			removedOld = true
+		case item.count == 1 && types.ToFloat64(item.lag) == 20.0:
+			addedNew = true
+		}
+	}
+	if !removedOld || !addedNew {
+		t.Fatalf("expected ts=3 to emit -1 lag 10.0 and +1 lag 20.0, got %v", seen[int64(3)])
+	}
+}

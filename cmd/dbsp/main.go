@@ -5,7 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,6 +21,7 @@ import (
 	"github.com/ariyn/dbsp/internal/dbsp/op"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
+	"github.com/ariyn/dbsp/internal/metrics"
 )
 
 var compileIncrementalQuery = sqlconv.ParseQueryToIncrementalDBSP
@@ -37,14 +38,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if addr := strings.TrimSpace(os.Getenv("DBSP_PPROF_ADDR")); addr != "" {
-		go func() {
-			fmt.Printf("pprof listening on %s\n", addr)
-			if err := http.ListenAndServe(addr, nil); err != nil {
-				fmt.Printf("pprof server error: %v\n", err)
-			}
-		}()
-	}
+	startObservabilityServers()
 
 	configPath := flag.String("config", "config.yaml", "Path to configuration file")
 	flag.Parse()
@@ -81,6 +75,55 @@ func main() {
 	}
 }
 
+func startObservabilityServers() {
+	pprofAddr := strings.TrimSpace(os.Getenv("DBSP_PPROF_ADDR"))
+	metricsAddr := strings.TrimSpace(os.Getenv("DBSP_METRICS_ADDR"))
+	metricsPath := strings.TrimSpace(os.Getenv("DBSP_METRICS_PATH"))
+	if metricsPath == "" {
+		metricsPath = "/metrics"
+	}
+
+	switch {
+	case pprofAddr == "" && metricsAddr == "":
+		return
+	case pprofAddr != "" && pprofAddr == metricsAddr:
+		go serveObservability("pprof+metrics", pprofAddr, newObservabilityMux(true, metricsPath))
+	default:
+		if pprofAddr != "" {
+			go serveObservability("pprof", pprofAddr, newObservabilityMux(true, ""))
+		}
+		if metricsAddr != "" {
+			go serveObservability("metrics", metricsAddr, newObservabilityMux(false, metricsPath))
+		}
+	}
+}
+
+func serveObservability(label, addr string, handler http.Handler) {
+	fmt.Printf("%s listening on %s\n", label, addr)
+	if err := http.ListenAndServe(addr, handler); err != nil {
+		fmt.Printf("%s server error: %v\n", label, err)
+	}
+}
+
+func newObservabilityMux(includePprof bool, metricsPath string) *http.ServeMux {
+	mux := http.NewServeMux()
+	if metricsPath != "" {
+		mux.Handle(metricsPath, metrics.Handler())
+	}
+	if includePprof {
+		registerPprofHandlers(mux)
+	}
+	return mux
+}
+
+func registerPprofHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+}
+
 func validateMinimalContract(cfg *config.PipelineConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("pipeline config is nil")
@@ -104,6 +147,14 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig) error {
 	query, rootNode, requiredFields, err := compileTransform(cfg)
 	if err != nil {
 		return err
+	}
+	stateBackend, err := op.NewStateBackendFromConfig(cfg.Pipeline.State.Enabled, cfg.Pipeline.State.Type, cfg.Pipeline.State.Path)
+	if err != nil {
+		return fmt.Errorf("initializing state backend: %w", err)
+	}
+	if stateBackend != nil {
+		defer stateBackend.Close()
+		op.ApplyStateBackend(rootNode, stateBackend, "pipeline")
 	}
 	if ttl, err := config.ParseDuration(cfg.Pipeline.State.StateTTL); err != nil {
 		return fmt.Errorf("invalid state_ttl: %w", err)

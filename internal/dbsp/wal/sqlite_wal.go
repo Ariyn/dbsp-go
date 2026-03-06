@@ -761,6 +761,14 @@ func decodeBatchGobV1(payload []byte) (types.Batch, error) {
 	return batch, nil
 }
 
+func EncodeBatchGobV1(batch types.Batch) ([]byte, error) {
+	return encodeBatchGobV1(batch)
+}
+
+func DecodeBatchGobV1(payload []byte) (types.Batch, error) {
+	return decodeBatchGobV1(payload)
+}
+
 func encodeIncrementalCheckpointMeta(meta incrementalCheckpointMetaV1) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)

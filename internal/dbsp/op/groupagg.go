@@ -22,6 +22,7 @@ type GroupAggOp struct {
 	AggInit func() any
 	AggFn   AggFunc
 	Aggs    []AggSlot
+	profile operatorApplyProfile
 
 	// EmitValue switches aggregate output from delta to current value.
 	// When true, the operator emits (-1 old, +1 new) value tuples per key.
@@ -413,11 +414,17 @@ type AggSlot struct {
 }
 
 func NewGroupAggOp(keyFn func(types.Tuple) any, aggInit func() any, aggFn AggFunc) *GroupAggOp {
-	return &GroupAggOp{KeyFn: keyFn, AggInit: aggInit, AggFn: aggFn, state: make(map[any]any)}
+	return &GroupAggOp{KeyFn: keyFn, AggInit: aggInit, AggFn: aggFn, state: make(map[any]any), profile: newOperatorApplyProfile("GroupAggOp")}
 }
 
 func NewGroupAggMultiOp(keyFn func(types.Tuple) any, aggs []AggSlot) *GroupAggOp {
-	return &GroupAggOp{KeyFn: keyFn, Aggs: append([]AggSlot(nil), aggs...), multiState: make(map[any][]any)}
+	return &GroupAggOp{KeyFn: keyFn, Aggs: append([]AggSlot(nil), aggs...), multiState: make(map[any][]any), profile: newOperatorApplyProfile("GroupAggOp")}
+}
+
+func (g *GroupAggOp) ensureProfiler() {
+	if g.profile.label == "" {
+		g.profile = newOperatorApplyProfile("GroupAggOp")
+	}
 }
 
 func (g *GroupAggOp) SetKeyColName(name string) {
@@ -434,6 +441,7 @@ func (g *GroupAggOp) SetGroupKeyColNames(names []string) {
 }
 
 func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
+	g.ensureProfiler()
 	if len(g.Aggs) > 0 {
 		return g.applyMulti(batch)
 	}
@@ -472,12 +480,13 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 			}
 			colName := aggOutputColumnName(g.AggFn)
 			if ok && oldVal != nil {
-				out = append(out, types.TupleDelta{Tuple: g.buildValueTuple(td, key, map[string]any{colName: oldVal}), Count: -1})
+				out = append(out, types.TupleDelta{Tuple: g.buildSingleValueTuple(td, key, colName, oldVal), Count: -1})
 			}
 			if newVal != nil {
-				out = append(out, types.TupleDelta{Tuple: g.buildValueTuple(td, key, map[string]any{colName: newVal}), Count: 1})
+				out = append(out, types.TupleDelta{Tuple: g.buildSingleValueTuple(td, key, colName, newVal), Count: 1})
 			}
 		}
+		g.profile.observeBatch(len(batch), out, 0, 0)
 		return out, nil
 	}
 
@@ -545,8 +554,7 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 				if _, ok := outDelta.Tuple["agg_delta"]; ok {
 					existing := pending[key]
 					if existing == nil {
-						cpy := &types.TupleDelta{Tuple: types.CloneTuple(outDelta.Tuple), Count: 1}
-						pending[key] = cpy
+						pending[key] = outDelta
 					} else {
 						existing.Tuple["agg_delta"] = types.ToFloat64(existing.Tuple["agg_delta"]) + types.ToFloat64(outDelta.Tuple["agg_delta"])
 					}
@@ -558,8 +566,7 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 				if _, ok := outDelta.Tuple["avg_delta"]; ok {
 					existing := pending[key]
 					if existing == nil {
-						cpy := &types.TupleDelta{Tuple: types.CloneTuple(outDelta.Tuple), Count: 1}
-						pending[key] = cpy
+						pending[key] = outDelta
 					} else {
 						existing.Tuple["avg_delta"] = types.ToFloat64(existing.Tuple["avg_delta"]) + types.ToFloat64(outDelta.Tuple["avg_delta"])
 					}
@@ -571,8 +578,7 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 				if _, ok := outDelta.Tuple["count_delta"]; ok {
 					existing := pending[key]
 					if existing == nil {
-						cpy := &types.TupleDelta{Tuple: types.CloneTuple(outDelta.Tuple), Count: 1}
-						pending[key] = cpy
+						pending[key] = outDelta
 					} else {
 						existing.Tuple["count_delta"] = types.ToInt64(existing.Tuple["count_delta"]) + types.ToInt64(outDelta.Tuple["count_delta"])
 					}
@@ -590,10 +596,12 @@ func (g *GroupAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	for _, td := range pending {
 		out = append(out, *td)
 	}
+	g.profile.observeBatch(len(batch), out, 0, 0)
 	return out, nil
 }
 
 func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
+	g.ensureProfiler()
 	var out types.Batch
 
 	now := time.Now()
@@ -644,10 +652,11 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 				continue
 			}
 			if ok {
-				out = append(out, types.TupleDelta{Tuple: g.buildValueTuple(td, key, aggValueMap(g.Aggs, oldVals)), Count: -1})
+				out = append(out, types.TupleDelta{Tuple: g.buildMultiValueTuple(td, key, g.Aggs, oldVals), Count: -1})
 			}
-			out = append(out, types.TupleDelta{Tuple: g.buildValueTuple(td, key, aggValueMap(g.Aggs, newVals)), Count: 1})
+			out = append(out, types.TupleDelta{Tuple: g.buildMultiValueTuple(td, key, g.Aggs, newVals), Count: 1})
 		}
+		g.profile.observeBatch(len(batch), out, 0, 0)
 		return out, nil
 	}
 	// Compact additive deltas per group key within the batch so that net-zero
@@ -711,6 +720,7 @@ func (g *GroupAggOp) applyMulti(batch types.Batch) (types.Batch, error) {
 	for _, td := range pending {
 		out = append(out, *td)
 	}
+	g.profile.observeBatch(len(batch), out, 0, 0)
 	return out, nil
 }
 
@@ -729,7 +739,7 @@ func mergePendingTupleDeltaLocal(pending map[any]*types.TupleDelta, key any, del
 
 	ex := pending[key]
 	if ex == nil {
-		pending[key] = &types.TupleDelta{Tuple: types.CloneTuple(delta.Tuple), Count: 1}
+		pending[key] = delta
 		ex = pending[key]
 	} else {
 		for k, v := range delta.Tuple {
@@ -834,7 +844,13 @@ func aggValueFromState(agg AggFunc, state any) any {
 }
 
 func (g *GroupAggOp) buildValueTuple(td types.TupleDelta, key any, values map[string]any) types.Tuple {
-	out := types.Tuple{}
+	baseCapacity := len(values)
+	if len(g.GroupKeyColNames) > 0 {
+		baseCapacity += len(g.GroupKeyColNames)
+	} else if g.KeyColName != "" {
+		baseCapacity++
+	}
+	out := make(types.Tuple, baseCapacity)
 	if len(g.GroupKeyColNames) > 0 {
 		for _, col := range g.GroupKeyColNames {
 			out[col] = td.Tuple[col]
@@ -844,6 +860,49 @@ func (g *GroupAggOp) buildValueTuple(td types.TupleDelta, key any, values map[st
 	}
 	for k, v := range values {
 		out[k] = v
+	}
+	return out
+}
+
+func (g *GroupAggOp) buildSingleValueTuple(td types.TupleDelta, key any, col string, value any) types.Tuple {
+	baseCapacity := 1
+	if len(g.GroupKeyColNames) > 0 {
+		baseCapacity += len(g.GroupKeyColNames)
+	} else if g.KeyColName != "" {
+		baseCapacity++
+	}
+	out := make(types.Tuple, baseCapacity)
+	if len(g.GroupKeyColNames) > 0 {
+		for _, groupCol := range g.GroupKeyColNames {
+			out[groupCol] = td.Tuple[groupCol]
+		}
+	} else if g.KeyColName != "" {
+		out[g.KeyColName] = key
+	}
+	out[col] = value
+	return out
+}
+
+func (g *GroupAggOp) buildMultiValueTuple(td types.TupleDelta, key any, aggs []AggSlot, vals []any) types.Tuple {
+	baseCapacity := len(aggs)
+	if len(g.GroupKeyColNames) > 0 {
+		baseCapacity += len(g.GroupKeyColNames)
+	} else if g.KeyColName != "" {
+		baseCapacity++
+	}
+	out := make(types.Tuple, baseCapacity)
+	if len(g.GroupKeyColNames) > 0 {
+		for _, groupCol := range g.GroupKeyColNames {
+			out[groupCol] = td.Tuple[groupCol]
+		}
+	} else if g.KeyColName != "" {
+		out[g.KeyColName] = key
+	}
+	for idx, agg := range aggs {
+		if idx >= len(vals) {
+			break
+		}
+		out[aggOutputColumnName(agg.Fn)] = vals[idx]
 	}
 	return out
 }

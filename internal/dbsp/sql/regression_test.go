@@ -1,11 +1,14 @@
 package sqlconv
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/ir"
 	"github.com/ariyn/dbsp/internal/dbsp/op"
+	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
 
 func TestAutoGroupingRegression(t *testing.T) {
@@ -199,12 +202,158 @@ func TestWindowFuncAliasPreservedInDBSP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseQueryToIncrementalDBSP failed: %v", err)
 	}
-	lag := findFirstLagAgg(root)
+	lag := findFirstOrderedWindowOp(root)
 	if lag == nil {
-		t.Fatal("Expected LagAgg in incremental plan")
+		t.Fatal("Expected OrderedWindowOp in incremental plan")
 	}
 	if lag.OutputCol != "timestamp_last" {
-		t.Fatalf("Expected LagAgg OutputCol=timestamp_last, got %q", lag.OutputCol)
+		t.Fatalf("Expected OrderedWindowOp OutputCol=timestamp_last, got %q", lag.OutputCol)
+	}
+}
+
+func TestGroupByDeduplicatesAggregateAliases(t *testing.T) {
+	query := "SELECT panel_position AS id, TIME_BUCKET(INTERVAL '5 min', timestamp::TIMESTAMP) AS binned_date, ROUND(AVG(i_out), 2) AS i_out, ROUND(AVG(i_out * v_out), 2) AS p, ROUND(AVG(v_in), 2) AS v_in, ROUND(AVG(v_out), 2) AS v_out, ROUND(AVG(temp), 2) AS temp, SUM((p_out + p_out_last) * timedelta_second / 2.0 / 3600.0) AS energy FROM power_calc GROUP BY id, binned_date"
+	lp, err := ParseQueryToLogicalPlan(query)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan failed: %v", err)
+	}
+	ga := findFirstGroupAgg(lp)
+	if ga == nil {
+		t.Fatal("Expected LogicalGroupAgg")
+	}
+	energyCount := 0
+	for _, agg := range ga.Aggs {
+		if agg.As == "energy" {
+			energyCount++
+		}
+	}
+	if energyCount != 1 {
+		t.Fatalf("Expected exactly one energy aggregate, got %d (%v)", energyCount, ga.Aggs)
+	}
+}
+
+func TestFullQueryEnergyAliasNotDuplicated(t *testing.T) {
+	query := "WITH lagged_data AS ( SELECT timestamp, panel_position, plant_id, local_date, v_out, i_out, v_in, temp, LAG(timestamp) OVER (PARTITION BY panel_position ORDER BY timestamp) AS timestamp_last, LAG(v_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS v_out_last, LAG(i_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS i_out_last FROM events ), power_calc AS ( SELECT timestamp_last AS timestamp_start, timestamp AS timestamp_end, timestamp, panel_position, plant_id, local_date, v_out, i_out, v_in, temp, v_out * i_out AS p_out, v_out_last * i_out_last AS p_out_last, (timestamp::DOUBLE / 1000000000.0) - (timestamp_last::DOUBLE / 1000000000.0) AS timedelta_second FROM lagged_data WHERE timestamp_last IS NOT NULL AND timestamp IS NOT NULL ), combined_data AS ( SELECT panel_position AS id, plant_id, local_date, TIME_BUCKET(INTERVAL '5 min', timestamp::TIMESTAMP) AS binned_date, ROUND(AVG(i_out), 2) AS i_out, ROUND(AVG(i_out * v_out), 2) AS p, ROUND(AVG(v_in), 2) AS v_in, ROUND(AVG(v_out), 2) AS v_out, ROUND(AVG(temp), 2) AS temp, SUM((p_out + p_out_last) * timedelta_second / 2.0 / 3600.0) AS energy FROM power_calc GROUP BY id, plant_id, local_date, binned_date ) SELECT * FROM combined_data"
+	lp, err := ParseQueryToLogicalPlan(query)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan failed: %v", err)
+	}
+	ga := findGroupAggInWith(lp, []string{"combined_data", "power_calc", "lagged_data"})
+	if ga == nil {
+		t.Fatal("Expected LogicalGroupAgg in WITH query")
+	}
+	energyCount := 0
+	for _, agg := range ga.Aggs {
+		if agg.As == "energy" {
+			energyCount++
+		}
+	}
+	if energyCount != 1 {
+		t.Fatalf("Expected exactly one energy aggregate in WITH query, got %d (%v)", energyCount, ga.Aggs)
+	}
+}
+
+func TestEnergyAndCumulativeEnergyE2E(t *testing.T) {
+	query := "WITH lagged_data AS ( SELECT timestamp, panel_position, plant_id, local_date, v_out, i_out, v_in, temp, LAG(timestamp) OVER (PARTITION BY panel_position ORDER BY timestamp) AS timestamp_last, LAG(v_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS v_out_last, LAG(i_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS i_out_last FROM events ), power_calc AS ( SELECT timestamp_last AS timestamp_start, timestamp AS timestamp_end, timestamp, panel_position, plant_id, local_date, v_out, i_out, v_in, temp, v_out * i_out AS p_out, v_out_last * i_out_last AS p_out_last, (timestamp::DOUBLE / 1000000000.0) - (timestamp_last::DOUBLE / 1000000000.0) AS timedelta_second FROM lagged_data WHERE timestamp_last IS NOT NULL AND timestamp IS NOT NULL ), combined_data AS ( SELECT panel_position AS id, plant_id, local_date, TIME_BUCKET(INTERVAL '5 min', timestamp::TIMESTAMP) AS binned_date, ROUND(AVG(i_out), 2) AS i_out, ROUND(AVG(i_out * v_out), 2) AS p, ROUND(AVG(v_in), 2) AS v_in, ROUND(AVG(v_out), 2) AS v_out, ROUND(AVG(temp), 2) AS temp, SUM((p_out + p_out_last) * timedelta_second / 2.0 / 3600.0) AS energy FROM power_calc GROUP BY id, plant_id, local_date, binned_date ), final_data AS ( SELECT i_out, p, v_in, v_out, temp, energy, SUM(energy) OVER (PARTITION BY id ORDER BY binned_date) AS cumulative_energy, id, plant_id, local_date, STRFTIME(binned_date, '%H:%M:%S') AS date, binned_date AS timestamp FROM combined_data ) SELECT * FROM final_data WHERE id = 'panel-1' ORDER BY date"
+	root, err := ParseQueryToIncrementalDBSP(query)
+	if err != nil {
+		t.Fatalf("ParseQueryToIncrementalDBSP failed: %v", err)
+	}
+
+	base := time.Date(2026, 2, 27, 7, 0, 0, 0, time.UTC)
+	rows := []types.Tuple{
+		{"timestamp": base.UnixNano(), "panel_position": "panel-1", "plant_id": "plant-a", "local_date": "2026-02-27", "v_out": 10.0, "i_out": 2.0, "v_in": 100.0, "temp": 25.0},
+		{"timestamp": base.Add(60 * time.Second).UnixNano(), "panel_position": "panel-1", "plant_id": "plant-a", "local_date": "2026-02-27", "v_out": 20.0, "i_out": 2.0, "v_in": 100.0, "temp": 25.0},
+		{"timestamp": base.Add(120 * time.Second).UnixNano(), "panel_position": "panel-1", "plant_id": "plant-a", "local_date": "2026-02-27", "v_out": 30.0, "i_out": 2.0, "v_in": 100.0, "temp": 25.0},
+	}
+
+	assertPositiveEnergySnapshot := func(outBatches []types.Batch) {
+		snapshot := map[string]types.Tuple{}
+		for _, out := range outBatches {
+			for _, td := range out {
+				id := td.Tuple["id"]
+				ts := td.Tuple["timestamp"]
+				key := ""
+				if id != nil || ts != nil {
+					key = keyForTuple(id, ts)
+				}
+				if key == "" {
+					continue
+				}
+				if td.Count < 0 {
+					delete(snapshot, key)
+					continue
+				}
+				snapshot[key] = td.Tuple
+			}
+		}
+
+		if len(snapshot) == 0 {
+			t.Fatal("Expected final snapshot row but got none")
+		}
+		var final types.Tuple
+		for _, row := range snapshot {
+			final = row
+		}
+		if final["temp"] == nil {
+			t.Fatalf("Expected non-nil temp, got nil (row=%v)", final)
+		}
+		temp := types.ToFloat64(final["temp"])
+		energy := types.ToFloat64(final["energy"])
+		cumulative := types.ToFloat64(final["cumulative_energy"])
+		if temp != 25.0 {
+			t.Fatalf("Expected temp=25.0, got %v (row=%v)", final["temp"], final)
+		}
+		if energy <= 0 {
+			t.Fatalf("Expected positive energy, got %v (row=%v)", final["energy"], final)
+		}
+		if cumulative <= 0 {
+			t.Fatalf("Expected positive cumulative_energy, got %v (row=%v)", final["cumulative_energy"], final)
+		}
+	}
+
+	var sequentialOut []types.Batch
+	for _, row := range rows {
+		out, err := op.Execute(root, types.Batch{{Tuple: row, Count: 1}})
+		if err != nil {
+			t.Fatalf("Execute failed: %v", err)
+		}
+		sequentialOut = append(sequentialOut, out)
+	}
+	assertPositiveEnergySnapshot(sequentialOut)
+
+	root, err = ParseQueryToIncrementalDBSP(query)
+	if err != nil {
+		t.Fatalf("ParseQueryToIncrementalDBSP failed: %v", err)
+	}
+	batched := make(types.Batch, 0, len(rows))
+	for _, row := range rows {
+		batched = append(batched, types.TupleDelta{Tuple: row, Count: 1})
+	}
+	out, err := op.Execute(root, batched)
+	if err != nil {
+		t.Fatalf("Execute batched failed: %v", err)
+	}
+	assertPositiveEnergySnapshot([]types.Batch{out})
+}
+
+func TestFullQueryRequiredFieldsRemainSelective(t *testing.T) {
+	query := "WITH lagged_data AS ( SELECT timestamp, panel_position, plant_id, local_date, v_out, i_out, v_in, temp, LAG(timestamp) OVER (PARTITION BY panel_position ORDER BY timestamp) AS timestamp_last, LAG(v_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS v_out_last, LAG(i_out) OVER (PARTITION BY panel_position ORDER BY timestamp) AS i_out_last FROM events ), power_calc AS ( SELECT timestamp_last AS timestamp_start, timestamp AS timestamp_end, timestamp, panel_position, plant_id, local_date, v_out, i_out, v_in, temp, v_out * i_out AS p_out, v_out_last * i_out_last AS p_out_last, (timestamp::DOUBLE / 1000000000.0) - (timestamp_last::DOUBLE / 1000000000.0) AS timedelta_second FROM lagged_data WHERE timestamp_last IS NOT NULL AND timestamp IS NOT NULL ), combined_data AS ( SELECT panel_position AS id, plant_id, local_date, TIME_BUCKET(INTERVAL '5 min', timestamp::TIMESTAMP) AS binned_date, ROUND(AVG(i_out), 2) AS i_out, ROUND(AVG(i_out * v_out), 2) AS p, ROUND(AVG(v_in), 2) AS v_in, ROUND(AVG(v_out), 2) AS v_out, ROUND(AVG(temp), 2) AS temp, SUM((p_out + p_out_last) * timedelta_second / 2.0 / 3600.0) AS energy FROM power_calc GROUP BY id, plant_id, local_date, binned_date ), final_data AS ( SELECT i_out, p, v_in, v_out, temp, energy, SUM(energy) OVER (PARTITION BY id ORDER BY binned_date) AS cumulative_energy, id, plant_id, local_date, STRFTIME(binned_date, '%H:%M:%S') AS date, binned_date AS timestamp FROM combined_data ) SELECT * FROM final_data WHERE id = 'panel-1' ORDER BY date"
+
+	lp, err := ParseQueryToLogicalPlan(query)
+	if err != nil {
+		t.Fatalf("ParseQueryToLogicalPlan failed: %v", err)
+	}
+
+	cols := ir.CollectRequiredInputColumns(lp)
+	if cols == nil {
+		t.Fatal("expected selective required fields, got keep-all")
+	}
+
+	for _, name := range []string{"timestamp", "panel_position", "plant_id", "local_date", "v_out", "i_out", "v_in", "temp"} {
+		if _, ok := cols[name]; !ok {
+			t.Fatalf("expected source field %q in required fields: %v", name, cols)
+		}
 	}
 }
 
@@ -309,6 +458,14 @@ func findFirstWindowAggOp(n *op.Node) *op.WindowAggOp {
 }
 
 func findWindowFuncByOutput(n ir.LogicalNode, output string) *ir.LogicalWindowFunc {
+	if with, ok := n.(*ir.LogicalWith); ok {
+		for _, cte := range with.CTEs {
+			if wf := findWindowFuncByOutput(cte, output); wf != nil {
+				return wf
+			}
+		}
+		return findWindowFuncByOutput(with.Body, output)
+	}
 	for n != nil {
 		if wf, ok := n.(*ir.LogicalWindowFunc); ok {
 			if wf.OutputCol == output {
@@ -320,28 +477,46 @@ func findWindowFuncByOutput(n ir.LogicalNode, output string) *ir.LogicalWindowFu
 	return nil
 }
 
-func findFirstLagAgg(n *op.Node) *op.LagAgg {
+func findFirstOrderedWindowOp(n *op.Node) *op.OrderedWindowOp {
 	if n == nil {
 		return nil
 	}
-	if g, ok := n.Op.(*op.GroupAggOp); ok {
-		if lag, ok := g.AggFn.(*op.LagAgg); ok {
-			return lag
-		}
+	if lag, ok := n.Op.(*op.OrderedWindowOp); ok {
+		return lag
 	}
 	if chained, ok := n.Op.(*op.ChainedOp); ok {
 		for _, inner := range chained.Ops {
-			if g, ok := inner.(*op.GroupAggOp); ok {
-				if lag, ok := g.AggFn.(*op.LagAgg); ok {
-					return lag
-				}
+			if lag, ok := inner.(*op.OrderedWindowOp); ok {
+				return lag
 			}
 		}
 	}
 	for _, in := range n.Inputs {
-		if lag := findFirstLagAgg(in); lag != nil {
+		if lag := findFirstOrderedWindowOp(in); lag != nil {
 			return lag
 		}
 	}
 	return nil
+}
+
+func keyForTuple(id any, ts any) string {
+	if id == nil && ts == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v|%v", id, ts)
+}
+
+func findGroupAggInWith(n ir.LogicalNode, cteNames []string) *ir.LogicalGroupAgg {
+	with, ok := n.(*ir.LogicalWith)
+	if !ok {
+		return findFirstGroupAgg(n)
+	}
+	for _, name := range cteNames {
+		if cte, ok := with.CTEs[name]; ok {
+			if ga := findFirstGroupAgg(cte); ga != nil {
+				return ga
+			}
+		}
+	}
+	return findFirstGroupAgg(with.Body)
 }

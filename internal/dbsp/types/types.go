@@ -115,7 +115,105 @@ func ParseFlexibleDuration(s string) (time.Duration, error) {
 // and treats numeric values as equal across types (e.g. 1 == 1.0), including
 // int/uint/float and json.Number.
 func EqualAny(a, b any) bool {
+	if fast, ok := fastEqualAny(a, b); ok {
+		return fast
+	}
 	return equalValue(reflect.ValueOf(a), reflect.ValueOf(b))
+}
+
+func fastEqualAny(a, b any) (bool, bool) {
+	if a == nil || b == nil {
+		return a == b, true
+	}
+
+	switch av := a.(type) {
+	case bool:
+		bv, ok := b.(bool)
+		if !ok {
+			return false, false
+		}
+		return av == bv, true
+	case string:
+		bv, ok := b.(string)
+		if !ok {
+			return false, false
+		}
+		return av == bv, true
+	case time.Time:
+		bv, ok := b.(time.Time)
+		if !ok {
+			return false, false
+		}
+		return av.Equal(bv), true
+	}
+
+	if isNumericType(a) && isNumericType(b) {
+		if ai, aok := signedInt64Exact(a); aok {
+			if bi, bok := signedInt64Exact(b); bok {
+				return ai == bi, true
+			}
+		}
+		if au, aok := unsignedInt64Exact(a); aok {
+			if bu, bok := unsignedInt64Exact(b); bok {
+				return au == bu, true
+			}
+		}
+		if af, aok := ToFloat64Safe(a); aok {
+			if bf, bok := ToFloat64Safe(b); bok {
+				return af == bf, true
+			}
+		}
+	}
+
+	return false, false
+}
+
+func isNumericType(v any) bool {
+	switch v.(type) {
+	case json.Number,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64, uintptr,
+		float32, float64:
+		return true
+	default:
+		return false
+	}
+}
+
+func signedInt64Exact(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int8:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case int64:
+		return n, true
+	default:
+		return 0, false
+	}
+}
+
+func unsignedInt64Exact(v any) (uint64, bool) {
+	switch n := v.(type) {
+	case uint:
+		return uint64(n), true
+	case uint8:
+		return uint64(n), true
+	case uint16:
+		return uint64(n), true
+	case uint32:
+		return uint64(n), true
+	case uint64:
+		return n, true
+	case uintptr:
+		return uint64(n), true
+	default:
+		return 0, false
+	}
 }
 
 // CloneTuple returns a shallow copy of the tuple.

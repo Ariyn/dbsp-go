@@ -56,12 +56,13 @@ func buildGroupKeyFnWithWindow(keys []string, window *TimeWindowSpec) func(types
 	}
 
 	return func(t types.Tuple) any {
-		kt := make(types.Tuple, len(keys)+1)
-		for i, col := range keys {
+		values := make([]any, 0, len(keys)+1)
+		for i := range keys {
 			v, _ := exprFns[i](t)
-			kt[col] = v
+			values = append(values, v)
 		}
 
+		var windowStart any
 		if window != nil {
 			v, _ := timeExpr(t)
 			if v != nil {
@@ -69,10 +70,9 @@ func buildGroupKeyFnWithWindow(keys []string, window *TimeWindowSpec) func(types
 				if err == nil {
 					millis := ts.UnixNano() / 1e6
 					if size > 0 {
-						bucket := (millis / size) * size
-						kt["window_start"] = bucket
+						windowStart = (millis / size) * size
 					} else {
-						kt["window_start"] = millis
+						windowStart = millis
 					}
 				} else {
 					fmt.Printf("DEBUG: toTime failed for value %v (type %T): %v\n", v, v, err)
@@ -81,12 +81,67 @@ func buildGroupKeyFnWithWindow(keys []string, window *TimeWindowSpec) func(types
 				fmt.Printf("DEBUG: timeExpr returned nil for column %s in tuple %v\n", window.TimeCol, t)
 			}
 		}
-
-		b, err := json.Marshal(kt)
-		if err == nil {
-			return string(b)
+		if window != nil {
+			values = append(values, windowStart)
 		}
-		return fmt.Sprintf("%#v", kt)
+		return buildCompositeGroupKey(keys, values, window != nil)
+	}
+}
+
+func buildCompositeGroupKey(keys []string, values []any, includeWindow bool) string {
+	var b strings.Builder
+	for idx, key := range keys {
+		if idx > 0 {
+			b.WriteByte('|')
+		}
+		b.WriteString(key)
+		b.WriteByte('=')
+		writeGroupKeyValue(&b, values[idx])
+	}
+	if includeWindow {
+		if len(keys) > 0 {
+			b.WriteByte('|')
+		}
+		b.WriteString("window_start=")
+		writeGroupKeyValue(&b, values[len(values)-1])
+	}
+	return b.String()
+}
+
+func writeGroupKeyValue(b *strings.Builder, value any) {
+	switch v := value.(type) {
+	case nil:
+		b.WriteString("null")
+	case string:
+		b.WriteString(v)
+	case bool:
+		b.WriteString(strconv.FormatBool(v))
+	case int:
+		b.WriteString(strconv.FormatInt(int64(v), 10))
+	case int8:
+		b.WriteString(strconv.FormatInt(int64(v), 10))
+	case int16:
+		b.WriteString(strconv.FormatInt(int64(v), 10))
+	case int32:
+		b.WriteString(strconv.FormatInt(int64(v), 10))
+	case int64:
+		b.WriteString(strconv.FormatInt(v, 10))
+	case uint:
+		b.WriteString(strconv.FormatUint(uint64(v), 10))
+	case uint8:
+		b.WriteString(strconv.FormatUint(uint64(v), 10))
+	case uint16:
+		b.WriteString(strconv.FormatUint(uint64(v), 10))
+	case uint32:
+		b.WriteString(strconv.FormatUint(uint64(v), 10))
+	case uint64:
+		b.WriteString(strconv.FormatUint(v, 10))
+	case float32:
+		b.WriteString(strconv.FormatFloat(float64(v), 'g', -1, 32))
+	case float64:
+		b.WriteString(strconv.FormatFloat(v, 'g', -1, 64))
+	default:
+		b.WriteString(fmt.Sprintf("%v", value))
 	}
 }
 
@@ -703,29 +758,10 @@ func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*
 
 	lagCol := wf.Spec.Args[0]
 	keyFn := buildPartitionKeyFn(wf.Spec.PartitionBy)
-
-	// Create LagAgg operator
-	lagAgg := &op.LagAgg{
-		OrderByCol: wf.Spec.OrderBy,
-		LagCol:     lagCol,
-		Offset:     wf.Spec.Offset,
-		OutputCol:  wf.OutputCol,
-	}
-
-	// If lagCol is an expression (contains -> or :: or operators or space), build an expression function
+	ordered := op.NewOrderedWindowOp(keyFn, wf.Spec.OrderBy, lagCol, wf.Spec.Offset, wf.OutputCol)
 	if strings.ContainsAny(lagCol, "()->:+-*/ ") {
-		lagAgg.LagExpr = BuildExprFunc(lagCol)
+		ordered.LagExpr = BuildExprFunc(lagCol)
 	}
-
-	// Initialize function for LagMonoid
-	aggInit := func() any {
-		return op.LagMonoid{
-			Buffer: op.NewOrderedBuffer(wf.Spec.OrderBy),
-		}
-	}
-
-	// Create GroupAggOp to handle partitioning
-	g := op.NewGroupAggOp(keyFn, aggInit, lagAgg)
 
 	// Check if there's an input node
 	if wf.Input != nil {
@@ -733,10 +769,10 @@ func logicalWindowFuncToDBSPWithContext(wf *LogicalWindowFunc, ctes map[string]*
 		if err != nil {
 			return nil, err
 		}
-		return &op.Node{Op: g, Inputs: []*op.Node{inNode}}, nil
+		return &op.Node{Op: ordered, Inputs: []*op.Node{inNode}}, nil
 	}
 
-	return &op.Node{Op: g}, nil
+	return &op.Node{Op: ordered}, nil
 }
 
 // logicalWindowAggToDBSP transforms LogicalWindowAgg (DuckDB standard window aggregate) to DBSP operators
@@ -831,9 +867,10 @@ func wrapWindowAggOutputAlias(node *op.Node, outputCol string) *op.Node {
 	}
 	alias := strings.TrimSpace(outputCol)
 	aliasOp := &op.MapOp{F: func(td types.TupleDelta) []types.TupleDelta {
-		tuple := types.CloneTuple(td.Tuple)
+		tuple := td.Tuple
 		if tuple == nil {
 			tuple = types.Tuple{}
+			td.Tuple = tuple
 		}
 		if v, ok := tuple["agg_result"]; ok {
 			tuple[alias] = v
@@ -848,7 +885,7 @@ func wrapWindowAggOutputAlias(node *op.Node, outputCol string) *op.Node {
 		} else if v, ok := tuple["max"]; ok {
 			tuple[alias] = v
 		}
-		return []types.TupleDelta{{Tuple: tuple, Count: td.Count}}
+		return []types.TupleDelta{td}
 	}}
 	return &op.Node{Op: &op.ChainedOp{Ops: []op.Operator{node.Op, aliasOp}}, Inputs: node.Inputs, Source: node.Source, PartitionBy: node.PartitionBy}
 }

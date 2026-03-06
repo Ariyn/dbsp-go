@@ -11,7 +11,9 @@ import (
 
 // Options controls DOT output details.
 type Options struct {
-	Verbose bool
+	Verbose       bool
+	IncludeSchema bool
+	InputSchema   map[string]string
 }
 
 // LogicalPlanDOT renders a logical plan as Graphviz DOT.
@@ -20,6 +22,9 @@ func LogicalPlanDOT(root ir.LogicalNode, opts Options) string {
 		ids:   make(map[ir.LogicalNode]int),
 		edges: make(map[string]struct{}),
 		opts:  opts,
+	}
+	if opts.IncludeSchema {
+		b.schemas = InferLogicalSchemas(root, opts.InputSchema)
 	}
 	b.buf.WriteString("digraph LogicalPlan {\n")
 	b.buf.WriteString("  rankdir=LR;\n")
@@ -38,6 +43,9 @@ func OperatorGraphDOT(root *op.Node, opts Options) string {
 		edges: make(map[string]struct{}),
 		opts:  opts,
 	}
+	if opts.IncludeSchema {
+		b.schemas = InferOperatorSchemas(root, opts.InputSchema)
+	}
 	b.buf.WriteString("digraph OperatorGraph {\n")
 	b.buf.WriteString("  rankdir=LR;\n")
 	b.buf.WriteString("  node [shape=box];\n")
@@ -53,6 +61,7 @@ type logicalDotBuilder struct {
 	next  int
 	ids   map[ir.LogicalNode]int
 	edges map[string]struct{}
+	schemas map[ir.LogicalNode]Schema
 	opts  Options
 }
 
@@ -89,17 +98,19 @@ func (b *logicalDotBuilder) emitEdge(from, to int) {
 }
 
 func (b *logicalDotBuilder) logicalLabel(n ir.LogicalNode) string {
+	lines := []string{logicalTypeName(n)}
 	switch t := n.(type) {
 	case *ir.LogicalScan:
 		if b.opts.Verbose {
-			return fmt.Sprintf("%s\nTable: %s", logicalTypeName(t), t.Table)
+			lines = append(lines, "Table: "+t.Table)
+		} else {
+			lines = append(lines, t.Table)
 		}
-		return fmt.Sprintf("%s\n%s", logicalTypeName(t), t.Table)
 	case *ir.LogicalCTERef:
-		return fmt.Sprintf("%s\n%s", logicalTypeName(t), t.CTEName)
+		lines = append(lines, t.CTEName)
 	case *ir.LogicalFilter:
 		if b.opts.Verbose {
-			return fmt.Sprintf("%s\nPredicate: %s", logicalTypeName(t), t.PredicateSQL)
+			lines = append(lines, "Predicate: "+t.PredicateSQL)
 		}
 	case *ir.LogicalProject:
 		if b.opts.Verbose {
@@ -110,15 +121,11 @@ func (b *logicalDotBuilder) logicalLabel(n ir.LogicalNode) string {
 					exprs = append(exprs, e.As)
 				}
 			}
-			parts := []string{}
 			if cols != "" {
-				parts = append(parts, "Columns: "+cols)
+				lines = append(lines, "Columns: "+cols)
 			}
 			if len(exprs) > 0 {
-				parts = append(parts, "Exprs: "+strings.Join(exprs, ", "))
-			}
-			if len(parts) > 0 {
-				return fmt.Sprintf("%s\n%s", logicalTypeName(t), strings.Join(parts, "\n"))
+				lines = append(lines, "Exprs: "+strings.Join(exprs, ", "))
 			}
 		}
 	case *ir.LogicalGroupAgg:
@@ -128,65 +135,66 @@ func (b *logicalDotBuilder) logicalLabel(n ir.LogicalNode) string {
 			if agg == "" && len(t.Aggs) > 0 {
 				agg = t.Aggs[0].Name
 			}
-			parts := []string{}
 			if keys != "" {
-				parts = append(parts, "Keys: "+keys)
+				lines = append(lines, "Keys: "+keys)
 			}
 			if agg != "" {
-				parts = append(parts, "Agg: "+agg)
-			}
-			if len(parts) > 0 {
-				return fmt.Sprintf("%s\n%s", logicalTypeName(t), strings.Join(parts, "\n"))
+				lines = append(lines, "Agg: "+agg)
 			}
 		}
 	case *ir.LogicalWindowFunc:
 		if b.opts.Verbose {
-			parts := []string{fmt.Sprintf("Func: %s", t.Spec.FuncName)}
+			lines = append(lines, "Func: "+t.Spec.FuncName)
 			if len(t.Spec.PartitionBy) > 0 {
-				parts = append(parts, "PartitionBy: "+strings.Join(t.Spec.PartitionBy, ", "))
+				lines = append(lines, "PartitionBy: "+strings.Join(t.Spec.PartitionBy, ", "))
 			}
 			if t.Spec.OrderBy != "" {
-				parts = append(parts, "OrderBy: "+t.Spec.OrderBy)
+				lines = append(lines, "OrderBy: "+t.Spec.OrderBy)
 			}
-			return fmt.Sprintf("%s\n%s", logicalTypeName(t), strings.Join(parts, "\n"))
 		}
 	case *ir.LogicalWindowAgg:
 		if b.opts.Verbose {
-			parts := []string{fmt.Sprintf("Agg: %s", t.AggName)}
+			lines = append(lines, "Agg: "+t.AggName)
 			if len(t.PartitionBy) > 0 {
-				parts = append(parts, "PartitionBy: "+strings.Join(t.PartitionBy, ", "))
+				lines = append(lines, "PartitionBy: "+strings.Join(t.PartitionBy, ", "))
 			}
 			if t.OrderBy != "" {
-				parts = append(parts, "OrderBy: "+t.OrderBy)
+				lines = append(lines, "OrderBy: "+t.OrderBy)
 			}
-			return fmt.Sprintf("%s\n%s", logicalTypeName(t), strings.Join(parts, "\n"))
 		}
 	case *ir.LogicalJoin:
 		if b.opts.Verbose {
-			return fmt.Sprintf("%s\n%s x %s", logicalTypeName(t), t.LeftTable, t.RightTable)
+			lines = append(lines, t.LeftTable+" x "+t.RightTable)
 		}
 	case *ir.LogicalSort:
 		if b.opts.Verbose {
-			return fmt.Sprintf("%s\nBy: %s", logicalTypeName(t), strings.Join(t.OrderColumns, ", "))
+			lines = append(lines, "By: "+strings.Join(t.OrderColumns, ", "))
 		}
 	case *ir.LogicalView:
 		if b.opts.Verbose {
-			parts := []string{"Name: " + t.Name}
+			lines = append(lines, "Name: "+t.Name)
 			if len(t.PartitionBy) > 0 {
-				parts = append(parts, "PartitionBy: "+strings.Join(t.PartitionBy, ", "))
+				lines = append(lines, "PartitionBy: "+strings.Join(t.PartitionBy, ", "))
 			}
-			return fmt.Sprintf("%s\n%s", logicalTypeName(t), strings.Join(parts, "\n"))
 		}
 	case *ir.LogicalLimit:
 		if b.opts.Verbose {
-			return fmt.Sprintf("%s\nLimit: %d\nOffset: %d", logicalTypeName(t), t.Limit, t.Offset)
+			lines = append(lines, fmt.Sprintf("Limit: %d", t.Limit))
+			lines = append(lines, fmt.Sprintf("Offset: %d", t.Offset))
 		}
 	case *ir.LogicalWith:
 		if b.opts.Verbose {
-			return fmt.Sprintf("%s\nCTEs: %s", logicalTypeName(t), strings.Join(t.CTENames, ", "))
+			lines = append(lines, "CTEs: "+strings.Join(t.CTENames, ", "))
 		}
 	}
-	return logicalTypeName(n)
+	if b.schemas != nil {
+		if schema, ok := b.schemas[n]; ok {
+			if schemaLine := formatSchema(schema); schemaLine != "" {
+				lines = append(lines, "Schema: "+schemaLine)
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (b *logicalDotBuilder) logicalChildren(n ir.LogicalNode) []ir.LogicalNode {
@@ -227,6 +235,7 @@ type operatorDotBuilder struct {
 	next  int
 	ids   map[*op.Node]int
 	edges map[string]struct{}
+	schemas map[*op.Node]Schema
 	opts  Options
 }
 
@@ -278,6 +287,13 @@ func (b *operatorDotBuilder) operatorLabel(n *op.Node) string {
 			}
 			if len(parts) > 0 {
 				lines = append(lines, "Ops: "+strings.Join(parts, " -> "))
+			}
+		}
+	}
+	if b.schemas != nil {
+		if schema, ok := b.schemas[n]; ok {
+			if schemaLine := formatSchema(schema); schemaLine != "" {
+				lines = append(lines, "Schema: "+schemaLine)
 			}
 		}
 	}

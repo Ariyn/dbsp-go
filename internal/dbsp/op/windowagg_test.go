@@ -73,3 +73,245 @@ func TestWindowAggFrameValueModeReplacesRow(t *testing.T) {
 		t.Fatalf("expected agg_result retraction 1.0 and insertion 2.0, got -%v +%v", minusVal, plusVal)
 	}
 }
+
+func TestWindowAggCumulativeFrameAppendUsesPrefixSemantics(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+
+	out, err := w.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 1.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 2.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(3), "v": 3.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("expected 3 output rows, got %d", len(out))
+	}
+
+	seen := map[int64]float64{}
+	for _, td := range out {
+		seen[td.Tuple["ts"].(int64)] = types.ToFloat64(td.Tuple["agg_result"])
+	}
+	if seen[1] != 1.0 || seen[2] != 3.0 || seen[3] != 6.0 {
+		t.Fatalf("unexpected cumulative outputs: %v", seen)
+	}
+}
+
+func TestWindowAggCumulativeFrameOutOfOrderInsertReplacesSuffix(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+
+	if _, err := w.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 1.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(3), "v": 3.0}, Count: 1},
+	}); err != nil {
+		t.Fatalf("apply initial: %v", err)
+	}
+
+	out, err := w.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 2.0}, Count: 1}})
+	if err != nil {
+		t.Fatalf("apply insert: %v", err)
+	}
+
+	changes := map[int64][]types.TupleDelta{}
+	for _, td := range out {
+		changes[td.Tuple["ts"].(int64)] = append(changes[td.Tuple["ts"].(int64)], td)
+	}
+	if len(changes[2]) != 1 || types.ToFloat64(changes[2][0].Tuple["agg_result"]) != 3.0 {
+		t.Fatalf("expected ts=2 cumulative sum 3.0, got %v", changes[2])
+	}
+
+	var removedOld, addedNew bool
+	for _, td := range changes[3] {
+		switch {
+		case td.Count == -1 && types.ToFloat64(td.Tuple["agg_result"]) == 4.0:
+			removedOld = true
+		case td.Count == 1 && types.ToFloat64(td.Tuple["agg_result"]) == 6.0:
+			addedNew = true
+		}
+	}
+	if !removedOld || !addedNew {
+		t.Fatalf("expected ts=3 replacement 4.0 -> 6.0, got %v", changes[3])
+	}
+}
+
+func TestWindowAggCumulativeFrameAppendOnlyEmitsOnlyNewRow(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+
+	if _, err := w.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 1.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 2.0}, Count: 1},
+	}); err != nil {
+		t.Fatalf("apply initial: %v", err)
+	}
+
+	out, err := w.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(3), "v": 3.0}, Count: 1}})
+	if err != nil {
+		t.Fatalf("apply append: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 output row, got %d (%v)", len(out), out)
+	}
+	if out[0].Count != 1 || out[0].Tuple["ts"] != int64(3) || types.ToFloat64(out[0].Tuple["agg_result"]) != 6.0 {
+		t.Fatalf("unexpected append output: %v", out)
+	}
+}
+
+func TestWindowAggCumulativeFrameLatestRowReplacementTouchesTailOnly(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+
+	if _, err := w.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 1.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 2.0}, Count: 1},
+	}); err != nil {
+		t.Fatalf("apply initial: %v", err)
+	}
+
+	out, err := w.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 2.0}, Count: -1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 4.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("apply replace: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 output rows, got %d (%v)", len(out), out)
+	}
+
+	var removedOld, addedNew bool
+	for _, td := range out {
+		if td.Tuple["ts"] != int64(2) {
+			t.Fatalf("expected only tail row ts=2 to change, got %v", out)
+		}
+		switch {
+		case td.Count == -1 && types.ToFloat64(td.Tuple["agg_result"]) == 3.0:
+			removedOld = true
+		case td.Count == 1 && types.ToFloat64(td.Tuple["agg_result"]) == 5.0:
+			addedNew = true
+		}
+	}
+	if !removedOld || !addedNew {
+		t.Fatalf("expected tail replacement 3.0 -> 5.0, got %v", out)
+	}
+}
+
+func TestWindowAggCumulativeFrameAppendAfterFallbackUsesUpdatedTailState(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+
+	if _, err := w.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 1.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(3), "v": 3.0}, Count: 1},
+	}); err != nil {
+		t.Fatalf("apply initial: %v", err)
+	}
+
+	if _, err := w.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 2.0}, Count: 1}}); err != nil {
+		t.Fatalf("apply out-of-order insert: %v", err)
+	}
+
+	out, err := w.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(4), "v": 4.0}, Count: 1}})
+	if err != nil {
+		t.Fatalf("apply tail append: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected only appended row output, got %d (%v)", len(out), out)
+	}
+	if out[0].Tuple["ts"] != int64(4) {
+		t.Fatalf("expected appended ts=4 row, got %v", out[0].Tuple)
+	}
+	if got := types.ToFloat64(out[0].Tuple["agg_result"]); got != 10.0 {
+		t.Fatalf("expected cumulative sum 10.0 after fallback+append, got %v", out[0].Tuple)
+	}
+	cache := w.getOrCreateCumulativeFrameCache("a")
+	if cache.rowCount != 4 {
+		t.Fatalf("expected cache rowCount=4, got %d", cache.rowCount)
+	}
+}
+
+func TestWindowAggTumblingCompactsBatchDeltasPerWindowKey(t *testing.T) {
+	w := NewWindowAggOp(
+		WindowSpecLite{TimeCol: "ts", SizeMillis: 1000, WindowType: WindowTypeTumbling},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		&SumAgg{ColName: "v"},
+	)
+
+	out, err := w.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(100), "v": 1.0}, Count: 1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(500), "v": 2.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 compacted output row, got %d (%v)", len(out), out)
+	}
+	if out[0].Count != 1 {
+		t.Fatalf("expected count 1, got %d", out[0].Count)
+	}
+	if out[0].Tuple["id"] != "a" {
+		t.Fatalf("expected id=a, got %v", out[0].Tuple)
+	}
+	if got := types.ToFloat64(out[0].Tuple["agg_delta"]); got != 3.0 {
+		t.Fatalf("expected agg_delta 3.0, got %v", out[0].Tuple)
+	}
+	if out[0].Tuple["__window_start"] != int64(0) || out[0].Tuple["__window_end"] != int64(1000) {
+		t.Fatalf("unexpected window bounds: %v", out[0].Tuple)
+	}
+}

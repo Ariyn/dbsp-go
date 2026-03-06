@@ -1,8 +1,8 @@
 package sink
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -23,7 +23,10 @@ import (
 )
 
 type partitionEntry struct {
-	store *op.ZSetStore
+	store         *op.ZSetStore
+	snapshotBatch types.Batch
+	snapshotBytes []byte
+	dirty         bool
 }
 
 type HTTPPullSink struct {
@@ -85,25 +88,34 @@ func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
 		return nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	partitioned := make(map[string]types.Batch)
 	for _, td := range batch {
 		pk := s.getPartitionKey(td.Tuple)
 		if strings.TrimSpace(os.Getenv("DBSP_DEBUG_PARTITION")) != "" {
 			fmt.Printf("DEBUG partition key: %s\n", pk)
 		}
+		partitioned[pk] = append(partitioned[pk], td)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for pk, deltas := range partitioned {
 		entry, ok := s.partitions[pk]
 		if !ok {
 			entry = &partitionEntry{
 				store: op.NewZSetStore(),
+				dirty: true,
 			}
 			s.partitions[pk] = entry
 		}
 
-		if err := entry.store.ApplyDelta(types.Batch{td}); err != nil {
+		if err := entry.store.ApplyDelta(deltas); err != nil {
 			return err
 		}
+		entry.snapshotBatch = nil
+		entry.snapshotBytes = nil
+		entry.dirty = true
 	}
 
 	return nil
@@ -117,15 +129,10 @@ func (s *HTTPPullSink) getPartitionKey(t types.Tuple) string {
 		val := resolvePartitionValue(t, s.partitionBy[0])
 		return sanitizeHivePathSegment(fmt.Sprintf("%v", val))
 	}
-
-	vals := make(map[string]string, len(s.partitionBy))
-	for _, col := range s.partitionBy {
+	return buildOrderedPartitionKey(s.partitionBy, func(col string) string {
 		val := resolvePartitionValue(t, col)
-		vals[col] = sanitizeHivePathSegment(fmt.Sprintf("%v", val))
-	}
-
-	b, _ := json.Marshal(vals)
-	return string(b)
+		return sanitizeHivePathSegment(fmt.Sprintf("%v", val))
+	})
 }
 
 func resolvePartitionValue(t types.Tuple, col string) any {
@@ -182,18 +189,14 @@ func (s *HTTPPullSink) handlePull(w http.ResponseWriter, r *http.Request) {
 	} else if len(s.partitionBy) == 1 {
 		pk = sanitizeHivePathSegment(r.URL.Query().Get(s.partitionBy[0]))
 	} else {
-		// Complex key: consistent with getPartitionKey
-		vals := make(map[string]string)
-		for _, col := range s.partitionBy {
-			vals[col] = sanitizeHivePathSegment(r.URL.Query().Get(col))
-		}
-		b, _ := json.Marshal(vals)
-		pk = string(b)
+		pk = buildOrderedPartitionKey(s.partitionBy, func(col string) string {
+			return sanitizeHivePathSegment(r.URL.Query().Get(col))
+		})
 	}
 
-	s.mu.Lock()
+	s.mu.RLock()
 	entry, ok := s.partitions[pk]
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	if !ok {
 		if len(s.partitions) > 0 {
@@ -216,9 +219,11 @@ func (s *HTTPPullSink) handlePull(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Materialize to Arrow Record
 	// We create a temporary batch from the store.
-	s.mu.RLock()
-	batch := entry.store.ToBatch()
-	s.mu.RUnlock()
+	batch, payload, err := s.materializePartitionSnapshot(pk, entry)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to materialize partition: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	if len(batch) == 0 {
 		w.WriteHeader(http.StatusNoContent)
@@ -229,28 +234,63 @@ func (s *HTTPPullSink) handlePull(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="snapshot.parquet"`)
 
+	if _, err := w.Write(payload); err != nil {
+		fmt.Printf("Error writing parquet stream: %v\n", err)
+	}
+}
+
+func (s *HTTPPullSink) materializePartitionSnapshot(pk string, entry *partitionEntry) (types.Batch, []byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry == nil {
+		entry = s.partitions[pk]
+	}
+	if entry == nil {
+		return nil, nil, nil
+	}
+	if !entry.dirty && entry.snapshotBatch != nil && entry.snapshotBytes != nil {
+		return entry.snapshotBatch, entry.snapshotBytes, nil
+	}
+	batch := entry.store.SnapshotBatch()
+	if len(batch) == 0 {
+		entry.snapshotBatch = nil
+		entry.snapshotBytes = nil
+		entry.dirty = false
+		return nil, nil, nil
+	}
+	payload, err := s.encodeBatchToParquet(batch)
+	if err != nil {
+		return nil, nil, err
+	}
+	entry.snapshotBatch = batch
+	entry.snapshotBytes = payload
+	entry.dirty = false
+	return batch, payload, nil
+}
+
+func (s *HTTPPullSink) encodeBatchToParquet(batch types.Batch) ([]byte, error) {
+	var buf bytes.Buffer
 	props := parquet.NewWriterProperties()
 	arrowProps := pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema())
 
-	fw, err := pqarrow.NewFileWriter(s.arrowSchema, w, props, arrowProps)
+	fw, err := pqarrow.NewFileWriter(s.arrowSchema, &buf, props, arrowProps)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to create parquet writer: %v", err), http.StatusInternalServerError)
-		return
+		return nil, fmt.Errorf("create parquet writer: %w", err)
 	}
-	defer fw.Close()
-
-	// Build Arrow arrays for the batch
 	rec, err := s.batchToRecord(batch)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to build arrow record: %v", err), http.StatusInternalServerError)
-		return
+		_ = fw.Close()
+		return nil, err
 	}
 	defer rec.Release()
-
 	if err := fw.Write(rec); err != nil {
-		// Too late to change header, but we can log.
-		fmt.Printf("Error writing parquet stream: %v\n", err)
+		_ = fw.Close()
+		return nil, err
 	}
+	if err := fw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func (s *HTTPPullSink) batchToRecord(batch types.Batch) (arrow.Record, error) {
@@ -298,4 +338,17 @@ func sanitizeHivePathSegment(v string) string {
 		return "_"
 	}
 	return v
+}
+
+func buildOrderedPartitionKey(columns []string, lookup func(string) string) string {
+	var b strings.Builder
+	for idx, col := range columns {
+		if idx > 0 {
+			b.WriteByte('/')
+		}
+		b.WriteString(col)
+		b.WriteByte('=')
+		b.WriteString(lookup(col))
+	}
+	return b.String()
 }

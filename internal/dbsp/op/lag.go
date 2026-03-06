@@ -3,6 +3,7 @@ package op
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
@@ -34,6 +35,39 @@ func NewOrderedBuffer(orderByCol string) OrderedBuffer {
 		entries:    []BufferEntry{},
 		orderByCol: orderByCol,
 	}
+}
+
+func cloneBufferEntries(entries []BufferEntry) []BufferEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	cloned := make([]BufferEntry, len(entries))
+	copy(cloned, entries)
+	return cloned
+}
+
+func findTupleIndex(entries []BufferEntry, tuple types.Tuple) int {
+	for i, entry := range entries {
+		if types.TuplesEqual(entry.Tuple, tuple) {
+			return i
+		}
+	}
+	return -1
+}
+
+func getLagValueFromEntries(entries []BufferEntry, pos int, offset int, lagCol string, lagExpr ...func(types.Tuple) (any, error)) any {
+	if pos < offset || pos >= len(entries) {
+		return nil
+	}
+	lagPos := pos - offset
+	if lagPos < 0 {
+		return nil
+	}
+	if len(lagExpr) > 0 && lagExpr[0] != nil {
+		raw, _ := lagExpr[0](entries[lagPos].Tuple)
+		return raw
+	}
+	return entries[lagPos].Tuple[lagCol]
 }
 
 // Add inserts or removes a row with the given count (multiplicity).
@@ -112,18 +146,7 @@ func (o *OrderedBuffer) isSameTuple(t1, t2 types.Tuple) bool {
 
 // GetLagValue returns the LAG value for the row at the given position
 func (o *OrderedBuffer) GetLagValue(pos int, offset int, lagCol string, lagExpr ...func(types.Tuple) (any, error)) any {
-	if pos < offset || pos >= len(o.entries) {
-		return nil
-	}
-	lagPos := pos - offset
-	if lagPos < 0 {
-		return nil
-	}
-	if len(lagExpr) > 0 && lagExpr[0] != nil {
-		raw, _ := lagExpr[0](o.entries[lagPos].Tuple)
-		return raw
-	}
-	return o.entries[lagPos].Tuple[lagCol]
+	return getLagValueFromEntries(o.entries, pos, offset, lagCol, lagExpr...)
 }
 
 // GetEntry returns the entry at the given position
@@ -187,6 +210,16 @@ func compareValues(a, b any) int {
 				return -1
 			}
 			if av > bv {
+				return 1
+			}
+			return 0
+		}
+	case time.Time:
+		if bv, ok := b.(time.Time); ok {
+			if av.Before(bv) {
+				return -1
+			}
+			if av.After(bv) {
 				return 1
 			}
 			return 0
@@ -297,6 +330,8 @@ func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 		offset = 1
 	}
 
+	oldEntries := cloneBufferEntries(monoid.Buffer.entries)
+
 	// Update buffer and get affected positions
 	insertPos, affected := monoid.Buffer.Add(td.Tuple, td.Count)
 	if insertPos < 0 {
@@ -326,19 +361,17 @@ func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 		}
 
 		var oldLagValue any
-		if l.LagExpr != nil {
-			oldLagValue, _ = l.LagExpr(td.Tuple)
-		} else {
-			oldLagValue = td.Tuple[lagCol]
+		oldPos := findTupleIndex(oldEntries, entry.Tuple)
+		if oldPos >= 0 {
+			oldLagValue = getLagValueFromEntries(oldEntries, oldPos, offset, lagCol, l.LagExpr)
 		}
 		newLagValue := monoid.Buffer.GetLagValue(pos, offset, lagCol, l.LagExpr)
 
 		if !types.EqualAny(oldLagValue, newLagValue) {
 			// Emit delta: cancel old value, add new value
-			outTuple := types.CloneTuple(entry.Tuple)
-
 			// Cancel old LAG value
 			if oldLagValue != nil {
+				outTuple := types.CloneTuple(entry.Tuple)
 				outTuple[l.getOutputCol()] = oldLagValue
 				outDeltas = append(outDeltas, types.TupleDelta{
 					Tuple: outTuple,
@@ -347,6 +380,7 @@ func (l *LagAgg) Apply(prev any, td types.TupleDelta) (any, *types.TupleDelta) {
 			}
 
 			// Add new LAG value
+			outTuple := types.CloneTuple(entry.Tuple)
 			outTuple[l.getOutputCol()] = newLagValue
 			outDeltas = append(outDeltas, types.TupleDelta{
 				Tuple: outTuple,

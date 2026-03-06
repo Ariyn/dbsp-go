@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/internal/dbsp/graph"
 	sqlconv "github.com/ariyn/dbsp/internal/dbsp/sql"
 )
@@ -17,6 +18,7 @@ func runGraphCommand(args []string) error {
 	out := fs.String("out", "", "Output file path for a single stage")
 	outPrefix := fs.String("out-prefix", "", "Output file prefix for stage=both")
 	verbose := fs.Bool("verbose", false, "Include detailed labels")
+	schema := fs.Bool("schema", true, "Include schema annotations")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -72,7 +74,12 @@ func runGraphCommand(args []string) error {
 		return fmt.Errorf("compile operator graph: %w", err)
 	}
 
-	opts := graph.Options{Verbose: *verbose}
+	inputSchema, err := extractInputSchema(&cfg)
+	if err != nil {
+		return fmt.Errorf("extract input schema: %w", err)
+	}
+
+	opts := graph.Options{Verbose: *verbose, IncludeSchema: *schema, InputSchema: inputSchema}
 
 	switch stageValue {
 	case "logical":
@@ -109,4 +116,26 @@ func writeDotOutput(dot string, outPath string) error {
 	}
 	fmt.Printf("Wrote %s\n", outPath)
 	return nil
+}
+
+func extractInputSchema(cfg *config.PipelineConfig) (map[string]string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	switch cfg.Pipeline.Source.Type {
+	case "http":
+		var httpCfg config.HTTPSourceConfig
+		if err := config.DecodeTo(cfg.Pipeline.Source.Config, &httpCfg); err != nil {
+			return nil, err
+		}
+		return httpCfg.Schema, nil
+	case "csv":
+		var csvCfg config.CSVSourceConfig
+		if err := config.DecodeTo(cfg.Pipeline.Source.Config, &csvCfg); err != nil {
+			return nil, err
+		}
+		return csvCfg.Schema, nil
+	default:
+		return nil, nil
+	}
 }

@@ -3,7 +3,6 @@ package source
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,23 +15,57 @@ import (
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 	"github.com/ariyn/dbsp/internal/dbsp/wal"
+	"github.com/buger/jsonparser"
 )
 
-type HTTPSource struct {
-	server         *http.Server
-	buffer         chan types.Batch
-	pending        types.Batch
-	schema         map[string]string
-	requiredFields map[string]struct{}
-	done           chan struct{}
-	once           sync.Once
+var requestBodyBufferPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
 
-	wal *wal.LogWriter
+var errStopObjectDecode = errors.New("stop object decode")
+
+type HTTPSource struct {
+	server          *http.Server
+	buffer          chan types.Batch
+	pending         types.Batch
+	schema          map[string]string
+	requiredFields  map[string]struct{}
+	fieldSpecs      []fieldSpec
+	fieldSpecsByLen map[int][]fieldSpec
+	fieldSpecMap    map[string]fieldSpec
+	done            chan struct{}
+	once            sync.Once
+	queueMu         sync.Mutex
+	walQueue        []queuedWALBatch
+	walDelivered    []uint64
+	walAvailable    chan struct{}
+	walBuffered     int
+	walBufferLimit  int
+
+	wal        *wal.LogWriter
+	pendingSeq uint64
 
 	maxBatchSize    int
 	maxBatchDelay   time.Duration
 	maxRequestBytes int64
 	timestampUnit   string
+
+	replayDir string
+}
+
+type queuedWALBatch struct {
+	seq   uint64
+	batch types.Batch
+	ref   *wal.RecordRef
+}
+
+type fieldSpec struct {
+	name     string
+	keyBytes []byte
+	typeName string
+	typeKind fieldTypeKind
 }
 
 func NewHTTPSource(httpConfig config.HTTPSourceConfig, requiredFields map[string]struct{}) (*HTTPSource, error) {
@@ -59,27 +92,6 @@ func NewHTTPSource(httpConfig config.HTTPSourceConfig, requiredFields map[string
 	}
 
 	effectiveRequired := requiredFields
-	if requiredFields != nil && len(httpConfig.Schema) == 0 {
-		effectiveRequired = nil
-	}
-	if requiredFields != nil && httpConfig.Schema != nil && len(httpConfig.Schema) > 0 {
-		needsSchema := false
-		for key := range requiredFields {
-			if _, ok := httpConfig.Schema[key]; !ok {
-				needsSchema = true
-				break
-			}
-		}
-		if needsSchema {
-			effectiveRequired = make(map[string]struct{}, len(requiredFields)+len(httpConfig.Schema))
-			for key := range requiredFields {
-				effectiveRequired[key] = struct{}{}
-			}
-			for key := range httpConfig.Schema {
-				effectiveRequired[key] = struct{}{}
-			}
-		}
-	}
 	if strings.TrimSpace(os.Getenv("DBSP_DEBUG_FIELDS")) != "" {
 		if effectiveRequired == nil {
 			fmt.Println("DEBUG http source requiredFields: <all>")
@@ -97,11 +109,16 @@ func NewHTTPSource(httpConfig config.HTTPSourceConfig, requiredFields map[string
 		buffer:          make(chan types.Batch, httpConfig.BufferSize),
 		schema:          httpConfig.Schema,
 		requiredFields:  effectiveRequired,
+		fieldSpecs:      buildFieldSpecs(effectiveRequired, httpConfig.Schema),
+		fieldSpecsByLen: buildFieldSpecsByLen(effectiveRequired, httpConfig.Schema),
+		fieldSpecMap:    buildFieldSpecMap(effectiveRequired, httpConfig.Schema),
 		done:            make(chan struct{}),
 		maxBatchSize:    httpConfig.MaxBatchSize,
 		maxBatchDelay:   time.Duration(httpConfig.MaxBatchDelayMS) * time.Millisecond,
 		maxRequestBytes: httpConfig.MaxRequestBytes,
 		timestampUnit:   httpConfig.TimestampUnit,
+		walAvailable:    make(chan struct{}, 1),
+		walBufferLimit:  httpConfig.BufferSize,
 	}
 
 	if httpConfig.WALDir != "" {
@@ -117,6 +134,7 @@ func NewHTTPSource(httpConfig config.HTTPSourceConfig, requiredFields map[string
 			return nil, fmt.Errorf("failed to init wal: %w", err)
 		}
 		s.wal = lw
+		s.replayDir = httpConfig.WALDir
 
 	}
 
@@ -145,13 +163,19 @@ func (s *HTTPSource) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	var walBuf bytes.Buffer
-	reader := io.Reader(r.Body)
-	if s.wal != nil {
-		reader = io.TeeReader(r.Body, &walBuf)
+	body, releaseBody, err := s.readRequestBody(r.Body, r.ContentLength)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
 	}
+	defer releaseBody()
 
-	batch, err := s.parseRequestBodyReader(reader)
+	batch, err := s.parseRequestBody(body)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
@@ -162,31 +186,31 @@ func (s *HTTPSource) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(batch) == 0 {
-		if strings.TrimSpace(os.Getenv("DBSP_DEBUG_INGEST")) != "" {
-			fmt.Println("DEBUG ingest: empty batch")
-		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK (empty)"))
 		return
 	}
-	if strings.TrimSpace(os.Getenv("DBSP_DEBUG_INGEST")) != "" {
-		fmt.Printf("DEBUG ingest: batch size=%d\n", len(batch))
-		if len(batch) > 0 {
-			fmt.Printf("DEBUG ingest: first tuple keys=%v\n", tupleKeysLocal(batch[0].Tuple))
-		}
-	}
 
 	if s.wal != nil {
-		body := walBuf.Bytes()
-		rec := &wal.Record{
-			Type:     wal.RecordTypeData,
-			Sequence: uint64(time.Now().UnixNano()),
-			Payload:  body,
+		payload, err := wal.EncodeBatchGobV1(batch)
+		if err != nil {
+			http.Error(w, "WAL encode failure", http.StatusInternalServerError)
+			return
 		}
-		if err := s.wal.Append(rec); err != nil {
+		rec := &wal.Record{
+			Type:     wal.RecordTypeBatch,
+			Sequence: uint64(time.Now().UnixNano()),
+			Payload:  payload,
+		}
+		ref, err := s.wal.AppendRef(rec)
+		if err != nil {
 			http.Error(w, "WAL failure", http.StatusInternalServerError)
 			return
 		}
+		s.enqueueWALBatch(rec.Sequence, batch, ref)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+		return
 	}
 
 	select {
@@ -194,191 +218,235 @@ func (s *HTTPSource) handleIngest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	default:
-		if strings.TrimSpace(os.Getenv("DBSP_DEBUG_INGEST")) != "" {
-			fmt.Println("DEBUG ingest: buffer full")
-		}
 		http.Error(w, "Source buffer full", http.StatusServiceUnavailable)
 	}
 }
 
 func (s *HTTPSource) parseRequestBody(body []byte) (types.Batch, error) {
-	return s.parseRequestBodyReader(bytes.NewReader(body))
+	return s.parseRequestBodyBytes(body)
 }
 
 func (s *HTTPSource) parseRequestBodyReader(reader io.Reader) (types.Batch, error) {
-	dec := json.NewDecoder(reader)
-	dec.UseNumber()
-
-	first, err := dec.Token()
+	body, releaseBody, err := s.readRequestBody(reader, 0)
 	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, nil
+		return nil, err
+	}
+	defer releaseBody()
+	return s.parseRequestBodyBytes(body)
+}
+
+func (s *HTTPSource) readRequestBody(reader io.Reader, contentLength int64) ([]byte, func(), error) {
+	buf := requestBodyBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if contentLength > 0 {
+		if s.maxRequestBytes > 0 && contentLength > s.maxRequestBytes {
+			requestBodyBufferPool.Put(buf)
+			return nil, func() {}, &http.MaxBytesError{Limit: s.maxRequestBytes}
 		}
-		return nil, fmt.Errorf("Invalid JSON")
+		if contentLength <= int64(^uint(0)>>1) {
+			buf.Grow(int(contentLength))
+		}
+	}
+	if _, err := buf.ReadFrom(reader); err != nil {
+		requestBodyBufferPool.Put(buf)
+		return nil, func() {}, err
+	}
+	release := func() {
+		if buf.Cap() > 4*1024*1024 {
+			return
+		}
+		buf.Reset()
+		requestBodyBufferPool.Put(buf)
+	}
+	return buf.Bytes(), release, nil
+}
+
+func (s *HTTPSource) parseRequestBodyBytes(body []byte) (types.Batch, error) {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		return nil, nil
 	}
 
-	var out types.Batch
-	switch tok := first.(type) {
-	case json.Delim:
-		switch tok {
-		case '[':
-			for dec.More() {
-				td, err := s.decodeObject(dec)
+	switch body[0] {
+	case '[':
+		capacity := s.maxBatchSize
+		if capacity <= 0 {
+			capacity = 16
+		}
+		out := make(types.Batch, 0, capacity)
+		var parseErr error
+		_, err := jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+			if parseErr != nil || err != nil {
 				if err != nil {
-					return nil, err
+					parseErr = err
 				}
-				if td != nil {
-					out = append(out, *td)
-				}
+				return
 			}
-			if _, err := dec.Token(); err != nil {
-				return nil, fmt.Errorf("Invalid JSON")
+			if dataType != jsonparser.Object {
+				parseErr = fmt.Errorf("Invalid JSON")
+				return
 			}
-		case '{':
-			td, err := s.decodeObjectFromOpen(dec)
-			if err != nil {
-				return nil, err
+			td, ok, objErr := s.decodeObjectBytes(value)
+			if objErr != nil {
+				parseErr = objErr
+				return
 			}
-			if td != nil {
-				out = append(out, *td)
+			if ok {
+				out = append(out, td)
 			}
-		default:
-			return nil, fmt.Errorf("Invalid JSON")
+		})
+		if parseErr != nil {
+			return nil, parseErr
 		}
-	default:
-		return nil, fmt.Errorf("Invalid JSON")
-	}
-
-	return out, nil
-}
-
-func tupleKeysLocal(t types.Tuple) []string {
-	if t == nil {
-		return nil
-	}
-	keys := make([]string, 0, len(t))
-	for k := range t {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
-func (s *HTTPSource) decodeObject(dec *json.Decoder) (*types.TupleDelta, error) {
-	if tok, err := dec.Token(); err != nil {
-		return nil, fmt.Errorf("Invalid JSON")
-	} else if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return nil, fmt.Errorf("Invalid JSON")
-	}
-	return s.decodeObjectFromOpen(dec)
-}
-
-func (s *HTTPSource) decodeObjectFromOpen(dec *json.Decoder) (*types.TupleDelta, error) {
-	tuple := make(types.Tuple)
-	for dec.More() {
-		keyTok, err := dec.Token()
 		if err != nil {
 			return nil, fmt.Errorf("Invalid JSON")
 		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return nil, fmt.Errorf("Invalid JSON")
-		}
-		if !s.shouldKeepField(key) {
-			if err := skipJSONValue(dec); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		value, err := s.decodeFieldValue(dec, key)
+		return out, nil
+	case '{':
+		td, ok, err := s.decodeObjectBytes(body)
 		if err != nil {
 			return nil, err
 		}
-		tuple[key] = value
-	}
-	if _, err := dec.Token(); err != nil {
+		if !ok {
+			return nil, nil
+		}
+		return types.Batch{td}, nil
+	default:
 		return nil, fmt.Errorf("Invalid JSON")
 	}
-	return &types.TupleDelta{Tuple: tuple, Count: 1}, nil
 }
 
-func (s *HTTPSource) shouldKeepField(key string) bool {
-	if s.requiredFields == nil {
-		return true
+func (s *HTTPSource) decodeObjectBytes(body []byte) (types.TupleDelta, bool, error) {
+	var tuple types.Tuple
+	remaining := len(s.requiredFields)
+	err := jsonparser.ObjectEach(body, func(key []byte, value []byte, dataType jsonparser.ValueType, offset int) error {
+		spec, ok := s.matchField(key)
+		if !ok {
+			return nil
+		}
+		if tuple == nil {
+			tuple = make(types.Tuple, s.estimatedTupleCapacity())
+		}
+		decoded, err := s.decodeFieldBytes(spec, value, dataType)
+		if err != nil {
+			return err
+		}
+		tuple[spec.name] = decoded
+		if remaining > 0 {
+			remaining--
+			if remaining == 0 {
+				return errStopObjectDecode
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errStopObjectDecode) {
+			return types.TupleDelta{Tuple: tuple, Count: 1}, true, nil
+		}
+		return types.TupleDelta{}, false, fmt.Errorf("Invalid JSON")
 	}
-	if s.schema != nil {
-		if _, ok := s.schema[key]; ok {
-			return true
+	if tuple == nil {
+		return types.TupleDelta{}, false, nil
+	}
+	return types.TupleDelta{Tuple: tuple, Count: 1}, true, nil
+}
+
+func (s *HTTPSource) estimatedTupleCapacity() int {
+	if len(s.requiredFields) > 0 {
+		return len(s.requiredFields)
+	}
+	if len(s.schema) > 0 {
+		return len(s.schema)
+	}
+	if len(s.fieldSpecMap) > 0 {
+		return len(s.fieldSpecMap)
+	}
+	return 8
+}
+
+func buildFieldSpecs(requiredFields map[string]struct{}, schema map[string]string) []fieldSpec {
+	if len(requiredFields) == 0 {
+		return nil
+	}
+	specs := make([]fieldSpec, 0, len(requiredFields))
+	for name := range requiredFields {
+		specs = append(specs, fieldSpec{
+			name:     name,
+			keyBytes: []byte(name),
+			typeName: schema[name],
+			typeKind: parseFieldTypeKind(schema[name]),
+		})
+	}
+	return specs
+}
+
+func buildFieldSpecsByLen(requiredFields map[string]struct{}, schema map[string]string) map[int][]fieldSpec {
+	if len(requiredFields) == 0 {
+		return nil
+	}
+	byLen := make(map[int][]fieldSpec, len(requiredFields))
+	for _, spec := range buildFieldSpecs(requiredFields, schema) {
+		keyLen := len(spec.keyBytes)
+		byLen[keyLen] = append(byLen[keyLen], spec)
+	}
+	return byLen
+}
+
+func buildFieldSpecMap(requiredFields map[string]struct{}, schema map[string]string) map[string]fieldSpec {
+	if len(requiredFields) == 0 {
+		return nil
+	}
+	out := make(map[string]fieldSpec, len(requiredFields))
+	for name := range requiredFields {
+		out[name] = fieldSpec{
+			name:     name,
+			keyBytes: []byte(name),
+			typeName: schema[name],
+			typeKind: parseFieldTypeKind(schema[name]),
 		}
 	}
-	_, ok := s.requiredFields[key]
-	return ok
+	return out
 }
 
-func (s *HTTPSource) decodeFieldValue(dec *json.Decoder, key string) (any, error) {
-	var raw json.RawMessage
-	if err := dec.Decode(&raw); err != nil {
-		return nil, fmt.Errorf("Invalid JSON")
+func (s *HTTPSource) matchField(key []byte) (fieldSpec, bool) {
+	if s.requiredFields == nil {
+		name := string(key)
+		return fieldSpec{name: name, typeName: s.schema[name]}, true
 	}
-	val, err := decodeRawValue(raw)
-	if err != nil {
-		return nil, fmt.Errorf("Invalid JSON")
+	if len(s.fieldSpecs) == 0 {
+		s.fieldSpecs = buildFieldSpecs(s.requiredFields, s.schema)
 	}
-	if typeName, ok := s.schema[key]; ok {
-		converted, err := parseValueByType(val, typeName, s.timestampUnit)
+	if len(s.fieldSpecsByLen) == 0 {
+		s.fieldSpecsByLen = buildFieldSpecsByLen(s.requiredFields, s.schema)
+	}
+	for _, spec := range s.fieldSpecsByLen[len(key)] {
+		if len(spec.keyBytes) == 0 || len(key) == 0 || spec.keyBytes[0] != key[0] {
+			continue
+		}
+		if bytes.Equal(spec.keyBytes, key) {
+			return spec, true
+		}
+	}
+	return fieldSpec{}, false
+}
+
+func (s *HTTPSource) decodeFieldBytes(spec fieldSpec, value []byte, valueType jsonparser.ValueType) (any, error) {
+	if spec.typeKind != fieldTypeUnknown {
+		converted, err := parseValueByFieldKind(value, valueType, spec.typeKind, s.timestampUnit)
 		if err != nil {
-			return nil, fmt.Errorf("Invalid value for field %s: %v", key, err)
+			return nil, fmt.Errorf("Invalid value for field %s: %v", spec.name, err)
 		}
 		return converted, nil
 	}
-	return val, nil
-}
-
-func decodeRawValue(raw json.RawMessage) (any, error) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var out any
-	if err := dec.Decode(&out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func skipJSONValue(dec *json.Decoder) error {
-	tok, err := dec.Token()
-	if err != nil {
-		return fmt.Errorf("Invalid JSON")
-	}
-	d, ok := tok.(json.Delim)
-	if !ok {
-		return nil
-	}
-	switch d {
-	case '{':
-		for dec.More() {
-			if _, err := dec.Token(); err != nil {
-				return fmt.Errorf("Invalid JSON")
-			}
-			if err := skipJSONValue(dec); err != nil {
-				return err
-			}
-		}
-		if _, err := dec.Token(); err != nil {
-			return fmt.Errorf("Invalid JSON")
-		}
-	case '[':
-		for dec.More() {
-			if err := skipJSONValue(dec); err != nil {
-				return err
-			}
-		}
-		if _, err := dec.Token(); err != nil {
-			return fmt.Errorf("Invalid JSON")
-		}
-	}
-	return nil
+	return parseJSONValueBytes(value, valueType)
 }
 
 func (s *HTTPSource) NextBatch() (types.Batch, error) {
+	if s.usesWALQueue() {
+		return s.nextWALBatch()
+	}
+
 	select {
 	case <-s.done:
 		return nil, nil
@@ -434,6 +502,10 @@ func (s *HTTPSource) NextBatch() (types.Batch, error) {
 
 // ReplayWAL repopulates the source from existing WAL log entries.
 func (s *HTTPSource) ReplayWAL(dir string) error {
+	afterSeq, err := wal.LoadReplayCursor(dir)
+	if err != nil {
+		return fmt.Errorf("load replay cursor: %w", err)
+	}
 	reader, err := wal.NewLogReader(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -441,21 +513,156 @@ func (s *HTTPSource) ReplayWAL(dir string) error {
 		}
 		return err
 	}
+	s.replayDir = dir
 
-	return reader.Replay(func(rec *wal.Record) error {
-		if rec.Type != wal.RecordTypeData {
-			return nil
+	return reader.ReplayRefsFrom(afterSeq, func(ref *wal.RecordRef) error {
+		if ref.Type != wal.RecordTypeBatch {
+			return fmt.Errorf("unsupported wal record type: %d", ref.Type)
 		}
-		batch, err := s.parseRequestBody(rec.Payload)
-		if err != nil {
-			return fmt.Errorf("failed to parse wal record: %w", err)
-		}
-		if len(batch) > 0 {
-			// In replay mode, we block if buffer is full to preserve order
-			s.buffer <- batch
-		}
+		s.enqueueWALReplayRef(ref)
 		return nil
 	})
+}
+
+func (s *HTTPSource) AckBatchProcessed(types.Batch) error {
+	if s.replayDir == "" {
+		return nil
+	}
+	seq, ok := s.popDeliveredSeq()
+	if !ok || seq == 0 {
+		return nil
+	}
+	if err := wal.SaveReplayCursor(s.replayDir, seq); err != nil {
+		return fmt.Errorf("save replay cursor: %w", err)
+	}
+	return nil
+}
+
+func (s *HTTPSource) usesWALQueue() bool {
+	return s.wal != nil || s.replayDir != ""
+}
+
+func (s *HTTPSource) enqueueWALBatch(seq uint64, batch types.Batch, ref *wal.RecordRef) {
+	item := queuedWALBatch{seq: seq}
+	s.queueMu.Lock()
+	if s.walBufferLimit > 0 && s.walBuffered < s.walBufferLimit {
+		item.batch = batch
+		s.walBuffered++
+	} else {
+		item.ref = ref
+	}
+	s.walQueue = append(s.walQueue, item)
+	s.queueMu.Unlock()
+	s.signalWALAvailable()
+}
+
+func (s *HTTPSource) enqueueWALReplayRef(ref *wal.RecordRef) {
+	s.queueMu.Lock()
+	s.walQueue = append(s.walQueue, queuedWALBatch{seq: ref.Sequence, ref: ref})
+	s.queueMu.Unlock()
+	s.signalWALAvailable()
+}
+
+func (s *HTTPSource) nextWALBatch() (types.Batch, error) {
+	maxSize := s.maxBatchSize
+	if maxSize <= 0 {
+		maxSize = 1
+	}
+	if len(s.pending) > 0 {
+		batch := s.takePending(nil, maxSize)
+		if len(s.pending) == 0 && s.pendingSeq != 0 {
+			s.recordDeliveredSeq(s.pendingSeq)
+			s.pendingSeq = 0
+		}
+		return batch, nil
+	}
+	for {
+		item, ok := s.takeNextWALBatch()
+		if ok {
+			batch, err := s.materializeWALBatch(item)
+			if err != nil {
+				return nil, err
+			}
+			if len(batch) == 0 {
+				continue
+			}
+			if len(batch) <= maxSize {
+				s.recordDeliveredSeq(item.seq)
+				return batch, nil
+			}
+			out := append(types.Batch(nil), batch[:maxSize]...)
+			s.pending = append(types.Batch(nil), batch[maxSize:]...)
+			s.pendingSeq = item.seq
+			return out, nil
+		}
+		select {
+		case <-s.done:
+			return nil, nil
+		case <-s.walAvailable:
+		}
+	}
+}
+
+func (s *HTTPSource) takeNextWALBatch() (queuedWALBatch, bool) {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if len(s.walQueue) == 0 {
+		return queuedWALBatch{}, false
+	}
+	item := s.walQueue[0]
+	s.walQueue = s.walQueue[1:]
+	if item.batch != nil && s.walBuffered > 0 {
+		s.walBuffered--
+	}
+	return item, true
+}
+
+func (s *HTTPSource) materializeWALBatch(item queuedWALBatch) (types.Batch, error) {
+	if item.batch != nil {
+		return item.batch, nil
+	}
+	if item.ref == nil {
+		return nil, nil
+	}
+	rec, err := wal.LoadRecord(item.ref)
+	if err != nil {
+		return nil, fmt.Errorf("load wal record: %w", err)
+	}
+	if rec.Type != wal.RecordTypeBatch {
+		return nil, fmt.Errorf("unsupported wal record type: %d", rec.Type)
+	}
+	batch, err := wal.DecodeBatchGobV1(rec.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("decode wal record: %w", err)
+	}
+	return batch, nil
+}
+
+func (s *HTTPSource) recordDeliveredSeq(seq uint64) {
+	if seq == 0 {
+		return
+	}
+	s.queueMu.Lock()
+	s.walDelivered = append(s.walDelivered, seq)
+	s.queueMu.Unlock()
+}
+
+func (s *HTTPSource) popDeliveredSeq() (uint64, bool) {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if len(s.walDelivered) == 0 {
+		return 0, false
+	}
+	seq := s.walDelivered[0]
+	s.walDelivered = s.walDelivered[1:]
+	return seq, true
+}
+
+func (s *HTTPSource) signalWALAvailable() {
+	select {
+	case s.walAvailable <- struct{}{}:
+	default:
+	}
 }
 
 func (s *HTTPSource) takePending(batch types.Batch, maxSize int) types.Batch {
@@ -492,9 +699,19 @@ func (s *HTTPSource) appendIncoming(batch types.Batch, incoming types.Batch, max
 
 func (s *HTTPSource) Close() error {
 	s.signalDone()
+	if s.server == nil {
+		if s.wal != nil {
+			_ = s.wal.Close()
+		}
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return s.server.Shutdown(ctx)
+	err := s.server.Shutdown(ctx)
+	if s.wal != nil {
+		_ = s.wal.Close()
+	}
+	return err
 }
 
 func (s *HTTPSource) signalDone() {

@@ -65,14 +65,18 @@ func collectColumns(node LogicalNode, cols map[string]struct{}) bool {
 		addPredicateColumns(n.PredicateSQL, cols)
 		return collectColumns(n.Input, cols)
 	case *LogicalProject:
-		if n.KeepInput || hasStar(n.Columns) {
-			return true
-		}
+		keepAllInput := n.KeepInput || hasStar(n.Columns)
 		for _, col := range n.Columns {
+			if strings.TrimSpace(col) == "*" {
+				continue
+			}
 			addColumnRef(col, cols)
 		}
 		for _, expr := range n.Exprs {
 			addExprColumns(expr.ExprSQL, cols)
+		}
+		if keepAllInput {
+			return collectColumns(n.Input, cols)
 		}
 		return collectColumns(n.Input, cols)
 	case *LogicalGroupAgg:

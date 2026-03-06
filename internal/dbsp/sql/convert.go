@@ -540,12 +540,20 @@ func parseSelectToLogicalPlanCore(sel *ast.Select, query string, ctes map[string
 				}
 			} else {
 				lg.Aggs = make([]ir.AggSpec, 0, len(aggs))
+				seenAliases := make(map[string]struct{})
 				for _, a := range aggs {
 					col := a.Col
 					if strings.ToUpper(a.Name) == "COUNT" && strings.TrimSpace(col) == "*" {
 						col = ""
 					}
-					lg.Aggs = append(lg.Aggs, ir.AggSpec{Name: a.Name, Col: col, As: aggOutputAlias(query, a)})
+					alias := aggOutputAlias(query, a)
+					if alias != "" {
+						if _, exists := seenAliases[alias]; exists {
+							continue
+						}
+						seenAliases[alias] = struct{}{}
+					}
+					lg.Aggs = append(lg.Aggs, ir.AggSpec{Name: a.Name, Col: col, As: alias})
 				}
 			}
 			currentNode = lg
@@ -1709,12 +1717,20 @@ func parseJoin(sel *ast.Select, joinExpr *ast.JoinTableExpr, rawQuery string, ct
 		}
 	} else {
 		lg.Aggs = make([]ir.AggSpec, 0, len(aggs))
+		seenAliases := make(map[string]struct{})
 		for _, a := range aggs {
 			col := a.Col
 			if strings.ToUpper(a.Name) == "COUNT" && strings.TrimSpace(col) == "*" {
 				col = ""
 			}
-			lg.Aggs = append(lg.Aggs, ir.AggSpec{Name: a.Name, Col: col, As: aggOutputAlias(rawQuery, a)})
+			alias := aggOutputAlias(rawQuery, a)
+			if alias != "" {
+				if _, exists := seenAliases[alias]; exists {
+					continue
+				}
+				seenAliases[alias] = struct{}{}
+			}
+			lg.Aggs = append(lg.Aggs, ir.AggSpec{Name: a.Name, Col: col, As: alias})
 		}
 	}
 
@@ -1733,34 +1749,48 @@ func aggOutputAlias(query string, agg AggCall) string {
 
 func findAggregatesForGroupBy(sel *ast.Select, query string) ([]AggCall, error) {
 	aggMap := make(map[string]AggCall)
+	aggAliasKey := make(map[string]string)
 	order := make([]string, 0)
+
+	addAgg := func(a AggCall) {
+		a.Col = normalizeQuotedIdentifierTokens(strings.TrimSpace(a.Col))
+		a.As = strings.TrimSpace(a.As)
+		key := strings.ToUpper(strings.TrimSpace(a.Name)) + "|" + strings.TrimSpace(a.Col)
+
+		// When multiple parsers discover the same SELECT aggregate through different
+		// shapes, prefer the first aggregate bound to an explicit alias.
+		if a.As != "" {
+			if existingKey, ok := aggAliasKey[a.As]; ok && existingKey != key {
+				return
+			}
+		}
+
+		if existing, exists := aggMap[key]; exists {
+			if strings.TrimSpace(existing.As) == "" && a.As != "" {
+				existing.As = a.As
+				aggMap[key] = existing
+				aggAliasKey[a.As] = key
+			}
+			return
+		}
+
+		order = append(order, key)
+		aggMap[key] = a
+		if a.As != "" {
+			aggAliasKey[a.As] = key
+		}
+	}
 
 	if queryAggs, err := findAggregatesFromQuery(query); err == nil && len(queryAggs) > 0 {
 		for _, a := range queryAggs {
-			a.Col = normalizeQuotedIdentifierTokens(strings.TrimSpace(a.Col))
 			a.As = extractAggAliasFromQuery(query, a)
-			key := strings.ToUpper(strings.TrimSpace(a.Name)) + "|" + strings.TrimSpace(a.Col)
-			if _, exists := aggMap[key]; exists {
-				continue
-			}
-			order = append(order, key)
-			aggMap[key] = a
+			addAgg(a)
 		}
 	}
 
 	if selAggs, err := findAggregatesFromSelect(sel); err == nil && len(selAggs) > 0 {
 		for _, a := range selAggs {
-			a.Col = normalizeQuotedIdentifierTokens(strings.TrimSpace(a.Col))
-			key := strings.ToUpper(strings.TrimSpace(a.Name)) + "|" + strings.TrimSpace(a.Col)
-			if existing, exists := aggMap[key]; exists {
-				if strings.TrimSpace(existing.As) == "" && strings.TrimSpace(a.As) != "" {
-					existing.As = strings.TrimSpace(a.As)
-					aggMap[key] = existing
-				}
-				continue
-			}
-			order = append(order, key)
-			aggMap[key] = a
+			addAgg(a)
 		}
 	}
 
@@ -1792,18 +1822,8 @@ func findAggregatesForGroupBy(sel *ast.Select, query string) ([]AggCall, error) 
 				continue
 			}
 			for _, call := range calls {
-				call.Col = normalizeQuotedIdentifierTokens(strings.TrimSpace(call.Col))
 				call.As = alias
-				key := strings.ToUpper(strings.TrimSpace(call.Name)) + "|" + strings.TrimSpace(call.Col)
-				if existing, exists := aggMap[key]; exists {
-					if strings.TrimSpace(existing.As) == "" && strings.TrimSpace(call.As) != "" {
-						existing.As = strings.TrimSpace(call.As)
-						aggMap[key] = existing
-					}
-					continue
-				}
-				order = append(order, key)
-				aggMap[key] = call
+				addAgg(call)
 			}
 		}
 	}

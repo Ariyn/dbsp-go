@@ -16,6 +16,7 @@ import (
 const (
 	RecordHeaderSize = 4 + 4 + 1 + 8
 	RecordTypeData   = 0x00
+	RecordTypeBatch  = 0x02
 )
 
 // Record represents a single entry in the WAL
@@ -23,6 +24,15 @@ type Record struct {
 	Type     uint8
 	Sequence uint64
 	Payload  []byte
+}
+
+// RecordRef points at a persisted record inside a WAL segment.
+type RecordRef struct {
+	Path     string
+	Offset   int64
+	Type     uint8
+	Sequence uint64
+	Length   uint32
 }
 
 // Encode serializes a Record into a byte slice

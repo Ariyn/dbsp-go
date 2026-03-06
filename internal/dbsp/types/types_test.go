@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -26,5 +27,21 @@ func TestToInt64Time(t *testing.T) {
 	want := ts.UnixNano()
 	if got != want {
 		t.Fatalf("unexpected int64 value: got=%v want=%v", got, want)
+	}
+}
+
+func TestEqualAnyFastNumericAndTimePaths(t *testing.T) {
+	if !EqualAny(int64(42), float64(42)) {
+		t.Fatal("expected int64 and float64 with same value to compare equal")
+	}
+	if !EqualAny(json.Number("42.5"), float64(42.5)) {
+		t.Fatal("expected json.Number and float64 with same value to compare equal")
+	}
+	ts := time.Unix(3, 123)
+	if !EqualAny(ts, ts) {
+		t.Fatal("expected identical time.Time values to compare equal")
+	}
+	if EqualAny(ts, ts.Add(time.Nanosecond)) {
+		t.Fatal("expected different time.Time values to compare unequal")
 	}
 }

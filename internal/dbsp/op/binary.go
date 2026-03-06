@@ -228,12 +228,7 @@ func (b *BinaryOp) now() time.Time {
 }
 
 func stableTupleKey(t types.Tuple) string {
-	// encoding/json produces deterministic output for map keys by sorting them.
-	b, err := json.Marshal(t)
-	if err == nil {
-		return string(b)
-	}
-	return fmt.Sprintf("%#v", t)
+	return stableTupleKeyCanonical(t)
 }
 
 func stableJoinKey(key any) string {
