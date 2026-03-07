@@ -183,7 +183,7 @@ func (s *ParquetSink) appendRowLocked(td types.TupleDelta) error {
 		switch col.Type {
 		case "int64":
 			b := s.builders[i].(*array.Int64Builder)
-			v, ok := td.Tuple[name]
+			v, ok := td.Get(name)
 			if !ok || v == nil {
 				b.AppendNull()
 				continue
@@ -197,7 +197,7 @@ func (s *ParquetSink) appendRowLocked(td types.TupleDelta) error {
 
 		case "float64":
 			b := s.builders[i].(*array.Float64Builder)
-			v, ok := td.Tuple[name]
+			v, ok := td.Get(name)
 			if !ok || v == nil {
 				b.AppendNull()
 				continue
@@ -211,22 +211,22 @@ func (s *ParquetSink) appendRowLocked(td types.TupleDelta) error {
 
 		case "string":
 			b := s.builders[i].(*array.StringBuilder)
-			v, ok := td.Tuple[name]
+			v, ok := td.Get(name)
 			if !ok || v == nil {
 				b.AppendNull()
 				continue
 			}
-			b.Append(fmt.Sprintf("%v", v))
+			b.Append(stringifyArrowValue(v))
 
 		default:
 			// Unknown types are stringified.
 			b := s.builders[i].(*array.StringBuilder)
-			v, ok := td.Tuple[name]
+			v, ok := td.Get(name)
 			if !ok || v == nil {
 				b.AppendNull()
 				continue
 			}
-			b.Append(fmt.Sprintf("%v", v))
+			b.Append(stringifyArrowValue(v))
 		}
 	}
 

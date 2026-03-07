@@ -2,6 +2,7 @@ package sink
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/apache/arrow/go/v15/arrow/array"
@@ -12,7 +13,7 @@ import (
 func AppendTupleDeltasToArrowBuilders(schema *arrow.Schema, builders []array.Builder, batch types.Batch) error {
 	for _, td := range batch {
 		for i, f := range schema.Fields() {
-			val, ok := td.Tuple[f.Name]
+			val, ok := td.Get(f.Name)
 			if !ok || val == nil {
 				builders[i].AppendNull()
 				continue
@@ -26,13 +27,38 @@ func AppendTupleDeltasToArrowBuilders(schema *arrow.Schema, builders []array.Bui
 				fv, _ := types.ToFloat64Safe(val)
 				builders[i].(*array.Float64Builder).Append(fv)
 			case arrow.STRING:
-				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
+				builders[i].(*array.StringBuilder).Append(stringifyArrowValue(val))
 			default:
-				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
+				builders[i].(*array.StringBuilder).Append(stringifyArrowValue(val))
 			}
 		}
 	}
 	return nil
+}
+
+func stringifyArrowValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case fmt.Stringer:
+		return v.String()
+	case int:
+		return strconv.Itoa(v)
+	case int8, int16, int32, int64:
+		return fmt.Sprintf("%d", v)
+	case uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%d", v)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(v)
+	default:
+		return fmt.Sprintf("%v", value)
+	}
 }
 
 func BuildArrowSchema(ps *config.ParquetSchema) *arrow.Schema {

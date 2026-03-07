@@ -9,6 +9,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/apache/arrow/go/v15/arrow/array"
 	"github.com/apache/arrow/go/v15/arrow/memory"
 	"github.com/apache/arrow/go/v15/parquet/file"
 	"github.com/apache/arrow/go/v15/parquet/pqarrow"
@@ -85,6 +86,61 @@ func TestParquetSink_WritesAndRotatesByBatches(t *testing.T) {
 	if rows1 != int64(len(b2)) {
 		t.Fatalf("expected file1 rows=%d, got %d", len(b2), rows1)
 	}
+}
+
+func TestParquetSinkWritesPackedRows(t *testing.T) {
+	dir := t.TempDir()
+	prefix := filepath.Join(dir, "packed")
+	schema := &config.ParquetSchema{Columns: []config.ParquetColumn{
+		{Name: "id", Type: "string"},
+		{Name: "energy", Type: "float64"},
+		{Name: "temp", Type: "string"},
+	}}
+	sinkCfg := map[string]interface{}{
+		"path":           prefix,
+		"compression":    "uncompressed",
+		"row_group_size": 8,
+	}
+
+	ps, err := NewParquetSink(sinkCfg, schema)
+	if err != nil {
+		t.Fatalf("NewParquetSink: %v", err)
+	}
+
+	packedSchema := types.NewPackedSchema([]string{"id", "energy"})
+	batch := types.Batch{{
+		Packed: types.NewPackedTupleWithPresence(packedSchema, []any{"panel-a", 9.75}, []bool{true, true}).WithExtra("temp", "27.0"),
+		Count:  1,
+	}}
+
+	if err := ps.WriteBatch(batch); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	if err := ps.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(ents) != 1 {
+		t.Fatalf("expected 1 parquet file, got %d", len(ents))
+	}
+	path := filepath.Join(dir, ents[0].Name())
+	rows := readParquetStringFloatRows(t, path)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	if rows[0].ID != "panel-a" || rows[0].Energy != 9.75 || rows[0].Temp != "27.0" {
+		t.Fatalf("unexpected row: %+v", rows[0])
+	}
+}
+
+type parquetStringFloatRow struct {
+	ID     string
+	Energy float64
+	Temp   string
 }
 
 func TestInferOrLoadParquetSchema_CachesAndReuses(t *testing.T) {
@@ -219,6 +275,45 @@ func readParquetRows(t *testing.T, path string) int64 {
 	for rr.Next() {
 		rec := rr.Record()
 		rows += rec.NumRows()
+	}
+	if err := rr.Err(); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("RecordReader.Err(%s): %v", path, err)
+	}
+	return rows
+}
+
+func readParquetStringFloatRows(t *testing.T, path string) []parquetStringFloatRow {
+	t.Helper()
+	rdr, err := file.OpenParquetFile(path, false)
+	if err != nil {
+		t.Fatalf("OpenParquetFile(%s): %v", path, err)
+	}
+	defer rdr.Close()
+
+	fr, err := pqarrow.NewFileReader(rdr, pqarrow.ArrowReadProperties{BatchSize: 1024}, memory.NewGoAllocator())
+	if err != nil {
+		t.Fatalf("NewFileReader(%s): %v", path, err)
+	}
+
+	rr, err := fr.GetRecordReader(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("GetRecordReader(%s): %v", path, err)
+	}
+	defer rr.Release()
+
+	var rows []parquetStringFloatRow
+	for rr.Next() {
+		rec := rr.Record()
+		idCol := rec.Column(0).(*array.String)
+		energyCol := rec.Column(1).(*array.Float64)
+		tempCol := rec.Column(2).(*array.String)
+		for idx := 0; idx < int(rec.NumRows()); idx++ {
+			rows = append(rows, parquetStringFloatRow{
+				ID:     idCol.Value(idx),
+				Energy: energyCol.Value(idx),
+				Temp:   tempCol.Value(idx),
+			})
+		}
 	}
 	if err := rr.Err(); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("RecordReader.Err(%s): %v", path, err)

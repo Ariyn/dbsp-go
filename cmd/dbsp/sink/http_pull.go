@@ -24,7 +24,6 @@ import (
 
 type partitionEntry struct {
 	store         *op.ZSetStore
-	snapshotBatch types.Batch
 	snapshotBytes []byte
 	dirty         bool
 }
@@ -35,6 +34,8 @@ type HTTPPullSink struct {
 	schema      *config.ParquetSchema
 	arrowSchema *arrow.Schema
 	mem         memory.Allocator
+	builders    []array.Builder
+	parquetBuf  bytes.Buffer
 
 	// Map of partition key -> partitionEntry
 	// For simplicity, we use string representation of partition key.
@@ -113,7 +114,6 @@ func (s *HTTPPullSink) WriteBatch(batch types.Batch) error {
 		if err := entry.store.ApplyDelta(deltas); err != nil {
 			return err
 		}
-		entry.snapshotBatch = nil
 		entry.snapshotBytes = nil
 		entry.dirty = true
 	}
@@ -161,6 +161,12 @@ func resolvePartitionValue(t types.Tuple, col string) any {
 }
 
 func (s *HTTPPullSink) Close() error {
+	for _, builder := range s.builders {
+		if builder != nil {
+			builder.Release()
+		}
+	}
+	s.builders = nil
 	if s.server != nil {
 		_ = s.server.Shutdown(context.Background())
 	}
@@ -219,13 +225,13 @@ func (s *HTTPPullSink) handlePull(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Materialize to Arrow Record
 	// We create a temporary batch from the store.
-	batch, payload, err := s.materializePartitionSnapshot(pk, entry)
+	payload, rowCount, err := s.materializePartitionSnapshot(pk, entry)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to materialize partition: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	if len(batch) == 0 {
+	if rowCount == 0 {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -239,94 +245,106 @@ func (s *HTTPPullSink) handlePull(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *HTTPPullSink) materializePartitionSnapshot(pk string, entry *partitionEntry) (types.Batch, []byte, error) {
+func (s *HTTPPullSink) materializePartitionSnapshot(pk string, entry *partitionEntry) ([]byte, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry == nil {
 		entry = s.partitions[pk]
 	}
 	if entry == nil {
-		return nil, nil, nil
+		return nil, 0, nil
 	}
-	if !entry.dirty && entry.snapshotBatch != nil && entry.snapshotBytes != nil {
-		return entry.snapshotBatch, entry.snapshotBytes, nil
+	if !entry.dirty && entry.snapshotBytes != nil {
+		return entry.snapshotBytes, entry.store.EntryCount(), nil
 	}
-	batch := entry.store.SnapshotBatch()
-	if len(batch) == 0 {
-		entry.snapshotBatch = nil
+	if entry.store == nil {
 		entry.snapshotBytes = nil
 		entry.dirty = false
-		return nil, nil, nil
+		return nil, 0, nil
 	}
-	payload, err := s.encodeBatchToParquet(batch)
+	payload, rowCount, err := s.encodeStoreToParquet(entry.store)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, err
 	}
-	entry.snapshotBatch = batch
 	entry.snapshotBytes = payload
 	entry.dirty = false
-	return batch, payload, nil
+	return payload, rowCount, nil
 }
 
-func (s *HTTPPullSink) encodeBatchToParquet(batch types.Batch) ([]byte, error) {
-	var buf bytes.Buffer
+func (s *HTTPPullSink) encodeStoreToParquet(store *op.ZSetStore) ([]byte, int, error) {
+	s.parquetBuf.Reset()
 	props := parquet.NewWriterProperties()
 	arrowProps := pqarrow.NewArrowWriterProperties(pqarrow.WithStoreSchema())
 
-	fw, err := pqarrow.NewFileWriter(s.arrowSchema, &buf, props, arrowProps)
+	fw, err := pqarrow.NewFileWriter(s.arrowSchema, &s.parquetBuf, props, arrowProps)
 	if err != nil {
-		return nil, fmt.Errorf("create parquet writer: %w", err)
+		return nil, 0, fmt.Errorf("create parquet writer: %w", err)
 	}
-	rec, err := s.batchToRecord(batch)
+	rec, rowCount, err := s.storeToRecord(store)
 	if err != nil {
 		_ = fw.Close()
-		return nil, err
+		return nil, 0, err
+	}
+	if rec == nil || rowCount == 0 {
+		_ = fw.Close()
+		return nil, 0, nil
 	}
 	defer rec.Release()
 	if err := fw.Write(rec); err != nil {
 		_ = fw.Close()
-		return nil, err
+		return nil, 0, err
 	}
 	if err := fw.Close(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return buf.Bytes(), nil
+	payload := append([]byte(nil), s.parquetBuf.Bytes()...)
+	return payload, rowCount, nil
 }
 
-func (s *HTTPPullSink) batchToRecord(batch types.Batch) (arrow.Record, error) {
-	builders := make([]array.Builder, len(s.arrowSchema.Fields()))
-	for i, f := range s.arrowSchema.Fields() {
-		builders[i] = array.NewBuilder(s.mem, f.Type)
+func (s *HTTPPullSink) storeToRecord(store *op.ZSetStore) (arrow.Record, int, error) {
+	rowCount := store.EntryCount()
+	if rowCount == 0 {
+		return nil, 0, nil
 	}
-	defer func() {
-		for _, b := range builders {
-			if b != nil {
-				b.Release()
-			}
-		}
-	}()
-
-	if err := AppendTupleDeltasToArrowBuilders(s.arrowSchema, builders, batch); err != nil {
-		return nil, err
+	s.ensureBuilders()
+	for _, builder := range s.builders {
+		builder.Reserve(rowCount)
 	}
 
-	cols := make([]arrow.Array, len(builders))
-	for i, b := range builders {
+	rowCount, err := store.AppendToArrowBuilders(s.arrowSchema, s.builders)
+	if err != nil {
+		return nil, 0, err
+	}
+	if rowCount == 0 {
+		return nil, 0, nil
+	}
+
+	cols := make([]arrow.Array, len(s.builders))
+	for i, b := range s.builders {
 		cols[i] = b.NewArray()
 	}
-	// We don't release columns here as the record will take ownership?
-	// Actually NewRecord takes ownership.
 
-	rec := array.NewRecord(s.arrowSchema, cols, int64(len(batch)))
-	// Release arrays because Record took them (it's documented)
+	rec := array.NewRecord(s.arrowSchema, cols, int64(rowCount))
 	for _, a := range cols {
 		a.Release()
 	}
 
-	// Reset builders so they are not released twice in defer
-	// Actually builders are released in defer, which is fine.
+	return rec, rowCount, nil
+}
 
-	return rec, nil
+func (s *HTTPPullSink) ensureBuilders() {
+	if len(s.builders) == len(s.arrowSchema.Fields()) {
+		return
+	}
+	for _, builder := range s.builders {
+		if builder != nil {
+			builder.Release()
+		}
+	}
+	s.builders = make([]array.Builder, len(s.arrowSchema.Fields()))
+	for i, field := range s.arrowSchema.Fields() {
+		s.builders[i] = array.NewBuilder(s.mem, field.Type)
+	}
 }
 
 func sanitizeHivePathSegment(v string) string {
