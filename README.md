@@ -47,6 +47,41 @@ go build -o dbsp ./cmd/dbsp
 go test ./...
 ```
 
+## 관측성
+
+- Prometheus 메트릭 노출: `DBSP_METRICS_ADDR=:9090`
+- 메트릭 경로 변경: `DBSP_METRICS_PATH=/metrics`
+- pprof 노출: `DBSP_PPROF_ADDR=:6060`
+- 같은 주소를 쓰면 하나의 HTTP 서버에서 `pprof`와 `metrics`를 함께 노출합니다.
+- 샘플 Prometheus + Grafana 스택: [observability/docker-compose.yml](observability/docker-compose.yml)
+- CPU/메모리 메트릭은 Prometheus 기본 Go/process collector로 함께 노출됩니다.
+  - CPU: `process_cpu_seconds_total`
+  - RSS 메모리: `process_resident_memory_bytes`
+  - Go heap: `go_memstats_heap_alloc_bytes`
+
+```bash
+DBSP_METRICS_ADDR=:9090 DBSP_PPROF_ADDR=:6060 go run ./cmd/dbsp -config ./your-config.yaml
+
+curl http://127.0.0.1:9090/metrics
+curl http://127.0.0.1:6060/debug/pprof/
+```
+
+macOS에서 Prometheus/Grafana를 같이 띄우려면:
+
+```bash
+# 1) DBSP 프로세스에서 metrics 노출
+DBSP_METRICS_ADDR=:9090 DBSP_PPROF_ADDR=:6060 /tmp/dbsp-go -config config.user.partition.request.yaml
+
+# 2) 별도 터미널에서 observability 스택 실행
+docker compose -f observability/docker-compose.yml up -d
+```
+
+- Prometheus UI: `http://127.0.0.1:9091`
+- Grafana UI: `http://127.0.0.1:3000` (`admin` / `admin`)
+- Grafana에는 `DBSP Overview` 대시보드가 자동으로 provision 됩니다.
+- 대시보드에는 pipeline/operator 메트릭 외에 `Process CPU Usage`, `Process and Heap Memory` 패널도 포함됩니다.
+- 기본 scrape target은 `host.docker.internal:9090` 입니다. Linux에서는 [observability/prometheus.yml](observability/prometheus.yml)의 target을 호스트 IP 또는 `host-gateway`에 맞게 바꿔야 합니다.
+
 ## 컨테이너 이미지 (GHCR)
 
 GitHub Actions 워크플로우로 `ghcr.io`에 이미지를 빌드/푸시합니다.

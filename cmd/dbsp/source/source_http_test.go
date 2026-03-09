@@ -207,6 +207,110 @@ func TestNewHTTPSourceDisablesFilteringWithEmptySchema(t *testing.T) {
 	}
 }
 
+func TestParseRequestBodyReaderInfersSchemaFromFirstObservedValues(t *testing.T) {
+	s := &HTTPSource{
+		requiredFields: map[string]struct{}{
+			"timestamp": {},
+			"v_out":     {},
+			"plant_id":  {},
+		},
+		timestampUnit: "ns",
+	}
+	s.refreshFieldSpecsLocked()
+	s.packedSchema = types.NewPackedSchema([]string{"plant_id", "timestamp", "v_out"})
+
+	body := `[{"timestamp":1772175600000000000,"v_out":10.5,"plant_id":"plant-a"}]`
+	batch, err := s.parseRequestBodyReader(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(batch) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(batch))
+	}
+	if got := s.schema["timestamp"]; got != "timestamp" {
+		t.Fatalf("expected timestamp inference, got %q", got)
+	}
+	if got := s.schema["v_out"]; got != "float" {
+		t.Fatalf("expected float inference, got %q", got)
+	}
+	if got := s.schema["plant_id"]; got != "string" {
+		t.Fatalf("expected string inference, got %q", got)
+	}
+	if value, ok := batch[0].Get("timestamp"); !ok {
+		t.Fatal("expected timestamp value to be present")
+	} else if _, ok := value.(time.Time); !ok {
+		t.Fatalf("expected inferred timestamp to decode as time.Time, got %T", value)
+	}
+	if value, ok := batch[0].Get("v_out"); !ok || value == nil {
+		t.Fatalf("expected inferred float value, got value=%v ok=%v", value, ok)
+	}
+}
+
+func TestParseRequestBodyReaderPromotesInferredIntToFloat(t *testing.T) {
+	s := &HTTPSource{
+		requiredFields: map[string]struct{}{
+			"reading": {},
+		},
+		timestampUnit: "auto",
+	}
+	s.refreshFieldSpecsLocked()
+	s.packedSchema = types.NewPackedSchema([]string{"reading"})
+
+	firstBatch, err := s.parseRequestBodyReader(strings.NewReader(`[{"reading":1}]`))
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+	if len(firstBatch) != 1 {
+		t.Fatalf("expected first record, got %d", len(firstBatch))
+	}
+	if got := s.schema["reading"]; got != "int" {
+		t.Fatalf("expected first inference to int, got %q", got)
+	}
+
+	secondBatch, err := s.parseRequestBodyReader(strings.NewReader(`[{"reading":1.5}]`))
+	if err != nil {
+		t.Fatalf("second parse: %v", err)
+	}
+	if len(secondBatch) != 1 {
+		t.Fatalf("expected second record, got %d", len(secondBatch))
+	}
+	if got := s.schema["reading"]; got != "float" {
+		t.Fatalf("expected promoted inference to float, got %q", got)
+	}
+	if got, ok := secondBatch[0].Get("reading"); !ok || types.ToFloat64(got) != 1.5 {
+		t.Fatalf("expected promoted float value 1.5, got value=%v ok=%v", got, ok)
+	}
+}
+
+func TestParseRequestBodyReaderDefersInferenceUntilNonNullValue(t *testing.T) {
+	s := &HTTPSource{
+		requiredFields: map[string]struct{}{
+			"temp": {},
+		},
+		timestampUnit: "auto",
+	}
+	s.refreshFieldSpecsLocked()
+	s.packedSchema = types.NewPackedSchema([]string{"temp"})
+
+	if _, err := s.parseRequestBodyReader(strings.NewReader(`[{"temp":null}]`)); err != nil {
+		t.Fatalf("parse null: %v", err)
+	}
+	if got := s.schema["temp"]; got != "" {
+		t.Fatalf("expected null-first field to remain unknown, got %q", got)
+	}
+
+	batch, err := s.parseRequestBodyReader(strings.NewReader(`[{"temp":25.0}]`))
+	if err != nil {
+		t.Fatalf("parse value: %v", err)
+	}
+	if len(batch) != 1 {
+		t.Fatalf("expected one record, got %d", len(batch))
+	}
+	if got := s.schema["temp"]; got != "float" {
+		t.Fatalf("expected float inference after non-null value, got %q", got)
+	}
+}
+
 func TestParseRequestBodyReaderDoesNotKeepSchemaOnlyFields(t *testing.T) {
 	s := &HTTPSource{
 		schema: map[string]string{

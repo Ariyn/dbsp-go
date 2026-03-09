@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ type HTTPSource struct {
 	server          *http.Server
 	buffer          chan types.Batch
 	pending         types.Batch
+	schemaMu        sync.RWMutex
 	schema          map[string]string
 	requiredFields  map[string]struct{}
 	fieldSpecs      []fieldSpec
@@ -110,7 +112,7 @@ func NewHTTPSource(httpConfig config.HTTPSourceConfig, requiredFields map[string
 
 	s := &HTTPSource{
 		buffer:          make(chan types.Batch, httpConfig.BufferSize),
-		schema:          httpConfig.Schema,
+		schema:          cloneSchemaMap(httpConfig.Schema),
 		requiredFields:  effectiveRequired,
 		fieldSpecs:      buildFieldSpecs(effectiveRequired, httpConfig.Schema),
 		fieldSpecsByLen: buildFieldSpecsByLen(effectiveRequired, httpConfig.Schema),
@@ -364,7 +366,7 @@ func (s *HTTPSource) decodeObjectBytes(body []byte) (types.TupleDelta, bool, err
 	if err != nil {
 		if errors.Is(err, errStopObjectDecode) {
 			if packedValues != nil {
-				return types.TupleDelta{Packed: types.NewPackedTupleWithPresence(s.packedSchema, packedValues, packedPresent), Count: 1}, true, nil
+				return types.TupleDelta{Packed: types.AdoptPackedTupleWithPresence(s.packedSchema, packedValues, packedPresent), Count: 1}, true, nil
 			}
 			return types.TupleDelta{Tuple: tuple, Count: 1}, true, nil
 		}
@@ -374,12 +376,14 @@ func (s *HTTPSource) decodeObjectBytes(body []byte) (types.TupleDelta, bool, err
 		return types.TupleDelta{}, false, nil
 	}
 	if packedValues != nil {
-		return types.TupleDelta{Packed: types.NewPackedTupleWithPresence(s.packedSchema, packedValues, packedPresent), Count: 1}, true, nil
+		return types.TupleDelta{Packed: types.AdoptPackedTupleWithPresence(s.packedSchema, packedValues, packedPresent), Count: 1}, true, nil
 	}
 	return types.TupleDelta{Tuple: tuple, Count: 1}, true, nil
 }
 
 func (s *HTTPSource) estimatedTupleCapacity() int {
+	s.schemaMu.RLock()
+	defer s.schemaMu.RUnlock()
 	if len(s.requiredFields) > 0 {
 		return len(s.requiredFields)
 	}
@@ -390,6 +394,17 @@ func (s *HTTPSource) estimatedTupleCapacity() int {
 		return len(s.fieldSpecMap)
 	}
 	return 8
+}
+
+func cloneSchemaMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func buildFieldSpecs(requiredFields map[string]struct{}, schema map[string]string) []fieldSpec {
@@ -442,15 +457,13 @@ func buildFieldSpecMap(requiredFields map[string]struct{}, schema map[string]str
 }
 
 func (s *HTTPSource) matchField(key []byte) (fieldSpec, bool) {
+	s.ensureFieldSpecs()
+	s.schemaMu.RLock()
+	defer s.schemaMu.RUnlock()
 	if s.requiredFields == nil {
 		name := string(key)
-		return fieldSpec{name: name, typeName: s.schema[name]}, true
-	}
-	if len(s.fieldSpecs) == 0 {
-		s.fieldSpecs = buildFieldSpecs(s.requiredFields, s.schema)
-	}
-	if len(s.fieldSpecsByLen) == 0 {
-		s.fieldSpecsByLen = buildFieldSpecsByLen(s.requiredFields, s.schema)
+		typeName := s.schema[name]
+		return fieldSpec{name: name, typeName: typeName, typeKind: parseFieldTypeKind(typeName)}, true
 	}
 	for _, spec := range s.fieldSpecsByLen[len(key)] {
 		if len(spec.keyBytes) == 0 || len(key) == 0 || spec.keyBytes[0] != key[0] {
@@ -464,14 +477,194 @@ func (s *HTTPSource) matchField(key []byte) (fieldSpec, bool) {
 }
 
 func (s *HTTPSource) decodeFieldBytes(spec fieldSpec, value []byte, valueType jsonparser.ValueType) (any, error) {
-	if spec.typeKind != fieldTypeUnknown {
-		converted, err := parseValueByFieldKind(value, valueType, spec.typeKind, s.timestampUnit)
-		if err != nil {
-			return nil, fmt.Errorf("Invalid value for field %s: %v", spec.name, err)
+	activeSpec := spec
+	if activeSpec.typeKind == fieldTypeUnknown {
+		if inferred := inferFieldTypeFromObservedValue(activeSpec.name, value, valueType); inferred != fieldTypeUnknown {
+			activeSpec = s.updateFieldSpecType(activeSpec.name, inferred)
 		}
+	}
+	if shouldPromoteToFloat(activeSpec.typeKind, value, valueType) {
+		activeSpec = s.updateFieldSpecType(activeSpec.name, fieldTypeFloat)
+	}
+	if activeSpec.typeKind == fieldTypeUnknown {
+		return parseJSONValueBytes(value, valueType)
+	}
+	converted, err := parseValueByFieldKind(value, valueType, activeSpec.typeKind, s.timestampUnit)
+	if err == nil {
 		return converted, nil
 	}
-	return parseJSONValueBytes(value, valueType)
+	if activeSpec.typeKind == fieldTypeInt {
+		promoted := s.updateFieldSpecType(activeSpec.name, fieldTypeFloat)
+		converted, promotedErr := parseValueByFieldKind(value, valueType, promoted.typeKind, s.timestampUnit)
+		if promotedErr == nil {
+			return converted, nil
+		}
+	}
+	return nil, fmt.Errorf("Invalid value for field %s: %v", activeSpec.name, err)
+}
+
+func (s *HTTPSource) ensureFieldSpecs() {
+	if s.requiredFields == nil {
+		return
+	}
+	s.schemaMu.RLock()
+	ready := len(s.fieldSpecsByLen) > 0
+	s.schemaMu.RUnlock()
+	if ready {
+		return
+	}
+	s.schemaMu.Lock()
+	defer s.schemaMu.Unlock()
+	if len(s.fieldSpecsByLen) == 0 {
+		s.refreshFieldSpecsLocked()
+	}
+}
+
+func inferFieldTypeFromObservedValue(name string, raw []byte, valueType jsonparser.ValueType) fieldTypeKind {
+	switch valueType {
+	case jsonparser.Number:
+		if looksLikeTimestampField(name) {
+			return fieldTypeTimestamp
+		}
+		if _, err := jsonparser.ParseInt(raw); err == nil {
+			return fieldTypeInt
+		}
+		if _, err := jsonparser.ParseFloat(raw); err == nil {
+			return fieldTypeFloat
+		}
+	case jsonparser.String:
+		trimmed := strings.TrimSpace(string(raw))
+		if trimmed == "" {
+			return fieldTypeString
+		}
+		if _, err := time.Parse(time.RFC3339, trimmed); err == nil {
+			return fieldTypeTimestamp
+		}
+		if looksLikeTimestampField(name) {
+			if _, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+				return fieldTypeTimestamp
+			}
+		}
+		return fieldTypeString
+	case jsonparser.Boolean:
+		return fieldTypeBool
+	case jsonparser.Object, jsonparser.Array:
+		return fieldTypeJSON
+	case jsonparser.Null:
+		return fieldTypeUnknown
+	}
+	return fieldTypeUnknown
+}
+
+func looksLikeTimestampField(name string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(name))
+	if trimmed == "timestamp" || trimmed == "ts" {
+		return true
+	}
+	return strings.HasSuffix(trimmed, "_timestamp") || strings.HasSuffix(trimmed, "_ts")
+}
+
+func shouldPromoteToFloat(kind fieldTypeKind, raw []byte, valueType jsonparser.ValueType) bool {
+	if kind != fieldTypeInt {
+		return false
+	}
+	switch valueType {
+	case jsonparser.Number:
+		if _, err := jsonparser.ParseInt(raw); err == nil {
+			return false
+		}
+		_, err := jsonparser.ParseFloat(raw)
+		return err == nil
+	case jsonparser.String:
+		trimmed := strings.TrimSpace(string(raw))
+		if trimmed == "" {
+			return false
+		}
+		if _, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+			return false
+		}
+		_, err := strconv.ParseFloat(trimmed, 64)
+		return err == nil
+	default:
+		return false
+	}
+}
+
+func fieldTypeName(kind fieldTypeKind) string {
+	switch kind {
+	case fieldTypeInt:
+		return "int"
+	case fieldTypeFloat:
+		return "float"
+	case fieldTypeBool:
+		return "bool"
+	case fieldTypeJSON:
+		return "json"
+	case fieldTypeTimestamp:
+		return "timestamp"
+	case fieldTypeString:
+		return "string"
+	default:
+		return ""
+	}
+}
+
+func (s *HTTPSource) updateFieldSpecType(name string, kind fieldTypeKind) fieldSpec {
+	if kind == fieldTypeUnknown || name == "" {
+		return fieldSpec{name: name}
+	}
+	s.schemaMu.Lock()
+	defer s.schemaMu.Unlock()
+	if s.requiredFields == nil {
+		typeName := fieldTypeName(kind)
+		if typeName != "" {
+			if s.schema == nil {
+				s.schema = make(map[string]string)
+			}
+			if existing := parseFieldTypeKind(s.schema[name]); existing == fieldTypeUnknown || (existing == fieldTypeInt && kind == fieldTypeFloat) {
+				s.schema[name] = typeName
+			}
+		}
+		resolvedName := s.schema[name]
+		return fieldSpec{name: name, typeName: resolvedName, typeKind: parseFieldTypeKind(resolvedName)}
+	}
+	current := s.fieldSpecMap[name]
+	merged := mergeFieldTypes(current.typeKind, kind)
+	if merged == fieldTypeUnknown {
+		return current
+	}
+	typeName := fieldTypeName(merged)
+	if typeName == "" {
+		return current
+	}
+	if s.schema == nil {
+		s.schema = make(map[string]string, len(s.requiredFields))
+	}
+	if current.typeKind == merged && s.schema[name] == typeName {
+		return current
+	}
+	s.schema[name] = typeName
+	s.refreshFieldSpecsLocked()
+	return s.fieldSpecMap[name]
+}
+
+func mergeFieldTypes(current fieldTypeKind, next fieldTypeKind) fieldTypeKind {
+	if current == fieldTypeUnknown {
+		return next
+	}
+	if current == next || next == fieldTypeUnknown {
+		return current
+	}
+	if (current == fieldTypeInt && next == fieldTypeFloat) || (current == fieldTypeFloat && next == fieldTypeInt) {
+		return fieldTypeFloat
+	}
+	return current
+}
+
+func (s *HTTPSource) refreshFieldSpecsLocked() {
+	s.fieldSpecs = buildFieldSpecs(s.requiredFields, s.schema)
+	s.fieldSpecsByLen = buildFieldSpecsByLen(s.requiredFields, s.schema)
+	s.fieldSpecMap = buildFieldSpecMap(s.requiredFields, s.schema)
 }
 
 func (s *HTTPSource) NextBatch() (types.Batch, error) {

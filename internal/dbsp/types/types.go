@@ -53,11 +53,13 @@ func NewPackedTuple(schema *PackedSchema, values []any) *PackedTuple {
 	if schema == nil {
 		return nil
 	}
+	cloned := make([]any, len(values))
+	copy(cloned, values)
 	present := make([]bool, len(values))
 	for idx := range present {
 		present[idx] = true
 	}
-	return NewPackedTupleWithPresence(schema, values, present)
+	return &PackedTuple{Schema: schema, Values: cloned, Present: present}
 }
 
 func NewPackedTupleWithPresence(schema *PackedSchema, values []any, present []bool) *PackedTuple {
@@ -72,6 +74,16 @@ func NewPackedTupleWithPresence(schema *PackedSchema, values []any, present []bo
 		copy(clonedPresent, present)
 	}
 	return &PackedTuple{Schema: schema, Values: cloned, Present: clonedPresent}
+}
+
+// AdoptPackedTupleWithPresence transfers ownership of caller-managed slices
+// into the packed tuple without cloning them. Callers must not mutate the
+// slices after passing them in.
+func AdoptPackedTupleWithPresence(schema *PackedSchema, values []any, present []bool) *PackedTuple {
+	if schema == nil {
+		return nil
+	}
+	return &PackedTuple{Schema: schema, Values: values, Present: present}
 }
 
 func (p *PackedTuple) Get(col string) (any, bool) {
@@ -223,7 +235,7 @@ func (p *PackedTuple) Project(columns []string) *PackedTuple {
 			extras[col] = value
 		}
 	}
-	projected := NewPackedTupleWithPresence(NewPackedSchema(baseColumns), values, present)
+	projected := AdoptPackedTupleWithPresence(NewPackedSchema(baseColumns), values, present)
 	if projected == nil {
 		if len(extras) == 0 {
 			return nil

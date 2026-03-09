@@ -106,6 +106,62 @@ func (s *ZSetStore) ForEach(f func(t types.Tuple, count int64) bool) {
 	}
 }
 
+func (s *ZSetStore) AppendToArrowBuilders(arrowSchema *arrow.Schema, builders []array.Builder) (int, error) {
+	if s == nil || len(s.entries) == 0 {
+		return 0, nil
+	}
+	if arrowSchema == nil {
+		return 0, fmt.Errorf("arrow schema is nil")
+	}
+	if len(builders) != len(arrowSchema.Fields()) {
+		return 0, fmt.Errorf("builder count %d does not match schema fields %d", len(builders), len(arrowSchema.Fields()))
+	}
+
+	rows := 0
+	for _, entry := range s.entries {
+		if entry == nil || entry.count == 0 {
+			continue
+		}
+		for i, field := range arrowSchema.Fields() {
+			val, ok := entry.tuple[field.Name]
+			if !ok || val == nil {
+				builders[i].AppendNull()
+				continue
+			}
+
+			switch field.Type.ID() {
+			case arrow.INT64:
+				iv, _ := types.ToInt64Safe(val)
+				builders[i].(*array.Int64Builder).Append(iv)
+			case arrow.FLOAT64:
+				fv, _ := types.ToFloat64Safe(val)
+				builders[i].(*array.Float64Builder).Append(fv)
+			case arrow.STRING:
+				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
+			default:
+				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
+			}
+		}
+		rows++
+	}
+
+	return rows, nil
+}
+
+func (s *ZSetStore) EntryCount() int {
+	if s == nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range s.entries {
+		if entry == nil || entry.count == 0 {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 func (s *ZSetStore) LookupByKey(key any, keyFn func(types.Tuple) any) []types.TupleDelta {
 	var out types.Batch
 	s.ForEach(func(t types.Tuple, count int64) bool {
@@ -158,34 +214,16 @@ func (s *ZSetStore) WriteToParquet(path string, arrowSchema *arrow.Schema, mem m
 		}
 	}()
 
-	for _, entry := range s.entries {
-		for i, field := range arrowSchema.Fields() {
-			val, ok := entry.tuple[field.Name]
-			if !ok || val == nil {
-				builders[i].AppendNull()
-				continue
-			}
-
-			switch field.Type.ID() {
-			case arrow.INT64:
-				iv, _ := types.ToInt64Safe(val)
-				builders[i].(*array.Int64Builder).Append(iv)
-			case arrow.FLOAT64:
-				fv, _ := types.ToFloat64Safe(val)
-				builders[i].(*array.Float64Builder).Append(fv)
-			case arrow.STRING:
-				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
-			default:
-				builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
-			}
-		}
+	rowCount, err := s.AppendToArrowBuilders(arrowSchema, builders)
+	if err != nil {
+		return err
 	}
 
 	cols := make([]arrow.Array, len(builders))
 	for i, b := range builders {
 		cols[i] = b.NewArray()
 	}
-	rec := array.NewRecord(arrowSchema, cols, int64(len(s.entries)))
+	rec := array.NewRecord(arrowSchema, cols, int64(rowCount))
 	defer rec.Release()
 	for _, a := range cols {
 		a.Release()

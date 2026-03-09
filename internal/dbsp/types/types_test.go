@@ -105,3 +105,20 @@ func TestPackedTupleWithExtrasMergesOnce(t *testing.T) {
 		t.Fatalf("expected original packed tuple to remain unchanged")
 	}
 }
+
+func TestAdoptPackedTupleWithPresenceUsesOwnedSlices(t *testing.T) {
+	schema := NewPackedSchema([]string{"a", "b"})
+	values := []any{int64(1), int64(2)}
+	present := []bool{true, true}
+	packed := AdoptPackedTupleWithPresence(schema, values, present)
+
+	values[0] = int64(9)
+	present[1] = false
+
+	if got, ok := packed.Get("a"); !ok || got != int64(9) {
+		t.Fatalf("expected adopted values slice to be reused, got value=%v ok=%v", got, ok)
+	}
+	if got, ok := packed.Get("b"); ok || got != nil {
+		t.Fatalf("expected adopted present slice to control visibility, got value=%v ok=%v", got, ok)
+	}
+}

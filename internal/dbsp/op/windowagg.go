@@ -87,6 +87,9 @@ type WindowAggOp struct {
 	// cumulativeFrameCache stores the current tail aggregate state for
 	// cumulative ROWS frames so append-only updates can avoid full recompute.
 	cumulativeFrameCache map[any]*cumulativeFramePartitionCache
+	// bucketedCumulativeState stores per-partition bucket states for append-only
+	// cumulative SUM windows ordered by a bucket column.
+	bucketedCumulativeState map[any]*bucketedCumulativePartitionState
 
 	// StateTTL evicts window/partition state based on processing-time inactivity.
 	StateTTL             time.Duration
@@ -96,6 +99,7 @@ type WindowAggOp struct {
 	nextTTLCheck         time.Time
 	windowTTLExpiry      ttlExpiryQueue
 	partitionTTLExpiry   ttlExpiryQueue
+	bucketTTLExpiry      ttlExpiryQueue
 
 	stateBackend        StateBackend
 	statePrefix         string
@@ -108,7 +112,30 @@ type cumulativeFramePartitionCache struct {
 	rowCount        int
 	beforeTailState any
 	tailState       any
-	tailOutput      types.TupleDelta
+	tailOutput      frameOutputCacheEntry
+	outputs         map[string]frameOutputCacheEntry
+}
+
+type frameOutputCacheEntry struct {
+	BaseTuple  types.Tuple
+	BasePacked *types.PackedTuple
+	AggValues  types.Tuple
+	Count      int64
+}
+
+type bucketedCumulativePartitionState struct {
+	ClosedPrefixSum float64
+	CurrentBucketID string
+	CurrentOrder    any
+	Buckets         map[string]*bucketedCumulativeBucketState
+}
+
+type bucketedCumulativeBucketState struct {
+	OrderValue any
+	AggState   any
+	BaseTuple  types.Tuple
+	BasePacked *types.PackedTuple
+	Output     types.TupleDelta
 }
 
 type windowAggSnapshotV1 struct {
@@ -119,6 +146,7 @@ type windowAggSnapshotV1 struct {
 	SessionBuffers   map[any]*PartitionBuffer
 	SessionOut       map[any]map[string]types.Tuple
 	FrameOut         map[any]map[string]types.TupleDelta
+	BucketedState    map[any]*bucketedCumulativePartitionState
 }
 
 func (w *WindowAggOp) Snapshot() (any, error) {
@@ -147,6 +175,9 @@ func (w *WindowAggOp) Snapshot() (any, error) {
 	if w.frameOut != nil {
 		snap.FrameOut = w.frameOut
 	}
+	if w.bucketedCumulativeState != nil {
+		snap.BucketedState = w.bucketedCumulativeState
+	}
 	return snap, nil
 }
 
@@ -166,6 +197,7 @@ func (w *WindowAggOp) Restore(state any) error {
 	w.SessionBuffers = s.SessionBuffers
 	w.sessionOut = s.SessionOut
 	w.frameOut = s.FrameOut
+	w.bucketedCumulativeState = s.BucketedState
 	w.ensureStateMaps()
 	w.backendLoaded = true
 	if err := w.flushBackendState(); err != nil {
@@ -199,12 +231,13 @@ func NewWindowAggOp(spec WindowSpecLite, keyFn func(types.Tuple) any, groupKeys 
 		State: WindowAggState{
 			Data: make(map[WindowID]map[any]any),
 		},
-		GroupCounts:          make(map[WindowID]map[any]int64),
-		PartitionBuffers:     make(map[any]*PartitionBuffer),
-		SessionBuffers:       make(map[any]*PartitionBuffer),
-		sessionOut:           make(map[any]map[string]types.Tuple),
-		cumulativeFrameCache: make(map[any]*cumulativeFramePartitionCache),
-		profile:              newOperatorApplyProfile("WindowAggOp"),
+		GroupCounts:             make(map[WindowID]map[any]int64),
+		PartitionBuffers:        make(map[any]*PartitionBuffer),
+		SessionBuffers:          make(map[any]*PartitionBuffer),
+		sessionOut:              make(map[any]map[string]types.Tuple),
+		cumulativeFrameCache:    make(map[any]*cumulativeFramePartitionCache),
+		bucketedCumulativeState: make(map[any]*bucketedCumulativePartitionState),
+		profile:                 newOperatorApplyProfile("WindowAggOp"),
 	}
 }
 
@@ -249,9 +282,42 @@ func (w *WindowAggOp) touchPartition(now time.Time, key any) {
 	w.partitionTTLExpiry.touch(stableAnyKey(key), now.Add(w.StateTTL))
 }
 
-func (w *WindowAggOp) evictExpired(now time.Time) {
+func encodeBucketTTLKey(partitionKey any, bucketID string) string {
+	partitionEnc := stableAnyKey(partitionKey)
+	return strconv.Itoa(len(partitionEnc)) + ":" + partitionEnc + bucketID
+}
+
+func decodeBucketTTLKey(encoded string) (any, string, error) {
+	sep := strings.IndexByte(encoded, ':')
+	if sep <= 0 {
+		return nil, "", fmt.Errorf("invalid bucket ttl key %q", encoded)
+	}
+	partitionLen, err := strconv.Atoi(encoded[:sep])
+	if err != nil {
+		return nil, "", err
+	}
+	rest := encoded[sep+1:]
+	if partitionLen < 0 || partitionLen > len(rest) {
+		return nil, "", fmt.Errorf("invalid bucket ttl key %q", encoded)
+	}
+	partitionKey, err := decodeAnyKey(rest[:partitionLen])
+	if err != nil {
+		return nil, "", err
+	}
+	return partitionKey, rest[partitionLen:], nil
+}
+
+func (w *WindowAggOp) touchBucket(now time.Time, partitionKey any, bucketID string) {
 	if w.StateTTL <= 0 {
 		return
+	}
+	w.bucketTTLExpiry.touch(encodeBucketTTLKey(partitionKey, bucketID), now.Add(w.StateTTL))
+}
+
+func (w *WindowAggOp) evictExpired(now time.Time) types.Batch {
+	var out types.Batch
+	if w.StateTTL <= 0 {
+		return nil
 	}
 	_ = w.windowTTLExpiry.popExpired(now, func(id string) error {
 		wid, err := decodeWindowIDKey(id)
@@ -267,23 +333,155 @@ func (w *WindowAggOp) evictExpired(now time.Time) {
 		}
 		return nil
 	})
+	out = append(out, w.evictExpiredBucketedCumulativeBuckets(now)...)
 	_ = w.partitionTTLExpiry.popExpired(now, func(id string) error {
 		key, err := decodeAnyKey(id)
 		if err != nil {
 			key = id
 		}
 		delete(w.lastTouchedPartition, key)
-		if w.PartitionBuffers != nil {
-			delete(w.PartitionBuffers, key)
-		}
-		if w.SessionBuffers != nil {
-			delete(w.SessionBuffers, key)
-		}
-		if w.sessionOut != nil {
-			delete(w.sessionOut, key)
-		}
+		w.clearFramePartitionState(key)
+		w.clearSessionPartitionState(key)
 		return nil
 	})
+	return out
+}
+
+func (w *WindowAggOp) clearFramePartitionState(key any) {
+	if w.PartitionBuffers != nil {
+		delete(w.PartitionBuffers, key)
+	}
+	if w.frameOut != nil {
+		delete(w.frameOut, key)
+	}
+	if w.cumulativeFrameCache != nil {
+		delete(w.cumulativeFrameCache, key)
+	}
+	w.clearBucketedCumulativePartitionState(key)
+}
+
+func (w *WindowAggOp) clearBucketedCumulativePartitionState(key any) {
+	if w.bucketedCumulativeState == nil {
+		return
+	}
+	partition := w.bucketedCumulativeState[key]
+	if partition != nil {
+		for bucketID := range partition.Buckets {
+			w.bucketTTLExpiry.remove(encodeBucketTTLKey(key, bucketID))
+		}
+	}
+	delete(w.bucketedCumulativeState, key)
+}
+
+func (w *WindowAggOp) evictExpiredBucketedCumulativeBuckets(now time.Time) types.Batch {
+	if w.StateTTL <= 0 || len(w.bucketedCumulativeState) == 0 {
+		return nil
+	}
+
+	expired := make(map[any]map[string]struct{})
+	_ = w.bucketTTLExpiry.popExpired(now, func(id string) error {
+		partitionKey, bucketID, err := decodeBucketTTLKey(id)
+		if err != nil {
+			return nil
+		}
+		bucketSet := expired[partitionKey]
+		if bucketSet == nil {
+			bucketSet = make(map[string]struct{})
+			expired[partitionKey] = bucketSet
+		}
+		bucketSet[bucketID] = struct{}{}
+		return nil
+	})
+
+	var out types.Batch
+	for partitionKey, bucketSet := range expired {
+		partition := w.bucketedCumulativeState[partitionKey]
+		if partition == nil {
+			continue
+		}
+		changed := false
+		for bucketID := range bucketSet {
+			bucket := partition.Buckets[bucketID]
+			if bucket == nil {
+				continue
+			}
+			if bucket.Output.Tuple != nil || bucket.Output.Packed != nil {
+				out = append(out, negateTupleDelta(bucket.Output))
+			}
+			delete(partition.Buckets, bucketID)
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+		if len(partition.Buckets) == 0 {
+			partition.ClosedPrefixSum = 0
+			partition.CurrentBucketID = ""
+			partition.CurrentOrder = nil
+			delete(w.bucketedCumulativeState, partitionKey)
+			continue
+		}
+		out = append(out, w.recomputeBucketedCumulativePartitionOutputs(partition)...)
+	}
+	return out
+}
+
+func (w *WindowAggOp) recomputeBucketedCumulativePartitionOutputs(partition *bucketedCumulativePartitionState) types.Batch {
+	if partition == nil || len(partition.Buckets) == 0 {
+		return nil
+	}
+
+	bucketIDs := make([]string, 0, len(partition.Buckets))
+	for bucketID := range partition.Buckets {
+		bucketIDs = append(bucketIDs, bucketID)
+	}
+	sort.Slice(bucketIDs, func(i, j int) bool {
+		left := partition.Buckets[bucketIDs[i]]
+		right := partition.Buckets[bucketIDs[j]]
+		return compareValues(left.OrderValue, right.OrderValue) < 0
+	})
+
+	var (
+		out          types.Batch
+		closedPrefix float64
+		currentID    string
+		currentOrder any
+	)
+	for idx, bucketID := range bucketIDs {
+		bucket := partition.Buckets[bucketID]
+		currentValue := types.ToFloat64(aggValueFromState(w.AggFn, bucket.AggState))
+		oldOutput := bucket.Output
+		hadOldOutput := oldOutput.Tuple != nil || oldOutput.Packed != nil
+		newOutput := w.buildBucketedCumulativeOutput(bucket, closedPrefix+currentValue)
+		bucket.Output = newOutput
+		if hadOldOutput {
+			if !tupleDeltaPayloadEqual(oldOutput, newOutput) || oldOutput.Count != newOutput.Count {
+				out = append(out, negateTupleDelta(oldOutput))
+				out = append(out, newOutput)
+			}
+		} else {
+			out = append(out, newOutput)
+		}
+		if idx == len(bucketIDs)-1 {
+			currentID = bucketID
+			currentOrder = bucket.OrderValue
+		} else {
+			closedPrefix += currentValue
+		}
+	}
+	partition.ClosedPrefixSum = closedPrefix
+	partition.CurrentBucketID = currentID
+	partition.CurrentOrder = currentOrder
+	return out
+}
+
+func (w *WindowAggOp) clearSessionPartitionState(key any) {
+	if w.SessionBuffers != nil {
+		delete(w.SessionBuffers, key)
+	}
+	if w.sessionOut != nil {
+		delete(w.sessionOut, key)
+	}
 }
 
 func (w *WindowAggOp) backendEnabled() bool {
@@ -390,6 +588,7 @@ func (w *WindowAggOp) loadBackendState() error {
 		w.SessionBuffers = make(map[any]*PartitionBuffer)
 		w.sessionOut = make(map[any]map[string]types.Tuple)
 		w.frameOut = make(map[any]map[string]types.TupleDelta)
+		w.bucketedCumulativeState = make(map[any]*bucketedCumulativePartitionState)
 
 		if payload, ok, err := w.stateBackend.Get(w.backendV2SpecKey()); err != nil {
 			return err
@@ -525,6 +724,23 @@ func (w *WindowAggOp) loadBackendState() error {
 			return err
 		}
 
+		bcumPrefix := fmt.Sprintf("%s/bcum/", w.backendV2BasePrefix())
+		if err := w.stateBackend.IterPrefix([]byte(bcumPrefix), func(key, value []byte) error {
+			partitionEnc := parseWindowAggV2OnePartKey(string(key), bcumPrefix)
+			partitionKey, err := decodeAnyKey(partitionEnc)
+			if err != nil {
+				partitionKey = partitionEnc
+			}
+			var state bucketedCumulativePartitionState
+			if err := decodeGobValue(value, &state); err != nil {
+				return nil
+			}
+			w.bucketedCumulativeState[partitionKey] = &state
+			return nil
+		}); err != nil {
+			return err
+		}
+
 		w.ensureStateMaps()
 		w.backendLoaded = true
 		return nil
@@ -550,6 +766,7 @@ func (w *WindowAggOp) loadBackendState() error {
 	w.SessionBuffers = s.SessionBuffers
 	w.sessionOut = s.SessionOut
 	w.frameOut = s.FrameOut
+	w.bucketedCumulativeState = s.BucketedState
 	w.ensureStateMaps()
 	w.backendLoaded = true
 	return nil
@@ -638,6 +855,18 @@ func (w *WindowAggOp) flushBackendState() error {
 		ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: key, Value: payload})
 	}
 
+	for partitionKey, state := range w.bucketedCumulativeState {
+		if state == nil {
+			continue
+		}
+		payload, err := encodeGobValue(*state)
+		if err != nil {
+			return err
+		}
+		key := []byte(fmt.Sprintf("%s/bcum/%s", w.backendV2BasePrefix(), stableAnyKey(partitionKey)))
+		ops = append(ops, StateBatchOp{Type: StateBatchPut, Key: key, Value: payload})
+	}
+
 	return w.stateBackend.BatchWrite(ops)
 }
 
@@ -662,6 +891,9 @@ func (w *WindowAggOp) ensureStateMaps() {
 	}
 	if w.cumulativeFrameCache == nil {
 		w.cumulativeFrameCache = make(map[any]*cumulativeFramePartitionCache)
+	}
+	if w.bucketedCumulativeState == nil {
+		w.bucketedCumulativeState = make(map[any]*bucketedCumulativePartitionState)
 	}
 }
 
@@ -814,8 +1046,9 @@ func (w *WindowAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	}
 	w.ensureStateMaps()
 	now := time.Now()
+	var ttlOut types.Batch
 	if shouldRunTTLCheck(&w.nextTTLCheck, now, w.StateTTL, w.ttlCheckInterval) {
-		w.evictExpired(now)
+		ttlOut = w.evictExpired(now)
 	}
 
 	var (
@@ -840,6 +1073,9 @@ func (w *WindowAggOp) Apply(batch types.Batch) (types.Batch, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(ttlOut) > 0 {
+		out = append(ttlOut, out...)
+	}
 	if err := w.flushBackendState(); err != nil {
 		return nil, err
 	}
@@ -863,6 +1099,11 @@ func (w *WindowAggOp) stateEntryCount() int {
 	for _, buffer := range w.SessionBuffers {
 		if buffer != nil {
 			count += len(buffer.Rows)
+		}
+	}
+	for _, partition := range w.bucketedCumulativeState {
+		if partition != nil {
+			count += len(partition.Buckets)
 		}
 	}
 	return count
@@ -1530,7 +1771,11 @@ func (w *WindowAggOp) applySession(batch types.Batch) (types.Batch, error) {
 		}
 
 		// Save
-		w.sessionOut[groupKey] = newMap
+		if len(newMap) == 0 {
+			w.clearSessionPartitionState(groupKey)
+		} else {
+			w.sessionOut[groupKey] = newMap
+		}
 	}
 
 	return out, nil
@@ -1838,7 +2083,11 @@ func (w *WindowAggOp) applyFrameBasedValue(batch types.Batch) (types.Batch, erro
 			}
 		}
 
-		w.frameOut[partitionKey] = newMap
+		if len(newMap) == 0 {
+			w.clearFramePartitionState(partitionKey)
+		} else {
+			w.frameOut[partitionKey] = newMap
+		}
 	}
 
 	return out, nil
@@ -2042,6 +2291,17 @@ func cloneCumulativeAggState(state any) any {
 }
 
 func (w *WindowAggOp) applyCumulativeFrameBasedValue(batch types.Batch) (types.Batch, error) {
+	if !w.canUseBucketedCumulativeSumFastPath() {
+		return w.applyCumulativeFrameBasedValueGeneric(batch)
+	}
+	if !w.bucketedCumulativeBatchCompatible(batch) {
+		w.promoteBucketedCumulativeStateToFrameBuffers()
+		return w.applyCumulativeFrameBasedValueGeneric(batch)
+	}
+	return w.applyBucketedCumulativeSumValue(batch)
+}
+
+func (w *WindowAggOp) applyCumulativeFrameBasedValueGeneric(batch types.Batch) (types.Batch, error) {
 	var out types.Batch
 	now := time.Now()
 
@@ -2085,6 +2345,223 @@ func (w *WindowAggOp) applyCumulativeFrameBasedValue(batch types.Batch) (types.B
 	return out, nil
 }
 
+func (w *WindowAggOp) canUseBucketedCumulativeSumFastPath() bool {
+	if w == nil || !w.EmitValue || !w.isCumulativeRowsFrame() || strings.TrimSpace(w.OrderByCol) == "" {
+		return false
+	}
+	if _, ok := w.AggFn.(*SumAgg); !ok {
+		return false
+	}
+	for _, buffer := range w.PartitionBuffers {
+		if buffer != nil && len(buffer.Rows) > 0 {
+			return false
+		}
+	}
+	for _, out := range w.frameOut {
+		if len(out) > 0 {
+			return false
+		}
+	}
+	for _, cache := range w.cumulativeFrameCache {
+		if cache != nil && cache.rowCount > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *WindowAggOp) bucketedCumulativeBatchCompatible(batch types.Batch) bool {
+	if len(batch) == 0 {
+		return true
+	}
+	type partitionOrderState struct {
+		lastOrder any
+		seen      bool
+	}
+	seen := make(map[any]partitionOrderState)
+	for _, td := range batch {
+		inputTuple := td.EnsureTuple()
+		if inputTuple == nil {
+			return false
+		}
+		partitionKey := w.KeyFn(inputTuple)
+		orderValue := inputTuple[w.OrderByCol]
+		partition := w.bucketedCumulativeState[partitionKey]
+		if partition != nil && partition.CurrentBucketID != "" && compareValues(orderValue, partition.CurrentOrder) < 0 {
+			return false
+		}
+		state := seen[partitionKey]
+		if state.seen && compareValues(orderValue, state.lastOrder) < 0 {
+			return false
+		}
+		state.lastOrder = orderValue
+		state.seen = true
+		seen[partitionKey] = state
+	}
+	return true
+}
+
+func (w *WindowAggOp) getOrCreateBucketedCumulativePartitionState(key any) *bucketedCumulativePartitionState {
+	if w.bucketedCumulativeState == nil {
+		w.bucketedCumulativeState = make(map[any]*bucketedCumulativePartitionState)
+	}
+	partition, ok := w.bucketedCumulativeState[key]
+	if !ok {
+		partition = &bucketedCumulativePartitionState{Buckets: make(map[string]*bucketedCumulativeBucketState)}
+		w.bucketedCumulativeState[key] = partition
+	}
+	if partition.Buckets == nil {
+		partition.Buckets = make(map[string]*bucketedCumulativeBucketState)
+	}
+	return partition
+}
+
+func (w *WindowAggOp) applyBucketedCumulativeSumValue(batch types.Batch) (types.Batch, error) {
+	var out types.Batch
+	now := time.Now()
+
+	partitionDeltas := make(map[any][]types.TupleDelta)
+	for _, td := range batch {
+		inputTuple := td.EnsureTuple()
+		partitionKey := w.KeyFn(inputTuple)
+		partitionDeltas[partitionKey] = append(partitionDeltas[partitionKey], td)
+	}
+
+	for partitionKey, deltas := range partitionDeltas {
+		w.touchPartition(now, partitionKey)
+		partition := w.getOrCreateBucketedCumulativePartitionState(partitionKey)
+
+		for start := 0; start < len(deltas); {
+			inputTuple := deltas[start].EnsureTuple()
+			orderValue := inputTuple[w.OrderByCol]
+			bucketID := stableAnyKey(orderValue)
+
+			if partition.CurrentBucketID == "" {
+				partition.CurrentBucketID = bucketID
+				partition.CurrentOrder = orderValue
+			} else if bucketID != partition.CurrentBucketID {
+				cmp := compareValues(orderValue, partition.CurrentOrder)
+				if cmp < 0 {
+					return nil, fmt.Errorf("bucketed cumulative sum requires monotonic %s within partition", w.OrderByCol)
+				}
+				if cmp > 0 {
+					if current := partition.Buckets[partition.CurrentBucketID]; current != nil {
+						partition.ClosedPrefixSum += types.ToFloat64(aggValueFromState(w.AggFn, current.AggState))
+					}
+					partition.CurrentBucketID = bucketID
+					partition.CurrentOrder = orderValue
+				}
+			}
+
+			bucket := partition.Buckets[bucketID]
+			if bucket == nil {
+				bucket = &bucketedCumulativeBucketState{OrderValue: orderValue}
+				partition.Buckets[bucketID] = bucket
+			}
+			oldOutput := bucket.Output
+			hadOldOutput := oldOutput.Tuple != nil || oldOutput.Packed != nil
+
+			end := start
+			for end < len(deltas) {
+				candidate := deltas[end].EnsureTuple()
+				if stableAnyKey(candidate[w.OrderByCol]) != bucketID {
+					break
+				}
+				newState, _ := w.AggFn.Apply(bucket.AggState, deltas[end])
+				bucket.AggState = newState
+				if deltas[end].Count > 0 {
+					bucket.BaseTuple = types.CloneTuple(candidate)
+					bucket.BasePacked = types.ClonePackedTuple(deltas[end].Packed)
+				}
+				end++
+			}
+
+			currentValue := types.ToFloat64(aggValueFromState(w.AggFn, bucket.AggState))
+			if bucket.BaseTuple == nil && bucket.BasePacked == nil {
+				if hadOldOutput {
+					out = append(out, negateTupleDelta(oldOutput))
+				}
+				w.bucketTTLExpiry.remove(encodeBucketTTLKey(partitionKey, bucketID))
+				delete(partition.Buckets, bucketID)
+				if bucketID == partition.CurrentBucketID {
+					partition.CurrentBucketID = ""
+					partition.CurrentOrder = nil
+				}
+				start = end
+				continue
+			}
+
+			newOutput := w.buildBucketedCumulativeOutput(bucket, partition.ClosedPrefixSum+currentValue)
+			bucket.Output = newOutput
+			w.touchBucket(now, partitionKey, bucketID)
+			if hadOldOutput {
+				if !tupleDeltaPayloadEqual(oldOutput, newOutput) || oldOutput.Count != newOutput.Count {
+					out = append(out, negateTupleDelta(oldOutput))
+					out = append(out, newOutput)
+				}
+			} else {
+				out = append(out, newOutput)
+			}
+
+			start = end
+		}
+	}
+
+	return out, nil
+}
+
+func (w *WindowAggOp) buildBucketedCumulativeOutput(bucket *bucketedCumulativeBucketState, cumulative float64) types.TupleDelta {
+	return w.buildFrameResultDelta(RowWithOrder{
+		Tuple:  bucket.BaseTuple,
+		Packed: bucket.BasePacked,
+		Count:  1,
+	}, cumulative)
+}
+
+func (w *WindowAggOp) promoteBucketedCumulativeStateToFrameBuffers() {
+	if len(w.bucketedCumulativeState) == 0 {
+		return
+	}
+	w.ensureStateMaps()
+	for partitionKey, partition := range w.bucketedCumulativeState {
+		if partition == nil || len(partition.Buckets) == 0 {
+			continue
+		}
+		bucketIDs := make([]string, 0, len(partition.Buckets))
+		for bucketID := range partition.Buckets {
+			bucketIDs = append(bucketIDs, bucketID)
+		}
+		sort.Slice(bucketIDs, func(i, j int) bool {
+			left := partition.Buckets[bucketIDs[i]]
+			right := partition.Buckets[bucketIDs[j]]
+			return compareValues(left.OrderValue, right.OrderValue) < 0
+		})
+
+		pb := &PartitionBuffer{Rows: []RowWithOrder{}, rowIndex: make(map[uint64][]int)}
+		cachedOut := make(map[string]frameOutputCacheEntry, len(bucketIDs))
+		for _, bucketID := range bucketIDs {
+			bucket := partition.Buckets[bucketID]
+			if bucket == nil || (bucket.BaseTuple == nil && bucket.BasePacked == nil) {
+				continue
+			}
+			w.bucketTTLExpiry.remove(encodeBucketTTLKey(partitionKey, bucketID))
+			td := types.TupleDelta{Tuple: types.CloneTuple(bucket.BaseTuple), Packed: types.ClonePackedTuple(bucket.BasePacked), Count: 1}
+			pb.addRow(td, w.OrderByCol)
+			if bucket.Output.Tuple != nil || bucket.Output.Packed != nil {
+				cachedOut[w.frameTupleDeltaKey(bucket.Output)] = frameOutputCacheEntryFromTupleDelta(bucket.Output)
+			}
+		}
+		if len(pb.Rows) > 0 {
+			w.PartitionBuffers[partitionKey] = pb
+		}
+		if len(cachedOut) > 0 {
+			cache := w.getOrCreateCumulativeFrameCache(partitionKey)
+			cache.outputs = cachedOut
+		}
+	}
+	w.bucketedCumulativeState = make(map[any]*bucketedCumulativePartitionState)
+}
+
 func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *PartitionBuffer, cache *cumulativeFramePartitionCache, affectedStart int, appendOnly bool) (types.Batch, error) {
 	if cache == nil {
 		cache = &cumulativeFramePartitionCache{}
@@ -2097,12 +2574,17 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 		affectedStart = len(buffer.Rows)
 	}
 
-	if w.frameOut == nil {
-		w.frameOut = make(map[any]map[string]types.TupleDelta)
-	}
-	partitionOut := w.frameOut[partitionKey]
+	partitionOut := cache.outputs
 	if partitionOut == nil {
-		partitionOut = make(map[string]types.TupleDelta)
+		partitionOut = make(map[string]frameOutputCacheEntry)
+	}
+	if buffer == nil || len(buffer.Rows) == 0 {
+		out := make(types.Batch, 0, len(partitionOut))
+		for _, oldEntry := range partitionOut {
+			out = append(out, negateTupleDelta(frameOutputCacheEntryToTupleDelta(oldEntry)))
+		}
+		w.clearFramePartitionState(partitionKey)
+		return out, nil
 	}
 	canTailReplace := !appendOnly && len(buffer.Rows) > 0 && len(buffer.Rows) == cache.rowCount && affectedStart == len(buffer.Rows)-1
 
@@ -2114,7 +2596,7 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 
 		out := make(types.Batch, 0, len(buffer.Rows)-affectedStart)
 		previousState := cloneCumulativeAggState(currentState)
-		var tailOutput types.TupleDelta
+		var tailOutput frameOutputCacheEntry
 		for idx := affectedStart; idx < len(buffer.Rows); idx++ {
 			row := buffer.Rows[idx]
 			previousState = cloneCumulativeAggState(currentState)
@@ -2123,12 +2605,12 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 				currentState, outDelta = w.AggFn.Apply(currentState, types.TupleDelta{Tuple: row.Tuple, Count: 1})
 				_ = outDelta
 			}
-			td := w.buildFrameResultDelta(row, currentState)
-			partitionOut[w.frameTupleDeltaKey(td)] = td
-			tailOutput = td
-			out = append(out, td)
+			entry := w.buildFrameOutputCacheEntry(row, currentState)
+			partitionOut[w.frameRowKey(row.Tuple)] = entry
+			tailOutput = entry
+			out = append(out, frameOutputCacheEntryToTupleDelta(entry))
 		}
-		w.frameOut[partitionKey] = partitionOut
+		cache.outputs = partitionOut
 		cache.rowCount = len(buffer.Rows)
 		if len(buffer.Rows) > 1 {
 			cache.beforeTailState = previousState
@@ -2152,46 +2634,46 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 			_ = outDelta
 		}
 		newTail := w.buildFrameResultDelta(row, currentState)
-		oldTail := cache.tailOutput
-		oldKey := w.frameTupleDeltaKey(oldTail)
-		newKey := w.frameTupleDeltaKey(newTail)
+		oldTail := frameOutputCacheEntryToTupleDelta(cache.tailOutput)
+		oldKey := w.frameRowKey(row.Tuple)
+		newKey := w.frameRowKey(row.Tuple)
 		var out types.Batch
-		if oldTail.Tuple != nil || oldTail.Packed != nil {
+		if frameOutputCacheEntryValid(cache.tailOutput) {
 			if oldKey != newKey {
 				delete(partitionOut, oldKey)
 				out = append(out, negateTupleDelta(oldTail))
-				partitionOut[newKey] = newTail
+				partitionOut[newKey] = w.buildFrameOutputCacheEntry(row, currentState)
 				out = append(out, newTail)
 			} else if !tupleDeltaPayloadEqual(oldTail, newTail) {
-				partitionOut[newKey] = newTail
+				partitionOut[newKey] = w.buildFrameOutputCacheEntry(row, currentState)
 				out = append(out, negateTupleDelta(oldTail))
 				out = append(out, newTail)
 			} else if newTail.Count != oldTail.Count {
-				partitionOut[newKey] = newTail
+				partitionOut[newKey] = w.buildFrameOutputCacheEntry(row, currentState)
 				diff := newTail.Count - oldTail.Count
 				if diff != 0 {
 					out = append(out, types.TupleDelta{Tuple: newTail.Tuple, Packed: newTail.Packed, Count: diff})
 				}
 			}
 		} else {
-			partitionOut[newKey] = newTail
+			partitionOut[newKey] = w.buildFrameOutputCacheEntry(row, currentState)
 			out = append(out, newTail)
 		}
-		w.frameOut[partitionKey] = partitionOut
+		cache.outputs = partitionOut
 		cache.tailState = cloneCumulativeAggState(currentState)
-		cache.tailOutput = newTail
+		cache.tailOutput = w.buildFrameOutputCacheEntry(row, currentState)
 		return out, nil
 	}
 
-	oldMap := make(map[string]types.TupleDelta, len(partitionOut))
-	for key, td := range partitionOut {
-		oldMap[key] = td
+	oldMap := make(map[string]frameOutputCacheEntry, len(partitionOut))
+	for key, entry := range partitionOut {
+		oldMap[key] = entry
 	}
 
-	newMap := make(map[string]types.TupleDelta, len(buffer.Rows))
+	newMap := make(map[string]frameOutputCacheEntry, len(buffer.Rows))
 	currentState := w.AggInit()
 	previousState := cloneCumulativeAggState(currentState)
-	var tailOutput types.TupleDelta
+	var tailOutput frameOutputCacheEntry
 	for _, row := range buffer.Rows {
 		previousState = cloneCumulativeAggState(currentState)
 		for c := int64(0); c < row.Count; c++ {
@@ -2199,18 +2681,20 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 			currentState, outDelta = w.AggFn.Apply(currentState, types.TupleDelta{Tuple: row.Tuple, Count: 1})
 			_ = outDelta
 		}
-		td := w.buildFrameResultDelta(row, currentState)
-		newMap[w.frameTupleDeltaKey(td)] = td
-		tailOutput = td
+		entry := w.buildFrameOutputCacheEntry(row, currentState)
+		newMap[w.frameRowKey(row.Tuple)] = entry
+		tailOutput = entry
 	}
 
 	var out types.Batch
-	for key, oldTd := range oldMap {
-		newTd, ok := newMap[key]
+	for key, oldEntry := range oldMap {
+		newEntry, ok := newMap[key]
+		oldTd := frameOutputCacheEntryToTupleDelta(oldEntry)
 		if !ok {
 			out = append(out, negateTupleDelta(oldTd))
 			continue
 		}
+		newTd := frameOutputCacheEntryToTupleDelta(newEntry)
 		if !tupleDeltaPayloadEqual(oldTd, newTd) {
 			out = append(out, negateTupleDelta(oldTd))
 			out = append(out, newTd)
@@ -2223,13 +2707,17 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 			}
 		}
 	}
-	for key, newTd := range newMap {
+	for key, newEntry := range newMap {
 		if _, ok := oldMap[key]; !ok {
-			out = append(out, newTd)
+			out = append(out, frameOutputCacheEntryToTupleDelta(newEntry))
 		}
 	}
 
-	w.frameOut[partitionKey] = newMap
+	if len(newMap) == 0 {
+		w.clearFramePartitionState(partitionKey)
+	} else {
+		cache.outputs = newMap
+	}
 	cache.rowCount = len(buffer.Rows)
 	if len(buffer.Rows) > 1 {
 		cache.beforeTailState = previousState
@@ -2239,6 +2727,44 @@ func (w *WindowAggOp) recomputeCumulativeFrameSuffix(partitionKey any, buffer *P
 	cache.tailState = cloneCumulativeAggState(currentState)
 	cache.tailOutput = tailOutput
 	return out, nil
+}
+
+func (w *WindowAggOp) buildFrameOutputCacheEntry(row RowWithOrder, aggState any) frameOutputCacheEntry {
+	entry := frameOutputCacheEntry{AggValues: w.aggValueTuple(aggState), Count: row.Count}
+	if row.Packed != nil {
+		entry.BasePacked = types.ClonePackedTuple(row.Packed)
+		return entry
+	}
+	entry.BaseTuple = types.CloneTuple(row.Tuple)
+	return entry
+}
+
+func frameOutputCacheEntryFromTupleDelta(td types.TupleDelta) frameOutputCacheEntry {
+	entry := frameOutputCacheEntry{Count: td.Count}
+	if td.Packed != nil {
+		entry.BasePacked = types.ClonePackedTuple(td.Packed)
+		return entry
+	}
+	entry.BaseTuple = types.CloneTuple(td.Tuple)
+	return entry
+}
+
+func frameOutputCacheEntryToTupleDelta(entry frameOutputCacheEntry) types.TupleDelta {
+	if entry.BasePacked != nil {
+		return types.TupleDelta{Packed: entry.BasePacked.WithExtras(entry.AggValues), Count: entry.Count}
+	}
+	tuple := make(types.Tuple, len(entry.BaseTuple)+len(entry.AggValues))
+	for key, value := range entry.BaseTuple {
+		tuple[key] = value
+	}
+	for key, value := range entry.AggValues {
+		tuple[key] = value
+	}
+	return types.TupleDelta{Tuple: tuple, Count: entry.Count}
+}
+
+func frameOutputCacheEntryValid(entry frameOutputCacheEntry) bool {
+	return entry.BaseTuple != nil || entry.BasePacked != nil
 }
 
 func (w *WindowAggOp) frameTupleDeltaKey(td types.TupleDelta) string {

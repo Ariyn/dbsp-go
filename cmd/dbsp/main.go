@@ -8,6 +8,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -59,6 +60,7 @@ func main() {
 		fmt.Printf("Error applying memory limit: %v\n", err)
 		os.Exit(1)
 	}
+	applyRuntimeSettings(&cfg)
 
 	if err := validateMinimalContract(&cfg); err != nil {
 		fmt.Printf("Unsupported config for minimal runtime: %v\n", err)
@@ -73,6 +75,15 @@ func main() {
 		fmt.Printf("Pipeline error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func applyRuntimeSettings(cfg *config.PipelineConfig) {
+	maxProcs := runtime.NumCPU()
+	if cfg != nil && cfg.Pipeline.State.GOMAXPROCS > 0 {
+		maxProcs = cfg.Pipeline.State.GOMAXPROCS
+	}
+	prev := runtime.GOMAXPROCS(maxProcs)
+	fmt.Printf("Applied GOMAXPROCS: %d (previous %d)\n", maxProcs, prev)
 }
 
 func startObservabilityServers() {

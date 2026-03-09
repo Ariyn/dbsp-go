@@ -2,6 +2,7 @@ package op
 
 import (
 	"testing"
+	"time"
 
 	"github.com/ariyn/dbsp/internal/dbsp/types"
 )
@@ -230,6 +231,131 @@ func TestWindowAggCumulativeFrameAppendOnlyEmitsOnlyNewRow(t *testing.T) {
 	}
 }
 
+func TestWindowAggBucketedCumulativeStateTracksBuckets(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+
+	out, err := w.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 1.0}, Count: 1}})
+	if err != nil {
+		t.Fatalf("apply first bucket: %v", err)
+	}
+	if len(out) != 1 || types.ToFloat64(out[0].Tuple["agg_result"]) != 1.0 {
+		t.Fatalf("unexpected first output: %v", out)
+	}
+	if got := w.stateEntryCount(); got != 1 {
+		t.Fatalf("expected 1 bucket state entry, got %d", got)
+	}
+
+	out, err = w.Apply(types.Batch{
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 1.0}, Count: -1},
+		{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 3.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("replace current bucket: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected replacement retraction/insertion, got %v", out)
+	}
+	if got := w.stateEntryCount(); got != 1 {
+		t.Fatalf("expected current bucket replacement to keep 1 state entry, got %d", got)
+	}
+
+	out, err = w.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 2.0}, Count: 1}})
+	if err != nil {
+		t.Fatalf("append next bucket: %v", err)
+	}
+	if len(out) != 1 || out[0].Tuple["ts"] != int64(2) || types.ToFloat64(out[0].Tuple["agg_result"]) != 5.0 {
+		t.Fatalf("unexpected second bucket output: %v", out)
+	}
+	if got := w.stateEntryCount(); got != 2 {
+		t.Fatalf("expected 2 bucket state entries, got %d", got)
+	}
+	partition := w.bucketedCumulativeState["a"]
+	if partition == nil || len(partition.Buckets) != 2 {
+		t.Fatalf("expected 2 retained buckets in fast path, got %+v", partition)
+	}
+	if len(w.PartitionBuffers) != 0 {
+		t.Fatalf("expected bucketed fast path to avoid row buffers, got %+v", w.PartitionBuffers)
+	}
+}
+
+func TestWindowAggBucketedCumulativeStateTTLExpiresInactiveBucketOnly(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+	w.SetStateTTL(4 * time.Millisecond)
+	w.ttlCheckInterval = time.Millisecond
+
+	if _, err := w.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(1), "v": 3.0}, Count: 1}}); err != nil {
+		t.Fatalf("apply first bucket: %v", err)
+	}
+
+	time.Sleep(3 * time.Millisecond)
+	if _, err := w.Apply(types.Batch{{Tuple: types.Tuple{"id": "a", "ts": int64(2), "v": 2.0}, Count: 1}}); err != nil {
+		t.Fatalf("apply second bucket: %v", err)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	out, err := w.Apply(nil)
+	if err != nil {
+		t.Fatalf("apply ttl eviction: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("expected old bucket retraction and survivor recompute, got %v", out)
+	}
+
+	var removedFirst, removedOldSecond, addedNewSecond bool
+	for _, td := range out {
+		switch {
+		case td.Count == -1 && td.Tuple["ts"] == int64(1) && types.ToFloat64(td.Tuple["agg_result"]) == 3.0:
+			removedFirst = true
+		case td.Count == -1 && td.Tuple["ts"] == int64(2) && types.ToFloat64(td.Tuple["agg_result"]) == 5.0:
+			removedOldSecond = true
+		case td.Count == 1 && td.Tuple["ts"] == int64(2) && types.ToFloat64(td.Tuple["agg_result"]) == 2.0:
+			addedNewSecond = true
+		}
+	}
+	if !removedFirst || !removedOldSecond || !addedNewSecond {
+		t.Fatalf("unexpected ttl output: %v", out)
+	}
+	if got := w.stateEntryCount(); got != 1 {
+		t.Fatalf("expected 1 retained bucket after ttl eviction, got %d", got)
+	}
+	partition := w.bucketedCumulativeState["a"]
+	if partition == nil || len(partition.Buckets) != 1 {
+		t.Fatalf("expected only latest bucket to remain, got %+v", partition)
+	}
+	if partition.CurrentBucketID != stableAnyKey(int64(2)) {
+		t.Fatalf("expected current bucket ts=2, got %q", partition.CurrentBucketID)
+	}
+	if partition.ClosedPrefixSum != 0 {
+		t.Fatalf("expected closed prefix to reset after ttl eviction, got %v", partition.ClosedPrefixSum)
+	}
+	remaining := partition.Buckets[stableAnyKey(int64(2))]
+	if remaining == nil || types.ToFloat64(remaining.Output.Tuple["agg_result"]) != 2.0 {
+		t.Fatalf("expected surviving bucket output to be recomputed to 2.0, got %+v", remaining)
+	}
+}
+
 func TestWindowAggCumulativeFrameLatestRowReplacementTouchesTailOnly(t *testing.T) {
 	agg := &SumAgg{ColName: "v"}
 	w := NewWindowAggOp(
@@ -373,6 +499,55 @@ func TestWindowAggStateEntryCountExcludesDerivedCaches(t *testing.T) {
 
 	if got := w.stateEntryCount(); got != 5 {
 		t.Fatalf("expected state entries to exclude derived caches, got %d", got)
+	}
+}
+
+func TestWindowAggCumulativeFrameDeleteClearsDerivedCaches(t *testing.T) {
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return int64(0) },
+		&CountAgg{},
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+
+	row := types.Tuple{"id": "a", "ts": int64(1), "v": 1.0}
+	if _, err := w.Apply(types.Batch{{Tuple: row, Count: 1}}); err != nil {
+		t.Fatalf("apply insert: %v", err)
+	}
+	if got := len(w.PartitionBuffers); got != 1 {
+		t.Fatalf("expected partition buffer to be populated, got %d", got)
+	}
+	cache, ok := w.cumulativeFrameCache["a"]
+	if !ok {
+		t.Fatal("expected cumulative cache for partition a")
+	}
+	if got := len(cache.outputs); got != 1 {
+		t.Fatalf("expected compact frame cache to be populated, got %d", got)
+	}
+	if got := len(w.cumulativeFrameCache); got != 1 {
+		t.Fatalf("expected cumulative cache to be populated, got %d", got)
+	}
+
+	out, err := w.Apply(types.Batch{{Tuple: row, Count: -1}})
+	if err != nil {
+		t.Fatalf("apply delete: %v", err)
+	}
+	if len(out) != 1 || out[0].Count != -1 {
+		t.Fatalf("expected single retraction, got %v", out)
+	}
+	if got := len(w.PartitionBuffers); got != 0 {
+		t.Fatalf("expected partition buffers to be cleared, got %d", got)
+	}
+	if _, ok := w.cumulativeFrameCache["a"]; ok {
+		t.Fatalf("expected cumulative cache entry for partition a to be cleared")
+	}
+	if got := len(w.cumulativeFrameCache); got != 0 {
+		t.Fatalf("expected cumulative cache to be cleared, got %d", got)
 	}
 }
 

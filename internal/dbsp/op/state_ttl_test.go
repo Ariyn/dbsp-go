@@ -93,6 +93,54 @@ func TestWindowAggStateTTL(t *testing.T) {
 	}
 }
 
+func TestWindowAggStateTTLAlsoEvictsDerivedFrameCaches(t *testing.T) {
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["k"] },
+		[]string{"k"},
+		func() any { return int64(0) },
+		&CountAgg{},
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "UNBOUNDED PRECEDING", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+	w.SetStateTTL(2 * time.Millisecond)
+	w.ttlCheckInterval = time.Millisecond
+
+	batch := types.Batch{{Tuple: types.Tuple{"k": "a", "ts": int64(1000), "v": 1.0}, Count: 1}}
+	if _, err := w.Apply(batch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := len(w.PartitionBuffers); got != 1 {
+		t.Fatalf("expected 1 partition buffer, got %d", got)
+	}
+	cache, ok := w.cumulativeFrameCache["a"]
+	if !ok {
+		t.Fatal("expected cumulative cache for partition a")
+	}
+	if got := len(cache.outputs); got != 1 {
+		t.Fatalf("expected 1 compact frame cache entry, got %d", got)
+	}
+	if got := len(w.cumulativeFrameCache); got != 1 {
+		t.Fatalf("expected 1 cumulative cache entry, got %d", got)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	if _, err := w.Apply(nil); err != nil {
+		t.Fatalf("apply for eviction: %v", err)
+	}
+	if got := len(w.PartitionBuffers); got != 0 {
+		t.Fatalf("expected partition buffers to be evicted, got %d", got)
+	}
+	if _, ok := w.cumulativeFrameCache["a"]; ok {
+		t.Fatalf("expected cumulative cache entry for partition a to be evicted")
+	}
+	if got := len(w.cumulativeFrameCache); got != 0 {
+		t.Fatalf("expected cumulative cache to be evicted, got %d", got)
+	}
+}
+
 func TestJoinStateTTL(t *testing.T) {
 	join := NewJoinOp(
 		func(t types.Tuple) any { return t["k"] },

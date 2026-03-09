@@ -138,6 +138,9 @@ type StateBackendConfig struct {
 	Type    string `yaml:"type"` // memory|kv|sqlite
 	Path    string `yaml:"path"`
 
+	// GOMAXPROCS overrides Go runtime parallelism. 0 uses all available CPUs.
+	GOMAXPROCS int `yaml:"gomaxprocs"`
+
 	// MemoryLimit sets a soft Go heap limit (e.g., "1GiB").
 	MemoryLimit string `yaml:"memory_limit"`
 
