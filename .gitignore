@@ -7,3 +7,5 @@ plans
 k8s
 experiments
 .tmp
+.claude
+.vscode
