@@ -70,39 +70,54 @@ func decodeAnyKey(encoded string) (any, error) {
 }
 
 func stableAnyKeyFast(key any) (string, bool) {
+	var buf [32]byte
 	switch v := key.(type) {
 	case nil:
 		return "n:", true
 	case string:
 		return "s:" + v, true
 	case bool:
-		return "b:" + strconv.FormatBool(v), true
+		b := append(buf[:0], "b:"...)
+		return string(strconv.AppendBool(b, v)), true
 	case int:
-		return "i:" + strconv.FormatInt(int64(v), 10), true
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, int64(v), 10)), true
 	case int8:
-		return "i:" + strconv.FormatInt(int64(v), 10), true
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, int64(v), 10)), true
 	case int16:
-		return "i:" + strconv.FormatInt(int64(v), 10), true
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, int64(v), 10)), true
 	case int32:
-		return "i:" + strconv.FormatInt(int64(v), 10), true
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, int64(v), 10)), true
 	case int64:
-		return "i:" + strconv.FormatInt(v, 10), true
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, v, 10)), true
 	case uint:
-		return "u:" + strconv.FormatUint(uint64(v), 10), true
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, uint64(v), 10)), true
 	case uint8:
-		return "u:" + strconv.FormatUint(uint64(v), 10), true
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, uint64(v), 10)), true
 	case uint16:
-		return "u:" + strconv.FormatUint(uint64(v), 10), true
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, uint64(v), 10)), true
 	case uint32:
-		return "u:" + strconv.FormatUint(uint64(v), 10), true
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, uint64(v), 10)), true
 	case uint64:
-		return "u:" + strconv.FormatUint(v, 10), true
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, v, 10)), true
 	case float32:
-		return "f:" + strconv.FormatFloat(float64(v), 'g', -1, 32), true
+		b := append(buf[:0], "f:"...)
+		return string(strconv.AppendFloat(b, float64(v), 'g', -1, 32)), true
 	case float64:
-		return "f:" + strconv.FormatFloat(v, 'g', -1, 64), true
+		b := append(buf[:0], "f:"...)
+		return string(strconv.AppendFloat(b, v, 'g', -1, 64)), true
 	case time.Time:
-		return "t:" + v.UTC().Format(time.RFC3339Nano), true
+		b := append(buf[:0], "t:"...)
+		return string(v.UTC().AppendFormat(b, time.RFC3339Nano)), true
 	case types.Tuple:
 		return "m:" + stableTupleKeyCanonical(v), true
 	case map[string]any:
@@ -113,39 +128,54 @@ func stableAnyKeyFast(key any) (string, bool) {
 }
 
 func compactAnyOrderKey(key any) string {
+	var buf [32]byte
 	switch v := key.(type) {
 	case nil:
 		return "n:"
 	case string:
 		return "s:" + v
 	case bool:
-		return "b:" + strconv.FormatBool(v)
+		b := append(buf[:0], "b:"...)
+		return string(strconv.AppendBool(b, v))
 	case int:
-		return "i:" + strconv.FormatInt(int64(v), 10)
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, int64(v), 10))
 	case int8:
-		return "i:" + strconv.FormatInt(int64(v), 10)
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, int64(v), 10))
 	case int16:
-		return "i:" + strconv.FormatInt(int64(v), 10)
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, int64(v), 10))
 	case int32:
-		return "i:" + strconv.FormatInt(int64(v), 10)
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, int64(v), 10))
 	case int64:
-		return "i:" + strconv.FormatInt(v, 10)
+		b := append(buf[:0], "i:"...)
+		return string(strconv.AppendInt(b, v, 10))
 	case uint:
-		return "u:" + strconv.FormatUint(uint64(v), 10)
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, uint64(v), 10))
 	case uint8:
-		return "u:" + strconv.FormatUint(uint64(v), 10)
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, uint64(v), 10))
 	case uint16:
-		return "u:" + strconv.FormatUint(uint64(v), 10)
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, uint64(v), 10))
 	case uint32:
-		return "u:" + strconv.FormatUint(uint64(v), 10)
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, uint64(v), 10))
 	case uint64:
-		return "u:" + strconv.FormatUint(v, 10)
+		b := append(buf[:0], "u:"...)
+		return string(strconv.AppendUint(b, v, 10))
 	case float32:
-		return "f:" + strconv.FormatFloat(float64(v), 'g', -1, 32)
+		b := append(buf[:0], "f:"...)
+		return string(strconv.AppendFloat(b, float64(v), 'g', -1, 32))
 	case float64:
-		return "f:" + strconv.FormatFloat(v, 'g', -1, 64)
+		b := append(buf[:0], "f:"...)
+		return string(strconv.AppendFloat(b, v, 'g', -1, 64))
 	case time.Time:
-		return "t:" + v.UTC().Format(time.RFC3339Nano)
+		b := append(buf[:0], "t:"...)
+		return string(v.UTC().AppendFormat(b, time.RFC3339Nano))
 	case types.Tuple:
 		return "h:" + stableTupleOrderHashHex(v)
 	case *types.PackedTuple:
@@ -266,6 +296,7 @@ func stableTupleKeyForColumns(t types.Tuple, columns []string) string {
 }
 
 func writeStableValue(b *strings.Builder, value any) {
+	var buf [32]byte
 	switch v := value.(type) {
 	case nil:
 		b.WriteString("null")
@@ -274,46 +305,46 @@ func writeStableValue(b *strings.Builder, value any) {
 		b.WriteString(v)
 	case bool:
 		b.WriteString("b:")
-		b.WriteString(strconv.FormatBool(v))
+		b.Write(strconv.AppendBool(buf[:0], v))
 	case int:
 		b.WriteString("i:")
-		b.WriteString(strconv.FormatInt(int64(v), 10))
+		b.Write(strconv.AppendInt(buf[:0], int64(v), 10))
 	case int8:
 		b.WriteString("i:")
-		b.WriteString(strconv.FormatInt(int64(v), 10))
+		b.Write(strconv.AppendInt(buf[:0], int64(v), 10))
 	case int16:
 		b.WriteString("i:")
-		b.WriteString(strconv.FormatInt(int64(v), 10))
+		b.Write(strconv.AppendInt(buf[:0], int64(v), 10))
 	case int32:
 		b.WriteString("i:")
-		b.WriteString(strconv.FormatInt(int64(v), 10))
+		b.Write(strconv.AppendInt(buf[:0], int64(v), 10))
 	case int64:
 		b.WriteString("i:")
-		b.WriteString(strconv.FormatInt(v, 10))
+		b.Write(strconv.AppendInt(buf[:0], v, 10))
 	case uint:
 		b.WriteString("u:")
-		b.WriteString(strconv.FormatUint(uint64(v), 10))
+		b.Write(strconv.AppendUint(buf[:0], uint64(v), 10))
 	case uint8:
 		b.WriteString("u:")
-		b.WriteString(strconv.FormatUint(uint64(v), 10))
+		b.Write(strconv.AppendUint(buf[:0], uint64(v), 10))
 	case uint16:
 		b.WriteString("u:")
-		b.WriteString(strconv.FormatUint(uint64(v), 10))
+		b.Write(strconv.AppendUint(buf[:0], uint64(v), 10))
 	case uint32:
 		b.WriteString("u:")
-		b.WriteString(strconv.FormatUint(uint64(v), 10))
+		b.Write(strconv.AppendUint(buf[:0], uint64(v), 10))
 	case uint64:
 		b.WriteString("u:")
-		b.WriteString(strconv.FormatUint(v, 10))
+		b.Write(strconv.AppendUint(buf[:0], v, 10))
 	case float32:
 		b.WriteString("f:")
-		b.WriteString(strconv.FormatFloat(float64(v), 'g', -1, 32))
+		b.Write(strconv.AppendFloat(buf[:0], float64(v), 'g', -1, 32))
 	case float64:
 		b.WriteString("f:")
-		b.WriteString(strconv.FormatFloat(v, 'g', -1, 64))
+		b.Write(strconv.AppendFloat(buf[:0], v, 'g', -1, 64))
 	case time.Time:
 		b.WriteString("t:")
-		b.WriteString(v.UTC().Format(time.RFC3339Nano))
+		b.Write(v.UTC().AppendFormat(buf[:0], time.RFC3339Nano))
 	default:
 		b.WriteString("x:")
 		b.WriteString(fmt.Sprintf("%#v", value))

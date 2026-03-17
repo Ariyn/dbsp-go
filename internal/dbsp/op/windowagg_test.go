@@ -150,6 +150,48 @@ func TestWindowAggCumulativeFrameKeepsPackedRows(t *testing.T) {
 	}
 }
 
+func TestWindowAggFrameStateRetainsOnlyPackedForPackedInput(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{},
+		func(t types.Tuple) any { return t["id"] },
+		[]string{"id"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.OrderByCol = "ts"
+	w.FrameSpec = &FrameSpecLite{Type: "ROWS", StartType: "1 PRECEDING", StartValue: "1", EndType: "CURRENT ROW"}
+	w.KeepInput = true
+	w.EmitValue = true
+
+	schema := types.NewPackedSchema([]string{"id", "ts", "v"})
+	_, err := w.Apply(types.Batch{
+		{Packed: types.NewPackedTupleWithPresence(schema, []any{"a", int64(1), 1.0}, []bool{true, true, true}), Count: 1},
+		{Packed: types.NewPackedTupleWithPresence(schema, []any{"a", int64(2), 2.0}, []bool{true, true, true}), Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	buffer := w.PartitionBuffers["a"]
+	if buffer == nil || len(buffer.Rows) != 2 {
+		t.Fatalf("expected 2 retained rows, got %+v", buffer)
+	}
+	row := buffer.Rows[0]
+	if row.Tuple != nil {
+		t.Fatalf("expected packed input not to retain tuple state, got %+v", row.Tuple)
+	}
+	if row.Packed == nil {
+		t.Fatal("expected packed input to be retained as packed state")
+	}
+	if got, ok := row.get("id"); !ok || got != "a" {
+		t.Fatalf("unexpected retained row id: %+v", row)
+	}
+	if got, ok := row.Packed.Get("ts"); !ok || got != int64(1) {
+		t.Fatalf("unexpected retained packed row: %+v", row.Packed)
+	}
+}
+
 func TestWindowAggCumulativeFrameOutOfOrderInsertReplacesSuffix(t *testing.T) {
 	agg := &SumAgg{ColName: "v"}
 	w := NewWindowAggOp(

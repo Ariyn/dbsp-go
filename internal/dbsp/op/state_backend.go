@@ -45,6 +45,7 @@ type StateBackend interface {
 	Delete(key []byte) error
 	IterPrefix(prefix []byte, visit func(key, value []byte) error) error
 	BatchWrite(ops []StateBatchOp) error
+	Reset() error
 	Close() error
 }
 
@@ -142,6 +143,16 @@ func (m *MemoryStateBackend) BatchWrite(ops []StateBatchOp) error {
 			return fmt.Errorf("unknown batch op type: %d", op.Type)
 		}
 	}
+	return nil
+}
+
+func (m *MemoryStateBackend) Reset() error {
+	if m == nil {
+		return fmt.Errorf("memory backend is nil")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data = make(map[string][]byte)
 	return nil
 }
 

@@ -175,6 +175,35 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig) error {
 	if cfg.Pipeline.State.OnlyLastLag {
 		op.ApplyOnlyLastLag(rootNode, true)
 	}
+	wmCfg := cfg.Pipeline.Transform.Watermark
+	if wmCfg.Enabled {
+		maxOutOfOrderness, err := config.ParseDuration(wmCfg.MaxOutOfOrderness)
+		if err != nil {
+			return fmt.Errorf("invalid watermark.max_out_of_orderness: %w", err)
+		}
+		allowedLateness, err := config.ParseDuration(wmCfg.AllowedLateness)
+		if err != nil {
+			return fmt.Errorf("invalid watermark.allowed_lateness: %w", err)
+		}
+		policy := strings.ToLower(strings.TrimSpace(wmCfg.Policy))
+		if policy == "" {
+			policy = "drop"
+		}
+		if policy != "drop" {
+			return fmt.Errorf("unsupported watermark.policy %q: only drop is currently supported", wmCfg.Policy)
+		}
+		op.ApplyEventTimeWatermark(rootNode, op.EventTimeWatermarkConfig{
+			MaxOutOfOrderness: maxOutOfOrderness,
+			AllowedLateness:   allowedLateness,
+			Policy:            policy,
+		})
+	}
+	if wmCfg.GC {
+		if !wmCfg.Enabled {
+			return fmt.Errorf("watermark.gc requires watermark.enabled")
+		}
+		op.ApplyWatermarkGC(rootNode, true)
+	}
 
 	src, err := newSource(cfg, requiredFields, requiredFieldHints)
 	if err != nil {
@@ -233,6 +262,37 @@ func runSinglePipeline(ctx context.Context, cfg *config.PipelineConfig) error {
 				}
 			}()
 		}
+	}
+
+	if cfg.Pipeline.State.DailyReset {
+		tz := strings.TrimSpace(cfg.Pipeline.State.ResetTimezone)
+		if tz == "" {
+			tz = "Asia/Seoul"
+		}
+		loc, err := time.LoadLocation(tz)
+		if err != nil {
+			return fmt.Errorf("invalid reset_timezone %q: %w", tz, err)
+		}
+		go func() {
+			for {
+				now := time.Now().In(loc)
+				next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, loc)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(next.Sub(now)):
+					fmt.Printf("[%s] Daily state reset triggered (tz=%s)\n", time.Now().Format(time.RFC3339), tz)
+					if stateBackend != nil {
+						if err := stateBackend.Reset(); err != nil {
+							fmt.Printf("State backend reset error: %v\n", err)
+						}
+					}
+					if err := op.ResetGraphState(rootNode); err != nil {
+						fmt.Printf("Graph state reset error: %v\n", err)
+					}
+				}
+			}
+		}()
 	}
 
 	if err := pipeline.RunPipeline(ctx, src, snk, func(batch types.Batch) (types.Batch, error) {

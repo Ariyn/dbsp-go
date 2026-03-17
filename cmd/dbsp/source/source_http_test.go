@@ -908,3 +908,68 @@ func TestHandleIngestSpillsToWALWhenMemoryQueueIsFull(t *testing.T) {
 		t.Fatalf("unexpected second batch: %v", batch)
 	}
 }
+
+func TestHandleIngestSortsAndSpillsBatchWhenConfigured(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "http_source_sort_spill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	s := &HTTPSource{
+		schema:        map[string]string{"panel_position": "string", "timestamp": "int", "v_out": "float"},
+		buffer:        make(chan queuedInputBatch, 1),
+		done:          make(chan struct{}),
+		maxBatchSize:  10,
+		timestampUnit: "auto",
+		sortEnabled:   true,
+		sortBy:        []string{"panel_position", "timestamp"},
+		sortSpillPath: tmpDir,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(`[
+		{"panel_position":"b","timestamp":3,"v_out":30},
+		{"panel_position":"a","timestamp":2,"v_out":20},
+		{"panel_position":"a","timestamp":1,"v_out":10}
+	]`))
+	rr := httptest.NewRecorder()
+	s.handleIngest(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	if len(s.buffer) != 1 {
+		t.Fatalf("expected 1 queued item, got %d", len(s.buffer))
+	}
+	item := <-s.buffer
+	if item.spillPath == "" {
+		t.Fatal("expected sorted batch to spill to disk")
+	}
+	if _, err := os.Stat(item.spillPath); err != nil {
+		t.Fatalf("expected spill file to exist: %v", err)
+	}
+	s.buffer <- item
+
+	batch, err := s.NextBatch()
+	if err != nil {
+		t.Fatalf("next batch: %v", err)
+	}
+	if len(batch) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(batch))
+	}
+	if got := tupleForTest(&batch[0])["panel_position"]; got != "a" {
+		t.Fatalf("expected first row panel_position=a, got %v", got)
+	}
+	if got := types.ToInt64(tupleForTest(&batch[0])["timestamp"]); got != 1 {
+		t.Fatalf("expected first row timestamp=1, got %d", got)
+	}
+	if got := types.ToInt64(tupleForTest(&batch[1])["timestamp"]); got != 2 {
+		t.Fatalf("expected second row timestamp=2, got %d", got)
+	}
+	if got := tupleForTest(&batch[2])["panel_position"]; got != "b" {
+		t.Fatalf("expected third row panel_position=b, got %v", got)
+	}
+	if _, err := os.Stat(item.spillPath); !os.IsNotExist(err) {
+		t.Fatalf("expected spill file to be removed after materialize, err=%v", err)
+	}
+}

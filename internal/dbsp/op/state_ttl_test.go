@@ -185,6 +185,132 @@ func TestJoinStateTTL(t *testing.T) {
 	}
 }
 
+func TestWindowAggWatermarkGC(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	var watermark int64
+	w := NewWindowAggOp(
+		WindowSpecLite{TimeCol: "ts", SizeMillis: 1000, WindowType: WindowTypeTumbling},
+		func(t types.Tuple) any { return t["k"] },
+		[]string{"k"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.WatermarkFn = func() int64 { return watermark }
+	w.SetWatermarkGC(true)
+
+	// Insert into window [1000, 2000)
+	batch := types.Batch{{Tuple: types.Tuple{"k": "a", "ts": int64(1500), "v": 1.0}, Count: 1}}
+	if _, err := w.Apply(batch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := len(w.State.Data); got != 1 {
+		t.Fatalf("expected 1 window, got %d", got)
+	}
+
+	// Watermark hasn't passed window end yet — state should remain
+	watermark = 1999
+	if _, err := w.Apply(nil); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := len(w.State.Data); got != 1 {
+		t.Fatalf("expected 1 window (watermark < end), got %d", got)
+	}
+
+	// Advance watermark past window end — state should be GC'd
+	watermark = 2000
+	if _, err := w.Apply(nil); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := len(w.State.Data); got != 0 {
+		t.Fatalf("expected 0 windows after watermark GC, got %d", got)
+	}
+	if got := len(w.GroupCounts); got != 0 {
+		t.Fatalf("expected 0 group counts after watermark GC, got %d", got)
+	}
+}
+
+func TestSetWatermarkGCDoesNotInstallImplicitWatermark(t *testing.T) {
+	w := NewWindowAggOp(
+		WindowSpecLite{TimeCol: "ts", SizeMillis: 1000, WindowType: WindowTypeTumbling},
+		func(t types.Tuple) any { return t["k"] },
+		[]string{"k"},
+		func() any { return float64(0) },
+		&SumAgg{ColName: "v"},
+	)
+	w.SetWatermarkGC(true)
+	if w.WatermarkFn != nil {
+		t.Fatal("expected watermark GC toggle not to install an implicit watermark function")
+	}
+}
+
+func TestWindowAggWatermarkDropProcessesOlderRowsInSameBatch(t *testing.T) {
+	w := NewWindowAggOp(
+		WindowSpecLite{TimeCol: "ts", SizeMillis: 1000, WindowType: WindowTypeTumbling},
+		func(t types.Tuple) any { return t["k"] },
+		[]string{"k"},
+		func() any { return float64(0) },
+		&SumAgg{ColName: "v"},
+	)
+	w.SetEventTimeWatermark(EventTimeWatermarkConfig{Policy: "drop"})
+
+	out, err := w.Apply(types.Batch{
+		{Tuple: types.Tuple{"k": "a", "ts": int64(1500), "v": 1.0}, Count: 1},
+		{Tuple: types.Tuple{"k": "a", "ts": int64(2500), "v": 2.0}, Count: 1},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 output rows, got %d", len(out))
+	}
+	if got := len(w.State.Data); got != 2 {
+		t.Fatalf("expected 2 retained windows, got %d", got)
+	}
+}
+
+func TestWindowAggWatermarkGCDisabled(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	var watermark int64
+	w := NewWindowAggOp(
+		WindowSpecLite{TimeCol: "ts", SizeMillis: 1000, WindowType: WindowTypeTumbling},
+		func(t types.Tuple) any { return t["k"] },
+		[]string{"k"},
+		func() any { return float64(0) },
+		agg,
+	)
+	w.WatermarkFn = func() int64 { return watermark }
+	// WatermarkGC defaults to false
+
+	batch := types.Batch{{Tuple: types.Tuple{"k": "a", "ts": int64(1500), "v": 1.0}, Count: 1}}
+	if _, err := w.Apply(batch); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// Advance watermark past window end, but GC is disabled
+	watermark = 5000
+	if _, err := w.Apply(nil); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := len(w.State.Data); got != 1 {
+		t.Fatalf("expected 1 window (GC disabled), got %d", got)
+	}
+}
+
+func TestApplyWatermarkGCPropagatesIntoChainedOp(t *testing.T) {
+	agg := &SumAgg{ColName: "v"}
+	w := NewWindowAggOp(
+		WindowSpecLite{TimeCol: "ts", SizeMillis: 1000, WindowType: WindowTypeTumbling},
+		func(t types.Tuple) any { return t["k"] },
+		[]string{"k"},
+		func() any { return float64(0) },
+		agg,
+	)
+	root := &Node{Op: &ChainedOp{Ops: []Operator{w}}}
+	ApplyWatermarkGC(root, true)
+	if !w.WatermarkGC {
+		t.Fatalf("expected WatermarkGC to be enabled after ApplyWatermarkGC")
+	}
+}
+
 func TestApplyStateTTLPropagatesIntoChainedOp(t *testing.T) {
 	ordered := NewOrderedWindowOp(func(t types.Tuple) any { return t["k"] }, "ts", "v", 1, "v_last")
 	root := &Node{Op: &ChainedOp{Ops: []Operator{&MapOp{F: func(td types.TupleDelta) []types.TupleDelta { return []types.TupleDelta{td} }}, ordered}}}

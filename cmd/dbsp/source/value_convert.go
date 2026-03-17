@@ -61,7 +61,7 @@ func parseValueByFieldKind(raw []byte, valueType jsonparser.ValueType, kind fiel
 			}
 			return int(i), nil
 		case jsonparser.String:
-			return strconv.Atoi(strings.TrimSpace(string(raw)))
+			return strconv.Atoi(string(bytes.TrimSpace(raw)))
 		default:
 			return nil, fmt.Errorf("expected int, got %s", valueType)
 		}
@@ -70,7 +70,7 @@ func parseValueByFieldKind(raw []byte, valueType jsonparser.ValueType, kind fiel
 		case jsonparser.Number:
 			return jsonparser.ParseFloat(raw)
 		case jsonparser.String:
-			return strconv.ParseFloat(strings.TrimSpace(string(raw)), 64)
+			return strconv.ParseFloat(string(bytes.TrimSpace(raw)), 64)
 		default:
 			return nil, fmt.Errorf("expected float, got %s", valueType)
 		}
@@ -91,7 +91,7 @@ func parseValueByFieldKind(raw []byte, valueType jsonparser.ValueType, kind fiel
 			}
 			return nil, fmt.Errorf("expected bool (0/1), got %v", f)
 		case jsonparser.String:
-			return strconv.ParseBool(strings.TrimSpace(string(raw)))
+			return strconv.ParseBool(string(bytes.TrimSpace(raw)))
 		default:
 			return nil, fmt.Errorf("expected bool, got %s", valueType)
 		}
@@ -100,10 +100,11 @@ func parseValueByFieldKind(raw []byte, valueType jsonparser.ValueType, kind fiel
 	case fieldTypeTimestamp:
 		switch valueType {
 		case jsonparser.String:
-			trimmed := strings.TrimSpace(string(raw))
-			if trimmed == "" {
+			trimmedBytes := bytes.TrimSpace(raw)
+			if len(trimmedBytes) == 0 {
 				return nil, fmt.Errorf("empty timestamp")
 			}
+			trimmed := string(trimmedBytes)
 			if ts, err := time.Parse(time.RFC3339, trimmed); err == nil {
 				return ts, nil
 			}
@@ -150,7 +151,7 @@ func parseJSONValueBytes(raw []byte, valueType jsonparser.ValueType) (any, error
 	case jsonparser.Null:
 		return nil, nil
 	case jsonparser.Object:
-		out := make(map[string]any)
+		out := make(map[string]any, 8)
 		err := jsonparser.ObjectEach(raw, func(key []byte, value []byte, dataType jsonparser.ValueType, offset int) error {
 			decoded, err := parseJSONValueBytes(value, dataType)
 			if err != nil {
@@ -164,7 +165,7 @@ func parseJSONValueBytes(raw []byte, valueType jsonparser.ValueType) (any, error
 		}
 		return out, nil
 	case jsonparser.Array:
-		out := make([]any, 0)
+		out := make([]any, 0, 4)
 		var parseErr error
 		_, err := jsonparser.ArrayEach(raw, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
 			if parseErr != nil || err != nil {

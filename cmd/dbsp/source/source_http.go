@@ -8,11 +8,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/ariyn/dbsp/cmd/dbsp/config"
 	"github.com/ariyn/dbsp/internal/dbsp/types"
@@ -30,7 +32,7 @@ var errStopObjectDecode = errors.New("stop object decode")
 
 type HTTPSource struct {
 	server          *http.Server
-	buffer          chan types.Batch
+	buffer          chan queuedInputBatch
 	pending         types.Batch
 	schemaMu        sync.RWMutex
 	schema          map[string]string
@@ -51,12 +53,24 @@ type HTTPSource struct {
 	wal        *wal.LogWriter
 	pendingSeq uint64
 
+	stringIntern    map[string]string
+	stringInternMu  sync.RWMutex
+	stringInternMax int
+
 	maxBatchSize    int
 	maxBatchDelay   time.Duration
 	maxRequestBytes int64
 	timestampUnit   string
+	sortEnabled     bool
+	sortBy          []string
+	sortSpillPath   string
 
 	replayDir string
+}
+
+type queuedInputBatch struct {
+	batch     types.Batch
+	spillPath string
 }
 
 type queuedWALBatch struct {
@@ -111,7 +125,7 @@ func NewHTTPSource(httpConfig config.HTTPSourceConfig, requiredFields map[string
 	}
 
 	s := &HTTPSource{
-		buffer:          make(chan types.Batch, httpConfig.BufferSize),
+		buffer:          make(chan queuedInputBatch, httpConfig.BufferSize),
 		schema:          cloneSchemaMap(httpConfig.Schema),
 		requiredFields:  effectiveRequired,
 		fieldSpecs:      buildFieldSpecs(effectiveRequired, httpConfig.Schema),
@@ -122,8 +136,13 @@ func NewHTTPSource(httpConfig config.HTTPSourceConfig, requiredFields map[string
 		maxBatchDelay:   time.Duration(httpConfig.MaxBatchDelayMS) * time.Millisecond,
 		maxRequestBytes: httpConfig.MaxRequestBytes,
 		timestampUnit:   httpConfig.TimestampUnit,
+		sortEnabled:     httpConfig.SortEnabled && len(httpConfig.SortBy) > 0,
+		sortBy:          append([]string(nil), httpConfig.SortBy...),
+		sortSpillPath:   strings.TrimSpace(httpConfig.SortSpillPath),
 		walAvailable:    make(chan struct{}, 1),
 		walBufferLimit:  httpConfig.BufferSize,
+		stringIntern:    make(map[string]string),
+		stringInternMax: 65536,
 	}
 	if shouldUsePackedSchema(effectiveRequired) {
 		columns := make([]string, 0, len(s.fieldSpecs))
@@ -202,6 +221,9 @@ func (s *HTTPSource) handleIngest(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("OK (empty)"))
 		return
 	}
+	if s.sortEnabled {
+		batch = s.sortBatch(batch)
+	}
 
 	if s.wal != nil {
 		payload, err := wal.EncodeBatchGobV1(batch)
@@ -225,8 +247,18 @@ func (s *HTTPSource) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	item := queuedInputBatch{batch: batch}
+	if s.sortEnabled && s.sortSpillPath != "" {
+		spillPath, err := s.spillBatch(batch)
+		if err != nil {
+			http.Error(w, "sort spill failure", http.StatusInternalServerError)
+			return
+		}
+		item = queuedInputBatch{spillPath: spillPath}
+	}
+
 	select {
-	case s.buffer <- batch:
+	case s.buffer <- item:
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	default:
@@ -286,6 +318,15 @@ func (s *HTTPSource) parseRequestBodyBytes(body []byte) (types.Batch, error) {
 			capacity = 16
 		}
 		out := make(types.Batch, 0, capacity)
+		var valuesArena []any
+		var presentArena []bool
+		var arenaOffset int
+		if s.packedSchema != nil {
+			cols := len(s.packedSchema.Columns)
+			arenaSize := cols * capacity
+			valuesArena = make([]any, arenaSize)
+			presentArena = make([]bool, arenaSize)
+		}
 		var parseErr error
 		_, err := jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
 			if parseErr != nil || err != nil {
@@ -298,7 +339,20 @@ func (s *HTTPSource) parseRequestBodyBytes(body []byte) (types.Batch, error) {
 				parseErr = fmt.Errorf("Invalid JSON")
 				return
 			}
-			td, ok, objErr := s.decodeObjectBytes(value)
+			var pv []any
+			var pp []bool
+			if valuesArena != nil {
+				cols := len(s.packedSchema.Columns)
+				if arenaOffset+cols <= len(valuesArena) {
+					pv = valuesArena[arenaOffset : arenaOffset+cols : arenaOffset+cols]
+					pp = presentArena[arenaOffset : arenaOffset+cols : arenaOffset+cols]
+					arenaOffset += cols
+				} else {
+					pv = make([]any, cols)
+					pp = make([]bool, cols)
+				}
+			}
+			td, ok, objErr := s.decodeObjectBytesWithArena(value, pv, pp)
 			if objErr != nil {
 				parseErr = objErr
 				return
@@ -329,12 +383,21 @@ func (s *HTTPSource) parseRequestBodyBytes(body []byte) (types.Batch, error) {
 }
 
 func (s *HTTPSource) decodeObjectBytes(body []byte) (types.TupleDelta, bool, error) {
+	return s.decodeObjectBytesWithArena(body, nil, nil)
+}
+
+func (s *HTTPSource) decodeObjectBytesWithArena(body []byte, arenaValues []any, arenaPresent []bool) (types.TupleDelta, bool, error) {
 	var tuple types.Tuple
 	var packedValues []any
 	var packedPresent []bool
 	if s.packedSchema != nil {
-		packedValues = make([]any, len(s.packedSchema.Columns))
-		packedPresent = make([]bool, len(s.packedSchema.Columns))
+		if arenaValues != nil {
+			packedValues = arenaValues
+			packedPresent = arenaPresent
+		} else {
+			packedValues = make([]any, len(s.packedSchema.Columns))
+			packedPresent = make([]bool, len(s.packedSchema.Columns))
+		}
 	}
 	remaining := len(s.requiredFields)
 	err := jsonparser.ObjectEach(body, func(key []byte, value []byte, dataType jsonparser.ValueType, offset int) error {
@@ -476,6 +539,35 @@ func (s *HTTPSource) matchField(key []byte) (fieldSpec, bool) {
 	return fieldSpec{}, false
 }
 
+// internString returns a deduplicated string for raw bytes.
+// Lookup is zero-copy via unsafe.String; allocation only happens on cache miss.
+// Strings longer than 256 bytes are returned as-is without interning.
+func (s *HTTPSource) internString(raw []byte) string {
+	if len(raw) > 256 {
+		return string(raw)
+	}
+	// Zero-copy key for map lookup — valid only within this scope, never stored.
+	key := unsafe.String(unsafe.SliceData(raw), len(raw))
+	s.stringInternMu.RLock()
+	if existing, ok := s.stringIntern[key]; ok {
+		s.stringInternMu.RUnlock()
+		return existing
+	}
+	s.stringInternMu.RUnlock()
+
+	s.stringInternMu.Lock()
+	defer s.stringInternMu.Unlock()
+	if existing, ok := s.stringIntern[key]; ok {
+		return existing
+	}
+	if len(s.stringIntern) >= s.stringInternMax {
+		return string(raw)
+	}
+	str := string(raw)
+	s.stringIntern[str] = str
+	return str
+}
+
 func (s *HTTPSource) decodeFieldBytes(spec fieldSpec, value []byte, valueType jsonparser.ValueType) (any, error) {
 	activeSpec := spec
 	if activeSpec.typeKind == fieldTypeUnknown {
@@ -488,6 +580,9 @@ func (s *HTTPSource) decodeFieldBytes(spec fieldSpec, value []byte, valueType js
 	}
 	if activeSpec.typeKind == fieldTypeUnknown {
 		return parseJSONValueBytes(value, valueType)
+	}
+	if activeSpec.typeKind == fieldTypeString && valueType == jsonparser.String {
+		return s.internString(value), nil
 	}
 	converted, err := parseValueByFieldKind(value, valueType, activeSpec.typeKind, s.timestampUnit)
 	if err == nil {
@@ -694,7 +789,11 @@ func (s *HTTPSource) NextBatch() (types.Batch, error) {
 		case <-s.done:
 			return nil, nil
 		case incoming := <-s.buffer:
-			batch = s.appendIncoming(batch, incoming, maxSize)
+			var err error
+			batch, err = s.appendIncoming(batch, incoming, maxSize)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -702,7 +801,11 @@ func (s *HTTPSource) NextBatch() (types.Batch, error) {
 		for len(batch) < maxSize {
 			select {
 			case incoming := <-s.buffer:
-				batch = s.appendIncoming(batch, incoming, maxSize)
+				var err error
+				batch, err = s.appendIncoming(batch, incoming, maxSize)
+				if err != nil {
+					return nil, err
+				}
 			default:
 				return batch, nil
 			}
@@ -717,7 +820,11 @@ func (s *HTTPSource) NextBatch() (types.Batch, error) {
 		case <-s.done:
 			return nil, nil
 		case incoming := <-s.buffer:
-			batch = s.appendIncoming(batch, incoming, maxSize)
+			var err error
+			batch, err = s.appendIncoming(batch, incoming, maxSize)
+			if err != nil {
+				return nil, err
+			}
 		case <-timer.C:
 			return batch, nil
 		}
@@ -905,21 +1012,25 @@ func (s *HTTPSource) takePending(batch types.Batch, maxSize int) types.Batch {
 	return batch
 }
 
-func (s *HTTPSource) appendIncoming(batch types.Batch, incoming types.Batch, maxSize int) types.Batch {
-	if len(incoming) == 0 {
-		return batch
+func (s *HTTPSource) appendIncoming(batch types.Batch, incoming queuedInputBatch, maxSize int) (types.Batch, error) {
+	resolved, err := s.materializeQueuedInput(incoming)
+	if err != nil {
+		return nil, err
+	}
+	if len(resolved) == 0 {
+		return batch, nil
 	}
 	space := maxSize - len(batch)
 	if space <= 0 {
-		s.pending = append(s.pending, incoming...)
-		return batch
+		s.pending = append(s.pending, resolved...)
+		return batch, nil
 	}
-	if len(incoming) <= space {
-		return append(batch, incoming...)
+	if len(resolved) <= space {
+		return append(batch, resolved...), nil
 	}
-	batch = append(batch, incoming[:space]...)
-	s.pending = append(s.pending, incoming[space:]...)
-	return batch
+	batch = append(batch, resolved[:space]...)
+	s.pending = append(s.pending, resolved[space:]...)
+	return batch, nil
 }
 
 func (s *HTTPSource) Close() error {
@@ -943,4 +1054,163 @@ func (s *HTTPSource) signalDone() {
 	s.once.Do(func() {
 		close(s.done)
 	})
+}
+
+func (s *HTTPSource) materializeQueuedInput(incoming queuedInputBatch) (types.Batch, error) {
+	if incoming.batch != nil {
+		return incoming.batch, nil
+	}
+	if incoming.spillPath == "" {
+		return nil, nil
+	}
+	payload, err := os.ReadFile(incoming.spillPath)
+	if err != nil {
+		return nil, fmt.Errorf("read sort spill: %w", err)
+	}
+	batch, err := wal.DecodeBatchGobV1(payload)
+	if err != nil {
+		return nil, fmt.Errorf("decode sort spill: %w", err)
+	}
+	if removeErr := os.Remove(incoming.spillPath); removeErr != nil && !os.IsNotExist(removeErr) {
+		return nil, fmt.Errorf("cleanup sort spill: %w", removeErr)
+	}
+	return batch, nil
+}
+
+func (s *HTTPSource) spillBatch(batch types.Batch) (string, error) {
+	if strings.TrimSpace(s.sortSpillPath) == "" {
+		return "", fmt.Errorf("sort spill path is empty")
+	}
+	if err := os.MkdirAll(s.sortSpillPath, 0o755); err != nil {
+		return "", fmt.Errorf("create sort spill dir: %w", err)
+	}
+	payload, err := wal.EncodeBatchGobV1(batch)
+	if err != nil {
+		return "", fmt.Errorf("encode sort spill: %w", err)
+	}
+	name := fmt.Sprintf("%d-%d.batch", time.Now().UnixNano(), len(batch))
+	path := filepath.Join(s.sortSpillPath, name)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, payload, 0o644); err != nil {
+		return "", fmt.Errorf("write sort spill: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("finalize sort spill: %w", err)
+	}
+	return path, nil
+}
+
+func (s *HTTPSource) sortBatch(batch types.Batch) types.Batch {
+	if len(batch) <= 1 || len(s.sortBy) == 0 {
+		return batch
+	}
+	out := append(types.Batch(nil), batch...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return s.lessTupleDelta(out[i], out[j])
+	})
+	return out
+}
+
+func (s *HTTPSource) lessTupleDelta(left, right types.TupleDelta) bool {
+	for _, col := range s.sortBy {
+		lv, _ := left.Get(col)
+		rv, _ := right.Get(col)
+		cmp := compareSortValues(lv, rv)
+		if cmp < 0 {
+			return true
+		}
+		if cmp > 0 {
+			return false
+		}
+	}
+	return false
+}
+
+func compareSortValues(a, b any) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return 1
+	}
+	if b == nil {
+		return -1
+	}
+	switch av := a.(type) {
+	case int:
+		switch bv := b.(type) {
+		case int:
+			if av < bv {
+				return -1
+			}
+			if av > bv {
+				return 1
+			}
+			return 0
+		case int64:
+			return compareSortValues(int64(av), bv)
+		case float64:
+			return compareSortValues(float64(av), bv)
+		}
+	case int64:
+		switch bv := b.(type) {
+		case int:
+			return compareSortValues(av, int64(bv))
+		case int64:
+			if av < bv {
+				return -1
+			}
+			if av > bv {
+				return 1
+			}
+			return 0
+		case float64:
+			return compareSortValues(float64(av), bv)
+		}
+	case float64:
+		switch bv := b.(type) {
+		case int:
+			return compareSortValues(av, float64(bv))
+		case int64:
+			return compareSortValues(av, float64(bv))
+		case float64:
+			if av < bv {
+				return -1
+			}
+			if av > bv {
+				return 1
+			}
+			return 0
+		}
+	case string:
+		if bv, ok := b.(string); ok {
+			if av < bv {
+				return -1
+			}
+			if av > bv {
+				return 1
+			}
+			return 0
+		}
+	case time.Time:
+		if bv, ok := b.(time.Time); ok {
+			if av.Before(bv) {
+				return -1
+			}
+			if av.After(bv) {
+				return 1
+			}
+			return 0
+		}
+	}
+	as := fmt.Sprint(a)
+	bs := fmt.Sprint(b)
+	if as < bs {
+		return -1
+	}
+	if as > bs {
+		return 1
+	}
+	return 0
 }

@@ -151,6 +151,13 @@ type StateBackendConfig struct {
 	// Default false preserves the full ordered state required for general updates.
 	OnlyLastLag bool `yaml:"only_last_lag"`
 
+	// DailyReset clears all operator state at midnight in ResetTimezone every day.
+	DailyReset bool `yaml:"daily_reset"`
+
+	// ResetTimezone is the IANA timezone name used for midnight calculation when DailyReset is true.
+	// Defaults to "Asia/Seoul" if empty.
+	ResetTimezone string `yaml:"reset_timezone"`
+
 	// CacheMaxEntries is reserved for future hot-cache tuning.
 	CacheMaxEntries int `yaml:"cache_max_entries"`
 
@@ -247,6 +254,10 @@ type WatermarkYAMLConfig struct {
 	AllowedLateness   string `yaml:"allowed_lateness"`     // e.g. "1s"
 	Policy            string `yaml:"policy"`               // drop|buffer|emit
 	MaxBufferSize     int    `yaml:"max_buffer_size"`
+
+	// GC enables watermark-based garbage collection for time-window operators.
+	// When true, window state for closed windows (End <= watermark) is evicted automatically.
+	GC bool `yaml:"gc"`
 }
 
 // SinkConfig defines the configuration for the data sink
@@ -286,6 +297,16 @@ type HTTPSourceConfig struct {
 	// MaxBufferBytes limits the total buffered request body size in memory.
 	// 0 disables the limit.
 	MaxBufferBytes int64 `yaml:"max_buffer_bytes"`
+
+	// SortEnabled sorts each parsed ingest batch before it is queued.
+	SortEnabled bool `yaml:"sort_enabled"`
+
+	// SortBy defines the ordered list of columns used when SortEnabled is true.
+	SortBy []string `yaml:"sort_by"`
+
+	// SortSpillPath enables temp-file spill for sorted batches before delivery.
+	// When empty, sorted batches stay in memory.
+	SortSpillPath string `yaml:"sort_spill_path"`
 
 	// WAL configuration
 	WALDir          string `yaml:"wal_dir"`
